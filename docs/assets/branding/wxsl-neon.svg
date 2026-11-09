@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-32 -32 702 648" role="img" aria-labelledby="title desc">
+  <title id="title">wxsl — néon</title>
+  <desc id="desc">Logo wxsl aux contours lumineux cyan, bleu électrique et magenta sur fond noir.</desc>
+  <defs>
+    <linearGradient id="mark" gradientUnits="userSpaceOnUse" x1="80" y1="10" x2="260" y2="390">
+      <stop offset="0" stop-color="#00F5FF"/>
+      <stop offset=".38" stop-color="#007FFF"/>
+      <stop offset=".65" stop-color="#5730FF"/>
+      <stop offset="1" stop-color="#FF20F5"/>
+    </linearGradient>
+    <linearGradient id="upper" gradientUnits="userSpaceOnUse" x1="410" y1="40" x2="510" y2="205">
+      <stop offset="0" stop-color="#00F5FF"/>
+      <stop offset=".38" stop-color="#007FFF"/>
+      <stop offset=".65" stop-color="#5730FF"/>
+      <stop offset="1" stop-color="#FF20F5"/>
+    </linearGradient>
+    <linearGradient id="lower" gradientUnits="userSpaceOnUse" x1="390" y1="220" x2="500" y2="385">
+      <stop offset="0" stop-color="#00F5FF"/>
+      <stop offset=".38" stop-color="#007FFF"/>
+      <stop offset=".65" stop-color="#5730FF"/>
+      <stop offset="1" stop-color="#FF20F5"/>
+    </linearGradient>
+    <linearGradient id="diamond" gradientUnits="userSpaceOnUse" x1="560" y1="25" x2="610" y2="190">
+      <stop offset="0" stop-color="#00F5FF"/>
+      <stop offset=".38" stop-color="#007FFF"/>
+      <stop offset=".65" stop-color="#5730FF"/>
+      <stop offset="1" stop-color="#FF20F5"/>
+    </linearGradient>
+    <linearGradient id="letters" gradientUnits="userSpaceOnUse" x1="70" y1="450" x2="590" y2="575">
+      <stop offset="0" stop-color="#00F5FF"/>
+      <stop offset=".38" stop-color="#007FFF"/>
+      <stop offset=".65" stop-color="#5730FF"/>
+      <stop offset="1" stop-color="#FF20F5"/>
+    </linearGradient>
+    <linearGradient id="inside" gradientUnits="userSpaceOnUse" x1="80" y1="0" x2="450" y2="580">
+      <stop offset="0" stop-color="#002446"/>
+      <stop offset=".35" stop-color="#020829"/>
+      <stop offset=".7" stop-color="#100337"/>
+      <stop offset="1" stop-color="#29003C"/>
+    </linearGradient>
+    <!-- The alpha silhouette unites overlapping letter strokes before outlining. -->
+    <filter id="tube" x="-50%" y="-50%" width="200%" height="200%" color-interpolation-filters="sRGB">
+      <feMorphology in="SourceAlpha" operator="erode" radius="2.6" result="inset"/>
+      <feComposite in="SourceAlpha" in2="inset" operator="out" result="rim"/>
+      <feComposite in="SourceGraphic" in2="rim" operator="in" result="color"/>
+      <feGaussianBlur in="color" stdDeviation="9" result="wide"/>
+      <feGaussianBlur in="color" stdDeviation="4" result="near"/>
+      <feGaussianBlur in="color" stdDeviation="1.2" result="soft"/>
+      <feColorMatrix in="color" type="matrix" values="0.4 0 0 0 0.6  0 0.4 0 0 0.6  0 0 0.4 0 0.6  0 0 0 1 0" result="hot"/>
+      <feMerge>
+        <feMergeNode in="wide"/><feMergeNode in="wide"/><feMergeNode in="wide"/>
+        <feMergeNode in="near"/><feMergeNode in="near"/><feMergeNode in="near"/><feMergeNode in="near"/>
+        <feMergeNode in="soft"/><feMergeNode in="soft"/><feMergeNode in="color"/><feMergeNode in="hot"/><feMergeNode in="hot"/>
+      </feMerge>
+    </filter>
+    <filter id="line-glow" x="-50%" y="-50%" width="200%" height="200%" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="5" result="halo"/>
+      <feMerge><feMergeNode in="halo"/><feMergeNode in="halo"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <clipPath id="mark-clip">
+  <path d="M22.00 7.00L427.31 7.00A15.0006 15.0006 0 0 1 440.30 29.50L237.65 380.51A15.0006 15.0006 0 0 1 211.66 380.51L9.01 29.50A15.0006 15.0006 0 0 1 22.00 7.00Z" fill="white" />
+    </clipPath>
+  </defs>
+  <rect x="-32" y="-32" width="702" height="648" fill="#010108"/>
+  <path d="M22.00 7.00L427.31 7.00A15.0006 15.0006 0 0 1 440.30 29.50L237.65 380.51A15.0006 15.0006 0 0 1 211.66 380.51L9.01 29.50A15.0006 15.0006 0 0 1 22.00 7.00Z" fill="url(#inside)" />
+  <path d="M22.00 7.00L427.31 7.00A15.0006 15.0006 0 0 1 440.30 29.50L237.65 380.51A15.0006 15.0006 0 0 1 211.66 380.51L9.01 29.50A15.0006 15.0006 0 0 1 22.00 7.00Z" fill="url(#mark)" filter="url(#tube)"/>
+  <path d="M471.91 25.25L567.17 190.25A7.50031 7.50031 0 0 1 560.68 201.50L370.15 201.50A7.50031 7.50031 0 0 1 363.65 190.25L458.92 25.25A7.50031 7.50031 0 0 1 471.91 25.25Z" fill="url(#inside)" />
+  <path d="M471.91 25.25L567.17 190.25A7.50031 7.50031 0 0 1 560.68 201.50L370.15 201.50A7.50031 7.50031 0 0 1 363.65 190.25L458.92 25.25A7.50031 7.50031 0 0 1 471.91 25.25Z" fill="url(#upper)" filter="url(#tube)"/>
+  <path d="M370.15 215.50L560.68 215.50A7.50031 7.50031 0 0 1 567.17 226.75L478.41 380.51A15.0006 15.0006 0 0 1 452.42 380.51L363.65 226.75A7.50031 7.50031 0 0 1 370.15 215.50Z" fill="url(#inside)" />
+  <path d="M370.15 215.50L560.68 215.50A7.50031 7.50031 0 0 1 567.17 226.75L478.41 380.51A15.0006 15.0006 0 0 1 452.42 380.51L363.65 226.75A7.50031 7.50031 0 0 1 370.15 215.50Z" fill="url(#lower)" filter="url(#tube)"/>
+  <path d="M589.04 19.63L630.61 91.63A3.75016 3.75016 0 0 1 627.36 97.25L544.22 97.25A3.75016 3.75016 0 0 1 540.98 91.63L582.55 19.63A3.75016 3.75016 0 0 1 589.04 19.63Z" fill="url(#inside)" />
+  <path d="M589.04 19.63L630.61 91.63A3.75016 3.75016 0 0 1 627.36 97.25L544.22 97.25A3.75016 3.75016 0 0 1 540.98 91.63L582.55 19.63A3.75016 3.75016 0 0 1 589.04 19.63Z" fill="url(#diamond)" filter="url(#tube)"/>
+  <path d="M544.22 111.25L627.36 111.25A3.75016 3.75016 0 0 1 630.61 116.88L589.04 188.88A3.75016 3.75016 0 0 1 582.55 188.88L540.98 116.88A3.75016 3.75016 0 0 1 544.22 111.25Z" fill="url(#inside)" />
+  <path d="M544.22 111.25L627.36 111.25A3.75016 3.75016 0 0 1 630.61 116.88L589.04 188.88A3.75016 3.75016 0 0 1 582.55 188.88L540.98 116.88A3.75016 3.75016 0 0 1 544.22 111.25Z" fill="url(#diamond)" filter="url(#tube)"/>
+  <path d="M105.33 7L289.48 311.75" clip-path="url(#mark-clip)" fill="none" stroke="url(#mark)" stroke-width="1.8" filter="url(#line-glow)"/>
+  <path d="M405.22 104.25L465.41 208.50" fill="none" stroke="#C9F9FF" stroke-width="3" filter="url(#line-glow)"/>
+  <circle cx="405.22" cy="104.25" r="25" fill="#030D34" stroke="#8AFFFF" stroke-width="4" filter="url(#line-glow)"/>
+  <circle cx="465.41" cy="208.5" r="25" fill="#030D34" stroke="#E7DAFF" stroke-width="4" filter="url(#line-glow)"/>
+  <circle cx="585.79" cy="104.25" r="17" fill="#030D34" stroke="#E4E9FF" stroke-width="4" filter="url(#line-glow)"/>
+  <path d="M33.31 453.03L70.33 453.03L115.89 576.61L78.87 576.61ZM124.43 453.03L161.45 453.03L115.89 576.61L78.87 576.61ZM124.43 453.03L161.45 453.03L207.01 576.61L169.99 576.61ZM215.55 453.03L252.57 453.03L207.01 576.61L169.99 576.61Z" fill="url(#inside)" />
+  <path d="M33.31 453.03L70.33 453.03L115.89 576.61L78.87 576.61ZM124.43 453.03L161.45 453.03L115.89 576.61L78.87 576.61ZM124.43 453.03L161.45 453.03L207.01 576.61L169.99 576.61ZM215.55 453.03L252.57 453.03L207.01 576.61L169.99 576.61Z" fill="url(#letters)" filter="url(#tube)"/>
+  <path d="M263.10 453.03L306.96 453.03L415.73 576.61L371.88 576.61ZM371.88 453.03L415.73 453.03L306.96 576.61L263.10 576.61Z" fill="url(#inside)" />
+  <path d="M263.10 453.03L306.96 453.03L415.73 576.61L371.88 576.61ZM371.88 453.03L415.73 453.03L306.96 576.61L263.10 576.61Z" fill="url(#letters)" filter="url(#tube)"/>
+  <path d="M484.92 450.75C524.79 450.75 549.56 462.53 549.56 488.91L512.55 488.91C512.55 481.50 502.81 475.52 484.92 475.52C462.50 475.52 457.59 485.30 457.59 488.34C457.59 501.13 495.70 502.67 510.88 505.85C524.94 508.80 549.28 518.30 549.28 538.45C549.28 551.19 541.45 578.89 484.92 578.89C445.05 578.89 420.29 567.11 420.29 540.73L457.30 540.73C457.30 548.13 467.04 554.11 484.92 554.11C507.35 554.11 512.26 544.34 512.26 541.30C512.26 528.50 474.15 526.97 458.97 523.79C444.91 520.84 420.57 511.33 420.57 491.18C420.57 478.44 428.40 450.75 484.92 450.75Z" fill="url(#inside)" />
+  <path d="M484.92 450.75C524.79 450.75 549.56 462.53 549.56 488.91L512.55 488.91C512.55 481.50 502.81 475.52 484.92 475.52C462.50 475.52 457.59 485.30 457.59 488.34C457.59 501.13 495.70 502.67 510.88 505.85C524.94 508.80 549.28 518.30 549.28 538.45C549.28 551.19 541.45 578.89 484.92 578.89C445.05 578.89 420.29 567.11 420.29 540.73L457.30 540.73C457.30 548.13 467.04 554.11 484.92 554.11C507.35 554.11 512.26 544.34 512.26 541.30C512.26 528.50 474.15 526.97 458.97 523.79C444.91 520.84 420.57 511.33 420.57 491.18C420.57 478.44 428.40 450.75 484.92 450.75Z" fill="url(#letters)" filter="url(#tube)"/>
+  <path d="M567.79 416.01L604.80 416.01L604.80 576.61L567.79 576.61Z" fill="url(#inside)" />
+  <path d="M567.79 416.01L604.80 416.01L604.80 576.61L567.79 576.61Z" fill="url(#letters)" filter="url(#tube)"/>
+</svg>

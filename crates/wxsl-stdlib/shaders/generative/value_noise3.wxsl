@@ -1,0 +1,42 @@
+// Value noise (3D)
+//
+// Smooth 0..1 noise over a lattice, quintically interpolated.
+//
+// A hashed value per lattice corner, trilinearly interpolated with a quintic
+// fade. Continuous everywhere, and its first two derivatives are continuous
+// across cell boundaries — that is what the quintic fade buys over a linear
+// one, which leaves visible creases on the lattice planes.
+
+import package::generative::hash13::hash13;
+import package::math::smootherstep::smootherstep;
+
+fn value_noise3(
+    p: vec3f, // @default 0.0
+) -> f32 {
+    let cell = floor(p);
+    let local = p - cell;
+    // `smootherstep` is a template; the type argument is written out
+    // because none of these arguments makes it evident (an unsuffixed
+    // literal and a swizzle are exactly the cases the compiler does not
+    // guess at).
+    let fade = vec3f(
+        smootherstep<f32>(0.0, 1.0, local.x),
+        smootherstep<f32>(0.0, 1.0, local.y),
+        smootherstep<f32>(0.0, 1.0, local.z),
+    );
+
+    let c000 = hash13(cell + vec3f(0.0, 0.0, 0.0));
+    let c100 = hash13(cell + vec3f(1.0, 0.0, 0.0));
+    let c010 = hash13(cell + vec3f(0.0, 1.0, 0.0));
+    let c110 = hash13(cell + vec3f(1.0, 1.0, 0.0));
+    let c001 = hash13(cell + vec3f(0.0, 0.0, 1.0));
+    let c101 = hash13(cell + vec3f(1.0, 0.0, 1.0));
+    let c011 = hash13(cell + vec3f(0.0, 1.0, 1.0));
+    let c111 = hash13(cell + vec3f(1.0, 1.0, 1.0));
+
+    let x00 = mix(c000, c100, fade.x);
+    let x10 = mix(c010, c110, fade.x);
+    let x01 = mix(c001, c101, fade.x);
+    let x11 = mix(c011, c111, fade.x);
+    return mix(mix(x00, x10, fade.y), mix(x01, x11, fade.y), fade.z);
+}

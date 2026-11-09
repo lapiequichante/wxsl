@@ -1,0 +1,77 @@
+@if(wxsl_debug_normals)
+fn ${SHADE_FN}(surface: ${SURFACE}, ctx: ${CONTEXT}${SHADING_PARAMS}) -> vec4f {
+    return vec4f(normalize(surface.normal) * 0.5 + vec3f(0.5), 1.0);
+}
+
+@if(!wxsl_debug_normals)
+fn ${SHADE_FN}(surface: ${SURFACE}, ctx: ${CONTEXT}${SHADING_PARAMS}) -> vec4f {
+    let normal = normalize(surface.normal);
+${EXTRA_DECL}    // Ambient occlusion attenuates the environment, not direct light.
+    // Evaluate IBL before the varying light loops. On Metal, sampling it
+    // afterwards can produce bright speckles in otherwise rough surfaces.
+    var lit = ${AMBIENT_CALL} * saturate(surface.occlusion);
+    let light_count = min(scene.light_count, WXSL_MAX_LIGHTS);
+    let lobe = specular_lobe(normal, ctx.view_direction, surface.roughness);
+    for (var index = 0u; index < light_count; index = index + 1u) {
+        // An unshadowed rectangle or tube, integrated whole when the model
+        // knows how; otherwise sampled below.
+        let area = area_light(index, ctx.world_position);
+        if area.shape != 0u {
+            let answer = area_dispatch(surface, ctx, area${DISPATCH_ARGS});
+            if answer.w > 0.0 {
+                lit = lit + answer.xyz;
+                continue;
+            }
+        }
+        // What every sample of this light shares, worked out once.
+        let setup = light_setup(index, ctx.world_position, lobe);
+        for (var sample = 0u; sample < setup.count; sample = sample + 1u) {
+            let light = sample_light_setup(setup, sample, ctx.world_position);
+            // Nothing reaches this point (out of range, outside the cone or
+            // the profile): no shadow lookup to pay for.
+            if all(light.radiance == vec3f(0.0)) {
+                continue;
+            }
+            // Declared unconditionally and overwritten under the flag,
+            // because a `let` inside an `@if` is removed along with it.
+            // The shadow's bias and receiver plane follow the geometry's
+            // normal: a normal map's would move each pixel's lookup on its
+            // own, and grain the penumbra a low sun stretches. Deferred,
+            // the G-buffer's shading normal is all there is.
+            var shadow = 1.0;
+            @if(wxsl_receive_shadows)
+            shadow = ${SHADOW_FN}(
+                index,
+                sample,
+                ctx.world_position,
+                normalize(ctx.world_normal),
+                saturate(dot(normalize(ctx.world_normal), light.direction)),
+            );
+            lit = lit
+                + ${DISPATCH_FN}(surface, ctx, light${DISPATCH_ARGS})
+                * shadow;
+        }
+    }
+    // Local lights, through the light grid: only those whose
+    // range reaches this point's cluster, one sample each, never shadowed.
+    let span = local_light_span(ctx.world_position);
+    for (var item = 0u; item < span.y; item = item + 1u) {
+        let local = light_grid_word(span.x + item);
+        let light = sample_light_value(local_light(local), 0u, ctx.world_position);
+        // Binned by its range's sphere: a spot's pixels outside its cone
+        // land here too, with nothing to shade.
+        if all(light.radiance == vec3f(0.0)) {
+            continue;
+        }
+        lit = lit + ${DISPATCH_FN}(surface, ctx, light${DISPATCH_ARGS});
+    }
+
+    lit = lit + surface.emissive;
+
+    // Linear radiance, exposed but neither curved nor encoded: the
+    // display transform is one screen effect at the end of the chain, so
+    // both render paths hand the same numbers to the same pass and
+    // anything reading this image in between — a bloom threshold, a
+    // history buffer — reads light rather than pixels.
+    return vec4f(lit * scene.exposure, saturate(surface.alpha));
+}

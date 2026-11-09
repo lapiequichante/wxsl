@@ -1,0 +1,25 @@
+[package]
+name = "wxsl-stdlib"
+description = "Granular WXSL shader nodes: original functions and attributed permissive ports."
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[dependencies]
+wxsl-core = { workspace = true }
+
+# The WXSL compiler derives this crate's function nodes from the `.wxsl`
+# files themselves. A *build* dependency on purpose: the shipped
+# crate carries no compiler, so `cargo tree -e normal` still shows only
+# `wxsl-core`. It is a dev-dependency as well, for the test that re-derives
+# every node and compares it with the generated table.
+[build-dependencies]
+wxsl-core = { workspace = true }
+wxsl-lang = { workspace = true }
+
+[dev-dependencies]
+wxsl-lang = { workspace = true }

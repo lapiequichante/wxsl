@@ -1,0 +1,128 @@
+//! `wxsl-render`: the wgpu renderer.
+//!
+//! Owns everything that talks to `wgpu`: device setup, the render graph that
+//! turns a list of passes into a frame, and the shader variant cache that
+//! lets a single node graph back both a forward and a deferred pipeline
+//! without the caller doing anything special to "switch".
+//!
+//! See `docs/architecture.md` for the rendering architecture.
+//!
+//! # How a graph becomes a frame
+//!
+//! ```text
+//!   Graph ──codegen──> Material ──variants──> ShaderVariant ─┐
+//!   (core)             (one module            (WGSL + wgpu   │
+//!                       per stage)             module)       │
+//!                                                            v
+//!   PassDesc… ──schedule──> Schedule ──record──>  pipelines ──> frame
+//!   (a pipeline, as data)   (order + textures)
+//! ```
+//!
+//! [`material::Material`] is authored once and compiled per *stage*: it
+//! holds one generated WXSL module per [`wxsl_core::abi::MaterialStage`],
+//! each with the entry point that stage calls for — a final colour, a
+//! G-buffer, or no fragment stage at all.
+//! [`variants::ShaderVariants`] compiles those per (macro set, stage) and
+//! caches the result.
+//!
+//! A *pipeline* is not a Rust struct but a [`graph::RenderGraph`] — a list
+//! of [`pass::PassDesc`]s, each naming the stage it draws with — which
+//! [`graph::Schedule`] orders and allocates and [`renderer::Renderer`]
+//! runs. Switching pipeline at runtime is
+//! [`renderer::Renderer::set_pipeline`], or
+//! [`renderer::Renderer::request_pipeline`] to swap without a stutter;
+//! supplying your own pass list is [`renderer::Renderer::set_graph`].
+//!
+//! # What is a scene, and what is not
+//!
+//! A *scene* — meshes, instances, materials, tags — is pure data and lives
+//! in `wxsl_core::scene`. What this crate takes is a [`draw::DrawList`],
+//! because batching, culling and sorting belong to the application.
+//! [`environment::Environment`] is the other half of a frame: camera,
+//! lights, ambient.
+//!
+//! # Which shaders this crate owns
+//!
+//! The shader ABI and the node library are `wxsl-stdlib`'s, and the
+//! dependency arrow only points *into* `wxsl-core`.
+//! The application supplies those modules through
+//! [`library::ShaderLibrary`], which is also how it can override an ABI
+//! module or add hand-written WXSL of its own.
+//!
+//! The exception is the *effects* shared through `wxsl-frame`
+//! ([`effect`]): a screen effect is a self-describing unit whose shader
+//! travels with it — bloom's WXSL lives under `wxsl-frame/shaders/`,
+//! mounted when the variant is compiled. An application's own
+//! effects carry their sources the same way, or resolve against the
+//! library like everything else.
+//!
+//! # Stability
+//!
+//! The names re-exported at this root are the stable surface,
+//! what a program needs to build, configure and render a frame. Modules
+//! reached only by path are unstable: [`ui`], and the machinery behind the
+//! renderer, such as the resource pool, the pipeline and variant caches and
+//! the shipped effects' ids. [`wgpu`] and [`glam`] are re-exported at the
+//! versions this crate is built against.
+
+#![warn(missing_docs)]
+
+pub mod bindings;
+pub mod draw;
+pub mod environment;
+pub mod error;
+#[cfg(feature = "gltf")]
+pub mod gltf;
+pub mod gpu;
+pub mod graph;
+pub mod library;
+pub mod material;
+pub mod mesh;
+pub mod pass;
+pub mod pipeline;
+pub mod pipeline_doc;
+pub mod probe;
+pub mod renderer;
+pub mod scene;
+pub mod setup;
+pub mod swap;
+mod timing;
+pub mod types;
+pub mod ui;
+pub mod variants;
+
+/// Shared effect declarations and their owned shader sources.
+pub use wxsl_frame::effect;
+/// What a device can run, and the fallbacks the shared half picks for it.
+pub use wxsl_frame::profile::{self, Profile};
+
+// Re-exported so a dependant can name a `wgpu::Device` or a `glam::Mat4`
+// without having to pin the same versions itself — and so that "which wgpu
+// does the renderer use" has one answer rather than a lockfile search.
+pub use glam;
+pub use wgpu;
+
+pub use bindings::MaterialBindings;
+pub use draw::{DrawItem, DrawList, InstanceAttributes};
+pub use effect::{
+    Downlevel, Effect, EffectInput, EffectInputKind, EffectKind, EffectOutput, EffectOutputShape,
+    EffectRegistry, EffectShader,
+};
+pub use environment::{
+    Camera, Environment, FrameBindings, InstanceRowSet, InstanceRows, InstanceTransform, Light,
+};
+pub use error::RenderError;
+pub use gpu::{device_profile, DeviceCaps, GpuContext, OffscreenTarget};
+pub use graph::{RenderGraph, Schedule};
+pub use library::ShaderLibrary;
+pub use material::Material;
+pub use mesh::{AttributeValues, Mesh, MeshData, MeshKind, Vertex};
+pub use pass::{
+    Attachment, DepthAttachment, DepthBias, Dimension, DrawSource, Extent, PassDesc, PassKind,
+    PassState, Persistence, Policy, Read, ResourceDesc, ResourceId,
+};
+pub use pipeline::{PipelineConfig, StockPipeline, TargetConfig};
+pub use pipeline_doc::{compile as compile_pipeline, document_registry, PipelineError};
+pub use renderer::{single_draw, RenderRequest, Renderer};
+pub use swap::SwapProgress;
+pub use variants::CacheStats;

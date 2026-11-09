@@ -1,0 +1,105 @@
+//! particles_simulate — advance a particle system one frame
+//! (`effect::particles`).
+//!
+//! Each invocation owns one slot of the buffer. Slot `i` is reborn at
+//! `i / rate` seconds past every period of `PARTICLES / rate` on the
+//! host's clock: the latest such time at or before `params.time`, if it
+//! falls within this frame's `params.dt`, respawns the slot at the
+//! emitter, already aged by what is left of the step. Otherwise a live
+//! particle moves on: its velocity slowed by `params.drag` and lifted by
+//! `params.lift`, its age advanced. A dead slot (its age past its
+//! lifetime, or never born: a zeroed buffer) is left alone, and the
+//! sprites skip it.
+//!
+//! The emitter is `params.origin` (xyz, a ball of `w` metres radius) and
+//! `params.velocity` (xyz metres a second, with `w` of its speed added in
+//! a random direction); a particle lives `params.lifetime` seconds give or
+//! take a third. `params.widen` makes both balls ellipsoids, `w` times as
+//! long along its unit axis `xyz` (a flat mouth's flame). With a
+//! `params.rate` of 0 nothing is born. A moving
+//! emitter's velocity is `params.carry` (xyz): its particles inherit it,
+//! and one born earlier in the step starts where the emitter was then, so
+//! a fast emitter leaves a trail rather than a particle bunched ahead of
+//! it each frame.
+
+/// Position (xyz) and age in seconds (w); velocity (xyz) and lifetime in
+/// seconds (w). Keep in sync with `particles_draw.wxsl` and
+/// `PARTICLE_BYTES`.
+struct Particle {
+    position: vec4f,
+    velocity: vec4f,
+}
+
+@group(3) @binding(0) var<storage, read_write> particles: array<Particle>;
+
+/// The slots: `effect::particles::PARTICLES`.
+const PARTICLES: u32 = 4096u;
+
+/// A well-mixed 32-bit hash (PCG).
+fn hash(value: u32) -> u32 {
+    let state = value * 747796405u + 2891336453u;
+    let word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+/// A uniform number in 0..1, the `index`-th drawn from `seed`.
+fn random(seed: u32, index: u32) -> f32 {
+    return f32(hash(seed + index) >> 8u) / 16777216.0;
+}
+
+/// A uniform point in the unit ball, from `seed`'s `index`-th draw on.
+fn in_ball(seed: u32, index: u32) -> vec3f {
+    let z = random(seed, index) * 2.0 - 1.0;
+    let angle = random(seed, index + 1u) * 6.2831853;
+    let ring = sqrt(max(1.0 - z * z, 0.0));
+    let radius = pow(random(seed, index + 2u), 1.0 / 3.0);
+    return vec3f(ring * cos(angle), ring * sin(angle), z) * radius;
+}
+
+/// `point` stretched `params.widen.w` times along the unit axis
+/// `params.widen.xyz`: a ball made an ellipsoid.
+fn widened(point: vec3f) -> vec3f {
+    return point + params.widen.xyz * (dot(point, params.widen.xyz) * (params.widen.w - 1.0));
+}
+
+/// `particle` a step of `dt` seconds on: drag, lift, then the move.
+fn advance(particle: Particle, dt: f32) -> Particle {
+    let velocity = particle.velocity.xyz * exp(-params.drag * dt) + vec3f(0.0, params.lift * dt, 0.0);
+    return Particle(
+        vec4f(particle.position.xyz + velocity * dt, particle.position.w + dt),
+        vec4f(velocity, particle.velocity.w),
+    );
+}
+
+@compute
+@workgroup_size(64)
+fn simulate(@builtin(global_invocation_id) id: vec3u) {
+    let slot = id.x;
+    if slot >= PARTICLES {
+        return;
+    }
+    let particle = particles[slot];
+    let dt = max(params.dt, 0.0);
+    if params.rate > 0.0 && dt > 0.0 {
+        let period = f32(PARTICLES) / params.rate;
+        let phase = f32(slot) / params.rate;
+        let turn = floor((params.time - phase) / period);
+        let born = turn * period + phase;
+        if born > params.time - dt {
+            let seed = hash(slot ^ hash(bitcast<u32>(i32(turn))));
+            let speed = length(params.velocity.xyz);
+            let velocity = params.velocity.xyz + widened(in_ball(seed, 0u)) * (speed * params.velocity.w)
+                + params.carry.xyz;
+            let lifetime = params.lifetime * (1.0 + (random(seed, 3u) - 0.5) * 0.66);
+            // Where the emitter was when the particle was born.
+            let position = params.origin.xyz - params.carry.xyz * (params.time - born)
+                + widened(in_ball(seed, 4u)) * params.origin.w;
+            let born_now = Particle(vec4f(position, 0.0), vec4f(velocity, lifetime));
+            particles[slot] = advance(born_now, params.time - born);
+            return;
+        }
+    }
+    if particle.position.w < particle.velocity.w {
+        particles[slot] = advance(particle, dt);
+    }
+}

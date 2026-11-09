@@ -1,0 +1,345 @@
+//! The compiler driver: WXSL sources in, WGSL out.
+//!
+//! The whole pipeline in one call. The passes run in an order that is not
+//! negotiable, and the reasons are worth stating because getting them wrong
+//! produces failures that look like something else:
+//!
+//! 1. **parse** every module reachable from the root.
+//! 2. **conditional translation and macro binding**, per module, before any
+//!    renaming — an `@if` names macros in its own module's vocabulary, and a
+//!    branch that is dropped should never have its references resolved.
+//! 3. **resolution**: mangle each imported declaration by origin, rewrite
+//!    references (respecting shadowing), concatenate dependencies first.
+//! 4. **monomorphization** of templates, on the flat module — a template
+//!    and its call sites can be in different files, so this is the first
+//!    point at which all of them are visible.
+//! 5. **dead-code elimination** from the root's declarations, so a library
+//!    module's unused half cannot fail to compile for reasons the shader
+//!    author never sees. After instantiation, so an unused instantiation
+//!    goes with it.
+//! 6. **emit WGSL**, refusing anything that is still WXSL-only — which
+//!    catches a skipped pass here rather than inside `wgpu`.
+//!
+//! Steps 2 to 5 live in [`mod@crate::resolve`], which owns the ordering.
+
+use crate::cond::Bindings;
+use crate::diagnostic::Diagnostics;
+use crate::emit::{emit, emit_wgsl};
+use crate::resolve::{resolve, Modules};
+
+/// A source-rendered failure at the backend-independent compilation boundary.
+#[derive(Debug)]
+pub enum CompileError {
+    /// The root is not a valid module path.
+    InvalidModulePath {
+        /// The invalid spelling.
+        module: String,
+    },
+    /// The compiler refused a source, with its diagnostic rendered in context.
+    ShaderCompile {
+        /// Root being compiled.
+        module: String,
+        /// Diagnostic including source lines and carets.
+        diagnostic: String,
+    },
+}
+
+impl core::fmt::Display for CompileError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::InvalidModulePath { module } => write!(f, "invalid module path `{module}`"),
+            Self::ShaderCompile { module, diagnostic } => {
+                write!(f, "compiling `{module}`: {diagnostic}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CompileError {}
+
+/// Compile with the graph model's macro values; shared by native backends and FFI.
+pub fn compile_with_macros(
+    modules: &Modules,
+    root: &str,
+    macros: &wxsl_core::macros::MacroSet,
+) -> Result<String, CompileError> {
+    if crate::ModulePath::parse(root).is_none() {
+        return Err(CompileError::InvalidModulePath {
+            module: root.to_string(),
+        });
+    }
+    let bindings = macros
+        .iter()
+        .map(|(name, value)| {
+            let value = match value {
+                wxsl_core::macros::MacroValue::Flag(flag) => crate::Value::Bool(flag),
+                wxsl_core::macros::MacroValue::Int(number) => crate::Value::Int(i64::from(number)),
+                wxsl_core::macros::MacroValue::Float(number) => {
+                    crate::Value::Float(f64::from(number))
+                }
+            };
+            (name.to_string(), value)
+        })
+        .collect();
+    compile(modules, root, &bindings).map_err(|diagnostics| CompileError::ShaderCompile {
+        module: root.to_string(),
+        diagnostic: diagnostics.render(&|path| modules.get(path).map(str::to_string)),
+    })
+}
+
+/// Compile `root` and its imports to WGSL.
+pub fn compile(modules: &Modules, root: &str, bindings: &Bindings) -> Result<String, Diagnostics> {
+    let module = resolve(modules, root, bindings)?;
+    emit_wgsl(&module)
+}
+
+/// Compile as far as the flattened WXSL, without the WGSL check.
+///
+/// What `--dump-wxsl` prints: useful when a shader fails to compile and the
+/// question is what the imports and conditionals actually produced.
+pub fn compile_to_wxsl(
+    modules: &Modules,
+    root: &str,
+    bindings: &Bindings,
+) -> Result<String, Diagnostics> {
+    Ok(emit(&resolve(modules, root, bindings)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cond::Value;
+
+    fn library() -> Modules {
+        let mut modules = Modules::new();
+        modules.insert(
+            "package::math::remap",
+            "fn remap(value: f32, low: f32, high: f32) -> f32 {\n\
+             \x20   return low + value * (high - low);\n}\n",
+        );
+        modules.insert(
+            "package::noise::fbm",
+            "@macro const OCTAVES: i32 = 5;\n\
+             @macro const RIDGED: bool = false;\n\n\
+             fn fbm(x: f32) -> f32 {\n\
+             \x20   var total = 0.0;\n\
+             \x20   for (var i = 0; i < OCTAVES; i++) {\n\
+             \x20       total += x;\n\
+             \x20   }\n\
+             \x20   @if(RIDGED) total = 1.0 - abs(total);\n\
+             \x20   return total;\n}\n",
+        );
+        modules
+    }
+
+    fn root(source: &str) -> Modules {
+        let mut modules = library();
+        modules.insert("package::main", source);
+        modules
+    }
+
+    #[test]
+    fn the_whole_pipeline_produces_wgsl() {
+        let modules = root(
+            "import package::math::remap::remap;\n\
+             import package::noise::fbm::fbm;\n\n\
+             @fragment\n\
+             fn fs() -> @location(0) vec4f {\n\
+             \x20   return vec4f(remap(fbm(0.5), 0.0, 1.0));\n}\n",
+        );
+        let wgsl = match compile(&modules, "package::main", &Bindings::new()) {
+            Ok(wgsl) => wgsl,
+            Err(diagnostics) => panic!(
+                "{}",
+                diagnostics.render(&|path| modules.get(path).map(str::to_string))
+            ),
+        };
+
+        // No WXSL left.
+        assert!(!wgsl.contains("import"), "{wgsl}");
+        assert!(!wgsl.contains("@if"), "{wgsl}");
+        assert!(!wgsl.contains("@macro"), "{wgsl}");
+        // Dependencies inlined and mangled, entry point untouched.
+        assert!(wgsl.contains("fn package_math_remap_remap"), "{wgsl}");
+        assert!(wgsl.contains("fn package_noise_fbm_fbm"), "{wgsl}");
+        assert!(wgsl.contains("@fragment\nfn fs()"), "{wgsl}");
+        // The macro became an ordinary const at its default.
+        assert!(
+            wgsl.contains("const package_noise_fbm_OCTAVES: i32 = 5;"),
+            "{wgsl}"
+        );
+        // The false conditional's statement is gone.
+        assert!(!wgsl.contains("1.0 - abs(total)"), "{wgsl}");
+    }
+
+    #[test]
+    fn bindings_change_the_output() {
+        let modules = root(
+            "import package::noise::fbm::fbm;\n\n\
+             @fragment\nfn fs() -> @location(0) vec4f { return vec4f(fbm(0.5)); }\n",
+        );
+        let mut bindings = Bindings::new();
+        bindings.insert("OCTAVES".to_string(), Value::Int(2));
+        bindings.insert("RIDGED".to_string(), Value::Bool(true));
+
+        let wgsl = compile(&modules, "package::main", &bindings).expect("compiles");
+        assert!(
+            wgsl.contains("const package_noise_fbm_OCTAVES: i32 = 2;"),
+            "{wgsl}"
+        );
+        assert!(wgsl.contains("1.0 - abs(total)"), "{wgsl}");
+
+        let default = compile(&modules, "package::main", &Bindings::new()).expect("compiles");
+        assert_ne!(wgsl, default, "bindings must change the shader");
+    }
+
+    #[test]
+    fn the_same_module_compiles_twice_with_different_bindings() {
+        // The A/B comparison case: one source, two compilations, different
+        // compile-time settings, no second material.
+        let modules = root(
+            "import package::noise::fbm::fbm;\n\n\
+             @fragment\nfn fs() -> @location(0) vec4f { return vec4f(fbm(0.5)); }\n",
+        );
+        let with = |octaves: i64| {
+            let mut bindings = Bindings::new();
+            bindings.insert("OCTAVES".to_string(), Value::Int(octaves));
+            compile(&modules, "package::main", &bindings).expect("compiles")
+        };
+        let three = with(3);
+        let seven = with(7);
+        assert!(three.contains("OCTAVES: i32 = 3;"), "{three}");
+        assert!(seven.contains("OCTAVES: i32 = 7;"), "{seven}");
+        assert_ne!(three, seven);
+    }
+
+    #[test]
+    fn an_unused_import_does_not_reach_the_output() {
+        let modules = root(
+            "import package::math::remap::remap;\n\
+             import package::noise::fbm::fbm;\n\n\
+             @fragment\nfn fs() -> @location(0) vec4f { return vec4f(fbm(0.5)); }\n",
+        );
+        let wgsl = compile(&modules, "package::main", &Bindings::new()).expect("compiles");
+        assert!(wgsl.contains("package_noise_fbm_fbm"), "{wgsl}");
+        assert!(!wgsl.contains("remap"), "unused import survived:\n{wgsl}");
+    }
+
+    #[test]
+    fn dumping_wxsl_keeps_the_flattened_form_readable() {
+        let modules = root(
+            "import package::noise::fbm::fbm;\n\n\
+             @fragment\nfn fs() -> @location(0) vec4f { return vec4f(fbm(0.5)); }\n",
+        );
+        let wxsl = compile_to_wxsl(&modules, "package::main", &Bindings::new()).expect("compiles");
+        // Same content as the WGSL for this input, but produced without the
+        // backend's refusal check, so it also works on a tree that still has
+        // WXSL constructs in it.
+        assert!(wxsl.contains("fn package_noise_fbm_fbm"), "{wxsl}");
+    }
+
+    #[test]
+    fn a_missing_module_names_the_importer_and_the_path() {
+        let mut modules = Modules::new();
+        modules.insert(
+            "package::main",
+            "import package::nowhere::thing;\nfn f() { }\n",
+        );
+        let error = compile(&modules, "package::main", &Bindings::new()).expect_err("missing");
+        let rendered = error.render(&|path| modules.get(path).map(str::to_string));
+        assert!(
+            rendered.contains("no module `package::nowhere`"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("package::main"), "{rendered}");
+    }
+
+    #[test]
+    fn a_root_that_is_not_in_the_module_set_is_an_error() {
+        let error =
+            compile(&Modules::new(), "package::absent", &Bindings::new()).expect_err("no root");
+        assert!(error.to_string().contains("no module"), "{error}");
+    }
+    #[test]
+    fn a_template_from_another_module_is_instantiated_at_the_call_site() {
+        // The template and the call are in different files, which is why
+        // instantiation runs on the flat module rather than per file.
+        let mut modules = library();
+        modules.insert(
+            "package::math::scale",
+            "fn scale<T: f32 | vec3f>(v: T, k: f32) -> T { return v * T(k); }\n",
+        );
+        modules.insert(
+            "package::main",
+            "import package::math::scale::scale;\n\
+             @fragment\n\
+             fn fs() -> @location(0) vec4f {\n\
+             \x20   let tint = vec3f(0.5);\n\
+             \x20   return vec4f(scale(tint, 2.0), 1.0);\n}\n",
+        );
+
+        let wgsl = match compile(&modules, "package::main", &Bindings::new()) {
+            Ok(wgsl) => wgsl,
+            Err(diagnostics) => panic!(
+                "{}",
+                diagnostics.render(&|path| modules.get(path).map(str::to_string))
+            ),
+        };
+        // Mangled by resolution, then instantiated: both names survive in
+        // the one identifier, which is what makes a GPU capture readable.
+        assert!(
+            wgsl.contains("fn package_math_scale_scale_vec3f(v: vec3f, k: f32) -> vec3f"),
+            "{wgsl}"
+        );
+        assert!(
+            wgsl.contains("package_math_scale_scale_vec3f(tint, 2.0)"),
+            "{wgsl}"
+        );
+        assert!(!wgsl.contains("<T"), "{wgsl}");
+        assert!(!wgsl.contains("T(k)"), "{wgsl}");
+    }
+
+    #[test]
+    fn a_template_the_root_never_calls_reaches_nothing() {
+        let mut modules = library();
+        modules.insert(
+            "package::math::scale",
+            "fn scale<T: f32 | vec3f>(v: T, k: f32) -> T { return v * T(k); }\n",
+        );
+        modules.insert(
+            "package::main",
+            "import package::math::scale::scale;\n\
+             @fragment\n\
+             fn fs() -> @location(0) vec4f { return vec4f(1.0); }\n",
+        );
+        let wgsl = compile(&modules, "package::main", &Bindings::new()).expect("compiles");
+        assert!(!wgsl.contains("scale"), "{wgsl}");
+    }
+
+    #[test]
+    fn a_bad_instantiation_points_at_the_file_that_wrote_the_call() {
+        let mut modules = library();
+        modules.insert(
+            "package::math::scale",
+            "fn scale<T: f32 | vec3f>(v: T, k: f32) -> T { return v * T(k); }\n",
+        );
+        modules.insert(
+            "package::main",
+            "import package::math::scale::scale;\n\
+             @fragment\n\
+             fn fs() -> @location(0) vec4f {\n\
+             \x20   let tint = vec2f(0.5);\n\
+             \x20   return vec4f(scale(tint, 2.0), 0.0, 1.0);\n}\n",
+        );
+        let error =
+            compile(&modules, "package::main", &Bindings::new()).expect_err("vec2f is not allowed");
+        let rendered = error.render(&|path| modules.get(path).map(str::to_string));
+        assert!(rendered.contains("package::main"), "{rendered}");
+        assert!(
+            rendered.contains("must be one of: f32 | vec3f"),
+            "{rendered}"
+        );
+        // The caret has to land on the call, in the caller file.
+        assert!(rendered.contains("scale(tint, 2.0)"), "{rendered}");
+    }
+}

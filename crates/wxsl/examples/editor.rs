@@ -1,0 +1,1287 @@
+//! The node editor, in a window.
+//!
+//! Everything editor-shaped is in `wxsl-editor`, which is
+//! windowing-agnostic. This file is the other half: a winit event
+//! loop, a surface, and the translation from winit's events to
+//! [`wxsl::render::ui::UiEvent`]. It is the only file in the workspace that
+//! knows winit exists, which is what keeps the editor embeddable in an
+//! application that already has an event loop of its own.
+//!
+//! ```text
+//! cargo run --example editor                          # the shipped demo graph
+//! cargo run --example editor -- --graph my.wxsl.json   # a graph of your own
+//! cargo run --example editor -- --font C:/Windows/Fonts/segoeui.ttf
+//! cargo run --example editor -- --list-fonts           # what it would pick
+//! cargo run --example editor -- --screenshot out.png   # one frame, no window
+//! cargo run --example editor -- --pipeline             # open the pipeline canvas
+//! cargo run --example editor --features gltf -- --scene resources/glb/DamagedHelmet/DamagedHelmet.glb
+//! cargo run --example editor --features mcp -- --mcp 7420               # an agent can attach
+//! cargo run --example editor --features mcp -- --mcp-stdio --headless   # an agent, no window
+//! ```
+//!
+//! # Fonts
+//!
+//! `wxsl-render` ships no font, exactly as it ships no shaders:
+//! the application supplies them. This one takes the repo's default faces
+//! from `resources/fonts/` (see that directory's README) and falls back to
+//! a short list of well-known system places; `--font`/`--mono` override
+//! both. If the search fails, the error says so rather than opening a
+//! window with invisible labels.
+//!
+//! # Keys
+//!
+//! `P` material/pipeline canvas · `F`/`D` render path · `M` preview mesh ·
+//! `G` MSDF backend · `A` add a node · `R` frame the graph · `Space` pause
+//! the spin · `Ctrl+S` save · `Delete` remove the selection · `Esc` quit.
+//! In the bottom panel's `function` tab the code editor has the
+//! keyboard: `Ctrl+S` there saves the function as a `user.*` node, `Ctrl+Z`
+//! undoes, and `Esc` leaves the editor rather than the application.
+//!
+//! The pipeline canvas opens on the deferred preset and compiles
+//! on every edit onto the same renderer the preview runs — so dropping a
+//! `pass.screen` node onto it, wiring it, and naming an effect changes what
+//! the preview's mesh is drawn through, live.
+//!
+//! # Pointer
+//!
+//! Drag a node to move it · drag a port to link · drag a *connected* input to
+//! pick its link up · right-click a link to cut it · right-click the canvas
+//! to add a node there · middle-drag (or shift-right-drag) to pan · wheel to
+//! zoom · drag the preview to turn it.
+//!
+//! # Scenes
+//!
+//! `--scene` opens a `.scene.json`, or a `.glb`/`.gltf` with the `gltf`
+//! feature, in the scene mode; dropping one of those files on
+//! the window does the same, a glTF file joining the open scene. Drag the
+//! viewport to orbit, scroll to zoom, click an instance to select it and
+//! open its material in the material canvas. `Ctrl+S` in the scene mode
+//! writes the scene as JSON.
+//!
+//! # Agents
+//!
+//! With the `mcp` feature, `--mcp <PORT>` serves the editor's commands to
+//! an MCP client over local HTTP while the window stays usable,
+//! and prints the line that registers it with a client. `--mcp-stdio
+//! --headless` serves them over stdio with no window, for CI. Paths an
+//! agent names stay under `--mcp-root`, the current directory by default.
+
+use std::error::Error;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Instant;
+
+use glam::Vec2;
+use winit::application::ApplicationHandler;
+use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{Key as WinitKey, ModifiersState, NamedKey, PhysicalKey};
+use winit::window::{Window, WindowId};
+use wxsl::core::graph::Graph;
+use wxsl::editor::{CanvasMode, Command, Editor, EditorConfig};
+use wxsl::render::gpu::GpuContext;
+use wxsl::render::ui::input::{Key, Modifiers, MouseButton, UiEvent};
+use wxsl::render::ui::UiTarget;
+
+/// The graph opened when `--graph` is not given: the same demo the renderer's
+/// example uses, so the two show the same material.
+const DEFAULT_GRAPH: &str = include_str!("../assets/pbr_cube.wxsl.json");
+
+const USAGE: &str = "\
+editor — the wxsl visual node editor
+
+USAGE:
+    cargo run --example editor -- [OPTIONS]
+
+OPTIONS:
+    --graph <FILE>        Graph to open, in the node format (default: the shipped demo)
+    --pipeline            Start on the pipeline canvas (the deferred preset,
+                          compiled live; Ctrl+S there saves edited.pipeline.json)
+    --scene <FILE>        Open a .scene.json, or a .glb/.gltf (gltf feature),
+                          in the scene mode; dropping a file does the same
+    --font <FILE>         Proportional font for the interface
+    --mono <FILE>         Monospaced font for the code panels
+    --size <WIDTHxHEIGHT> Window size (default: 1600x900)
+    --atlas <PIXELS>      Glyph atlas side length (default: 2048)
+    --list-fonts          Print the fonts that would be used, and exit
+    --screenshot <FILE>   Render one frame headless to a PNG and exit
+    --mcp <PORT>          Serve MCP over HTTP on 127.0.0.1 (0: any free port;
+                          mcp feature)
+    --mcp-stdio           Serve MCP over stdin/stdout (mcp feature)
+    --mcp-root <DIR>      The directory agents' paths stay under (default: .)
+    --headless            No window: only serve MCP, until stdin closes
+    -h, --help            Print this help
+
+KEYS:
+    P            material / pipeline canvas
+    F / D        forward / deferred render path (material canvas)
+    M            cycle the preview mesh
+    A            add a node at the middle of the canvas
+    R            frame the whole graph
+    Space        pause the preview's spin (tap; held, it pans)
+    Ctrl+S       save the active document (in the function tab's code
+                 editor: save the function as a user.* node)
+    Ctrl+Z       undo in the code editor (Ctrl+Shift+Z redo)
+    Delete       delete the selected nodes
+    Esc          quit (in the code editor: leave it)
+
+POINTER:
+    drag a node             move it (the whole selection moves)
+    drag a port             draw a link; drop it on a compatible port
+    drag a connected input  pick that link up by its other end
+    right-click a link      cut it
+    right-click the canvas  add a node there
+    middle-drag             pan (shift + right-drag, or Space + move)
+    wheel                   zoom about the pointer
+    drag the preview        turn the mesh
+";
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let options = match Options::parse(std::env::args().skip(1)) {
+        Ok(options) => options,
+        Err(message) => {
+            eprintln!("error: {message}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
+    if options.help {
+        print!("{USAGE}");
+        return Ok(());
+    }
+
+    let fonts = Fonts::find(options.ui_font.as_deref(), options.mono_font.as_deref())?;
+    if options.list_fonts {
+        println!("interface: {}", fonts.ui_path.display());
+        println!("monospace: {}", fonts.mono_path.display());
+        return Ok(());
+    }
+
+    let graph = load_graph(options.graph.as_deref())?;
+    if let Some(path) = options.screenshot.clone() {
+        return screenshot(&options, graph, fonts, &path);
+    }
+    let mcp = mcp::start(&options)?;
+    if options.headless {
+        return mcp::headless(&options, graph, fonts, mcp);
+    }
+
+    let event_loop = EventLoop::new()?;
+    event_loop.set_control_flow(ControlFlow::Poll);
+    let mut app = App {
+        options,
+        graph: Some(graph),
+        fonts: Some(fonts),
+        mcp,
+        state: None,
+        started: Instant::now(),
+        modifiers: Modifiers::NONE,
+        error: None,
+    };
+    event_loop.run_app(&mut app)?;
+    match app.error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Headless
+// ---------------------------------------------------------------------------
+
+/// Render a few frames with no window and write the last one to a PNG.
+///
+/// Worth having beyond the obvious: the editor draws itself with the renderer,
+/// so a screenshot is a complete test of the UI shader, the glyph
+/// atlas, the instance path and the offscreen preview — reviewable in a diff,
+/// and runnable on a machine with no display.
+fn screenshot(
+    options: &Options,
+    graph: Graph,
+    fonts: Fonts,
+    path: &Path,
+) -> Result<(), Box<dyn Error>> {
+    use wxsl::render::gpu::OffscreenTarget;
+
+    let gpu = pollster::block_on(GpuContext::headless())?;
+    let (width, height) = options.size;
+    let target = OffscreenTarget::new(&gpu.device, width, height);
+
+    let mut config = EditorConfig::new(
+        wxsl::stdlib_library(),
+        wxsl::stdlib::registry(),
+        graph,
+        fonts.ui,
+        fonts.mono,
+    );
+    config.atlas_size = options.atlas;
+    let mut editor = Editor::new(&gpu.device, &gpu.queue, config)?;
+    editor.handle_event(UiEvent::Resized {
+        size: Vec2::new(width as f32, height as f32),
+        scale: 1.0,
+    });
+
+    // Select the graph's output node, so the picture shows the inspector
+    // doing something rather than saying "no node selected".
+    let output = editor
+        .graph()
+        .surface_outputs(editor.registry())
+        .first()
+        .copied()
+        .or_else(|| editor.graph().nodes().map(|(id, _)| id).next());
+    if let Some(node) = output {
+        editor.select([node]);
+    }
+    // After the selection: entering the pipeline mode replaces the centre
+    // canvas wholesale, and the selection that matters there is the first
+    // frame's compile.
+    if options.pipeline {
+        editor.set_canvas_mode(CanvasMode::Pipeline);
+    }
+    if let Some(scene) = options.scene.as_deref() {
+        open_file(&mut editor, scene);
+    }
+
+    // Three frames: the first fills the glyph atlas and compiles the
+    // material, and the preview needs one more to have something to spin.
+    for frame in 0..3 {
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("editor screenshot"),
+            });
+        editor.frame(
+            &gpu.device,
+            &gpu.queue,
+            &mut encoder,
+            &UiTarget {
+                view: target.view(),
+                format: target.format(),
+                width,
+                height,
+                clear: None,
+            },
+            frame as f64 * 0.016,
+        )?;
+        gpu.queue.submit([encoder.finish()]);
+        gpu.wait();
+    }
+
+    let pixels = target.read_rgba8(&gpu.device, &gpu.queue);
+    image::save_buffer(
+        path,
+        &pixels,
+        width,
+        height,
+        image::ExtendedColorType::Rgba8,
+    )?;
+    println!(
+        "wrote {} ({width}x{height}, {})",
+        path.display(),
+        if options.pipeline {
+            match editor.pipeline_status() {
+                [] => "the document compiles".to_string(),
+                errors => format!("{} compile error(s)", errors.len()),
+            }
+        } else {
+            match editor.preview().status() {
+                wxsl::editor::PreviewStatus::Ok => "the graph compiles".to_string(),
+                other => format!("{other:?}"),
+            }
+        }
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Command line
+// ---------------------------------------------------------------------------
+
+struct Options {
+    graph: Option<PathBuf>,
+    pipeline: bool,
+    scene: Option<PathBuf>,
+    ui_font: Option<PathBuf>,
+    mono_font: Option<PathBuf>,
+    size: (u32, u32),
+    atlas: u32,
+    list_fonts: bool,
+    screenshot: Option<PathBuf>,
+    mcp_port: Option<u16>,
+    mcp_stdio: bool,
+    mcp_root: PathBuf,
+    headless: bool,
+    help: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options {
+            graph: None,
+            scene: None,
+            pipeline: false,
+            ui_font: None,
+            mono_font: None,
+            size: (1600, 900),
+            atlas: 2048,
+            list_fonts: false,
+            screenshot: None,
+            mcp_port: None,
+            mcp_stdio: false,
+            mcp_root: PathBuf::from("."),
+            headless: false,
+            help: false,
+        }
+    }
+}
+
+impl Options {
+    fn parse(args: impl Iterator<Item = String>) -> Result<Self, String> {
+        let mut options = Options::default();
+        let mut args = args.peekable();
+        while let Some(argument) = args.next() {
+            let mut value = || {
+                args.next()
+                    .ok_or_else(|| format!("{argument} needs a value"))
+            };
+            match argument.as_str() {
+                "--graph" => options.graph = Some(PathBuf::from(value()?)),
+                "--pipeline" => options.pipeline = true,
+                "--scene" => options.scene = Some(PathBuf::from(value()?)),
+                "--font" => options.ui_font = Some(PathBuf::from(value()?)),
+                "--mono" => options.mono_font = Some(PathBuf::from(value()?)),
+                "--size" => {
+                    let text = value()?;
+                    let (width, height) = text
+                        .split_once(['x', 'X'])
+                        .ok_or_else(|| format!("`{text}` is not WIDTHxHEIGHT"))?;
+                    options.size = (
+                        width.trim().parse().map_err(|_| "bad width".to_string())?,
+                        height
+                            .trim()
+                            .parse()
+                            .map_err(|_| "bad height".to_string())?,
+                    );
+                }
+                "--atlas" => {
+                    let text = value()?;
+                    options.atlas = text.trim().parse().map_err(|_| "bad atlas size")?;
+                }
+                "--list-fonts" => options.list_fonts = true,
+                "--screenshot" => options.screenshot = Some(PathBuf::from(value()?)),
+                "--mcp" => {
+                    let text = value()?;
+                    options.mcp_port = Some(text.trim().parse().map_err(|_| "bad port")?);
+                }
+                "--mcp-stdio" => options.mcp_stdio = true,
+                "--mcp-root" => options.mcp_root = PathBuf::from(value()?),
+                "--headless" => options.headless = true,
+                "-h" | "--help" => options.help = true,
+                other => return Err(format!("unknown option `{other}`")),
+            }
+        }
+        if options.mcp_port.is_some() && options.mcp_stdio {
+            return Err("--mcp and --mcp-stdio are one transport or the other".into());
+        }
+        if options.headless && options.mcp_port.is_none() && !options.mcp_stdio {
+            return Err("--headless serves MCP: pass --mcp <PORT> or --mcp-stdio".into());
+        }
+        Ok(options)
+    }
+}
+
+/// Open a dropped or named file in the scene mode: a scene document
+/// replaces the scene, a glTF file joins it.
+fn open_file(editor: &mut Editor, path: &Path) {
+    let gltf = path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("glb") || ext.eq_ignore_ascii_case("gltf"));
+    let path_text = path.display().to_string();
+    let command = if gltf {
+        Command::ImportGltf { path: path_text }
+    } else {
+        Command::OpenScene { path: path_text }
+    };
+    match editor.apply(command) {
+        Ok(_) => {
+            editor.set_canvas_mode(CanvasMode::Scene);
+            editor.set_message(format!("opened {}", path.display()));
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            editor.set_message(error.to_string());
+        }
+    }
+}
+
+fn load_graph(path: Option<&Path>) -> Result<Graph, Box<dyn Error>> {
+    match path {
+        Some(path) => {
+            let json = std::fs::read_to_string(path)
+                .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+            Ok(serde_json::from_str(&json)?)
+        }
+        None => Ok(serde_json::from_str(DEFAULT_GRAPH)?),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fonts
+// ---------------------------------------------------------------------------
+
+/// The two faces the editor needs, and where they came from.
+struct Fonts {
+    ui: Vec<u8>,
+    mono: Vec<u8>,
+    ui_path: PathBuf,
+    mono_path: PathBuf,
+}
+
+impl Fonts {
+    /// Load the fonts, from the paths given or from a platform default.
+    fn find(ui: Option<&Path>, mono: Option<&Path>) -> Result<Self, Box<dyn Error>> {
+        let ui_path = match ui {
+            Some(path) => path.to_path_buf(),
+            None => first_existing(UI_FONT_CANDIDATES).ok_or_else(|| {
+                format!(
+                    "no interface font found; pass --font <FILE>. Looked in:\n  {}",
+                    UI_FONT_CANDIDATES.join("\n  ")
+                )
+            })?,
+        };
+        let mono_path = match mono {
+            Some(path) => path.to_path_buf(),
+            None => first_existing(MONO_FONT_CANDIDATES).ok_or_else(|| {
+                format!(
+                    "no monospaced font found; pass --mono <FILE>. Looked in:\n  {}",
+                    MONO_FONT_CANDIDATES.join("\n  ")
+                )
+            })?,
+        };
+        Ok(Fonts {
+            ui: read_font(&ui_path)?,
+            mono: read_font(&mono_path)?,
+            ui_path,
+            mono_path,
+        })
+    }
+}
+
+fn read_font(path: &Path) -> Result<Vec<u8>, Box<dyn Error>> {
+    std::fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()).into())
+}
+
+fn first_existing(candidates: &[&str]) -> Option<PathBuf> {
+    candidates
+        .iter()
+        .map(PathBuf::from)
+        .find(|path| path.is_file())
+}
+
+/// The repo's default faces, resolved at compile time so the example finds
+/// them however it is run from. Checked before the system lists, so the
+/// editor renders the same text on every machine — which is also what the
+/// screenshot tests want.
+const UI_FONT: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../resources/fonts/Inter-Regular.ttf"
+);
+const MONO_FONT: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../resources/fonts/JetBrainsMono-Regular.ttf"
+);
+
+/// Where a proportional UI font usually lives.
+///
+/// Deliberately dumb — the repo's default first, then a short list of
+/// system places, checked in order. A real application would ask the
+/// platform's font service; an example that has to work on three operating
+/// systems with no dependencies checks paths.
+#[cfg(target_os = "windows")]
+const UI_FONT_CANDIDATES: &[&str] = &[
+    UI_FONT,
+    "C:/Windows/Fonts/segoeui.ttf",
+    "C:/Windows/Fonts/calibri.ttf",
+    "C:/Windows/Fonts/arial.ttf",
+    "C:/Windows/Fonts/tahoma.ttf",
+];
+
+/// Where a monospaced font usually lives.
+#[cfg(target_os = "windows")]
+const MONO_FONT_CANDIDATES: &[&str] = &[
+    MONO_FONT,
+    "C:/Windows/Fonts/consola.ttf",
+    "C:/Windows/Fonts/CascadiaMono.ttf",
+    "C:/Windows/Fonts/lucon.ttf",
+    "C:/Windows/Fonts/cour.ttf",
+];
+
+#[cfg(target_os = "macos")]
+const UI_FONT_CANDIDATES: &[&str] = &[
+    UI_FONT,
+    "/System/Library/Fonts/SFNS.ttf",
+    "/System/Library/Fonts/Helvetica.ttc",
+    "/Library/Fonts/Arial.ttf",
+];
+
+#[cfg(target_os = "macos")]
+const MONO_FONT_CANDIDATES: &[&str] = &[
+    MONO_FONT,
+    "/System/Library/Fonts/SFNSMono.ttf",
+    "/System/Library/Fonts/Menlo.ttc",
+    "/System/Library/Fonts/Monaco.ttf",
+];
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+const UI_FONT_CANDIDATES: &[&str] = &[
+    UI_FONT,
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+];
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+const MONO_FONT_CANDIDATES: &[&str] = &[
+    MONO_FONT,
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+    "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+    "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+    "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
+];
+
+// ---------------------------------------------------------------------------
+// The window
+// ---------------------------------------------------------------------------
+
+/// Everything that only exists once there is a window.
+struct State {
+    window: Arc<Window>,
+    surface: wgpu::Surface<'static>,
+    gpu: GpuContext,
+    format: wgpu::TextureFormat,
+    editor: Editor,
+}
+
+struct App {
+    options: Options,
+    /// Taken when the window is created.
+    graph: Option<Graph>,
+    /// Taken when the window is created.
+    fonts: Option<Fonts>,
+    /// The MCP server, served after every frame.
+    mcp: mcp::Mcp,
+    state: Option<State>,
+    started: Instant,
+    modifiers: Modifiers,
+    error: Option<Box<dyn Error>>,
+}
+
+impl App {
+    fn create_state(&mut self, event_loop: &ActiveEventLoop) -> Result<State, Box<dyn Error>> {
+        let (width, height) = self.options.size;
+        // Hidden at first: the platform paints a freshly created window's
+        // client area itself before anything here has drawn a frame — white,
+        // on Windows — and that paint can happen before `present_black_frame`
+        // below runs. Revealing the window only after that first present
+        // guarantees the first pixels shown are ours, not the platform's.
+        let window = Arc::new(
+            event_loop.create_window(
+                Window::default_attributes()
+                    .with_title("wxsl — node editor")
+                    .with_inner_size(winit::dpi::LogicalSize::new(width, height))
+                    .with_visible(false),
+            )?,
+        );
+
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let surface = instance.create_surface(Arc::clone(&window))?;
+        let gpu = pollster::block_on(GpuContext::new(instance, Some(&surface)))?;
+
+        // A non-sRGB format: the UI pass writes colours through unchanged, and
+        // the preview's shading function encodes sRGB itself so that the two
+        // render paths agree exactly. With an `*Srgb` surface everything would
+        // be encoded twice.
+        let capabilities = surface.get_capabilities(&gpu.adapter);
+        let format = capabilities
+            .formats
+            .iter()
+            .copied()
+            .find(|format| !format.is_srgb())
+            .unwrap_or_else(|| {
+                eprintln!("warning: no linear surface format; colours will be washed out");
+                capabilities.formats[0]
+            });
+
+        // Configure the surface and present one black frame *before* the
+        // slower setup below (loading fonts, compiling the UI shader and,
+        // with the GPU MSDF backend, its compute pipeline) and before the
+        // window is revealed, so there is never a frame with nothing drawn
+        // to it — just a black window that opens instantly and is still
+        // loading, rather than a stall.
+        let initial_size = window.inner_size();
+        surface.configure(
+            &gpu.device,
+            &surface_configuration(format, initial_size.width, initial_size.height),
+        );
+        present_black_frame(&gpu, &surface);
+        window.set_visible(true);
+
+        let fonts = self
+            .fonts
+            .take()
+            .expect("fonts are loaded before the window");
+        let graph = self
+            .graph
+            .take()
+            .expect("the graph is loaded before the window");
+        let scale = window.scale_factor() as f32;
+        let mut config = EditorConfig::new(
+            wxsl::stdlib_library(),
+            wxsl::stdlib::registry(),
+            graph,
+            fonts.ui,
+            fonts.mono,
+        );
+        config.atlas_size = self.options.atlas;
+        config.scale = scale;
+
+        let mut editor = Editor::new(&gpu.device, &gpu.queue, config)?;
+        // Hot reload over the node library's own sources, when this runs
+        // from a checkout: an edited `.wxsl` lands in the preview.
+        let shaders = Path::new(env!("CARGO_MANIFEST_DIR")).join("../wxsl-stdlib/shaders");
+        if shaders.is_dir() {
+            let watched = editor.watch_shaders(&shaders);
+            eprintln!("hot reload: watching {watched} shader files");
+        }
+        if self.options.pipeline {
+            editor.set_canvas_mode(CanvasMode::Pipeline);
+        }
+        if let Some(scene) = self.options.scene.as_deref() {
+            open_file(&mut editor, scene);
+        }
+        let size = window.inner_size();
+        // The editor learns the viewport from events, so it needs the first
+        // one before it can lay anything out.
+        editor.handle_event(UiEvent::Resized {
+            size: Vec2::new(size.width as f32, size.height as f32),
+            scale,
+        });
+
+        let mut state = State {
+            window,
+            surface,
+            gpu,
+            format,
+            editor,
+        };
+        configure_surface(&mut state, size.width, size.height);
+        Ok(state)
+    }
+
+    fn render(&mut self) {
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        let frame = match state.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(frame)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
+                let size = state.window.inner_size();
+                configure_surface(state, size.width, size.height);
+                return;
+            }
+            other => {
+                if !matches!(
+                    other,
+                    wgpu::CurrentSurfaceTexture::Occluded | wgpu::CurrentSurfaceTexture::Timeout
+                ) {
+                    eprintln!("dropped a frame: {other:?}");
+                }
+                return;
+            }
+        };
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let size = state.window.inner_size();
+        let mut encoder =
+            state
+                .gpu
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("editor frame"),
+                });
+        let result = state.editor.frame(
+            &state.gpu.device,
+            &state.gpu.queue,
+            &mut encoder,
+            &UiTarget {
+                view: &view,
+                format: state.format,
+                width: size.width,
+                height: size.height,
+                // The editor paints its own background over the whole window,
+                // so there is nothing to clear to.
+                clear: None,
+            },
+            self.started.elapsed().as_secs_f64(),
+        );
+        if let Err(error) = result {
+            eprintln!("cannot draw the editor: {error}");
+        }
+        state.gpu.queue.submit([encoder.finish()]);
+        state.gpu.queue.present(frame);
+        mcp::serve(
+            &mut self.mcp,
+            &mut state.editor,
+            &state.gpu,
+            (size.width, size.height),
+            self.started.elapsed().as_secs_f64(),
+        );
+    }
+
+    /// Save the active document back to where it came from.
+    ///
+    /// The pipeline document is a graph in the same node format, so it
+    /// saves by the same serializer — to its own default, because a
+    /// pipeline is not a material and overwriting the material's file
+    /// with one would be a prank.
+    fn save(&mut self) {
+        if let Some(state) = self.state.as_mut() {
+            if state.editor.canvas_mode() == CanvasMode::Scene {
+                // Back to its own file only when that is a scene document:
+                // a .glb is not overwritten with JSON.
+                let path = self
+                    .options
+                    .scene
+                    .clone()
+                    .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+                    .unwrap_or_else(|| PathBuf::from("edited.scene.json"));
+                let command = Command::SaveScene {
+                    path: path.display().to_string(),
+                };
+                match state.editor.apply(command) {
+                    Ok(_) => state
+                        .editor
+                        .set_message(format!("saved {}", path.display())),
+                    Err(error) => state.editor.set_message(error.to_string()),
+                }
+                return;
+            }
+        }
+        let pipeline = self
+            .state
+            .as_ref()
+            .map(|state| state.editor.canvas_mode() == CanvasMode::Pipeline)
+            .unwrap_or(false);
+        let path = if pipeline {
+            PathBuf::from("edited.pipeline.json")
+        } else {
+            self.options
+                .graph
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("edited.wxsl.json"))
+        };
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        let json = if pipeline {
+            state
+                .editor
+                .pipeline_graph()
+                .map(serde_json::to_string_pretty)
+        } else {
+            Some(serde_json::to_string_pretty(state.editor.graph()))
+        };
+        let json = match json {
+            Some(json) => json,
+            None => return,
+        };
+        match json {
+            Ok(json) => match std::fs::write(&path, json) {
+                Ok(()) => {
+                    state.editor.mark_saved();
+                    state
+                        .editor
+                        .set_message(format!("saved {}", path.display()));
+                }
+                Err(error) => state
+                    .editor
+                    .set_message(format!("cannot write {}: {error}", path.display())),
+            },
+            Err(error) => state
+                .editor
+                .set_message(format!("cannot serialize the graph: {error}")),
+        }
+    }
+}
+
+/// The surface configuration this example always uses, just parameterized
+/// on the format and size — shared so the very first, editor-less configure
+/// in [`App::create_state`] and every later resize agree on everything else.
+fn surface_configuration(
+    format: wgpu::TextureFormat,
+    width: u32,
+    height: u32,
+) -> wgpu::SurfaceConfiguration {
+    wgpu::SurfaceConfiguration {
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        format,
+        color_space: wgpu::SurfaceColorSpace::Auto,
+        width: width.max(1),
+        height: height.max(1),
+        present_mode: wgpu::PresentMode::AutoVsync,
+        desired_maximum_frame_latency: 2,
+        alpha_mode: wgpu::CompositeAlphaMode::Auto,
+        view_formats: vec![],
+    }
+}
+
+fn configure_surface(state: &mut State, width: u32, height: u32) {
+    state.surface.configure(
+        &state.gpu.device,
+        &surface_configuration(state.format, width, height),
+    );
+}
+
+/// Clear the surface to black and present it, with no editor and no draw
+/// list — the whole point is that this can run before either exists. See
+/// the call site in [`App::create_state`] for why.
+fn present_black_frame(gpu: &GpuContext, surface: &wgpu::Surface<'_>) {
+    let frame = match surface.get_current_texture() {
+        wgpu::CurrentSurfaceTexture::Success(frame)
+        | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+        // Nothing to present yet on this backend/platform combination; the
+        // window keeps its blank backdrop a little longer, which is no worse
+        // than before this existed.
+        _ => return,
+    };
+    let view = frame
+        .texture
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    let mut encoder = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("initial black frame"),
+        });
+    {
+        let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("initial black frame"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+    }
+    gpu.queue.submit([encoder.finish()]);
+    gpu.queue.present(frame);
+}
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.state.is_some() {
+            return;
+        }
+        match self.create_state(event_loop) {
+            Ok(state) => {
+                // Standard output is the protocol's under --mcp-stdio.
+                if !self.options.mcp_stdio {
+                    println!("{USAGE}");
+                }
+                self.state = Some(state);
+            }
+            Err(error) => {
+                self.error = Some(error);
+                event_loop.exit();
+            }
+        }
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _window: WindowId,
+        event: WindowEvent,
+    ) {
+        // Translation only: every decision about what an event *means* is the
+        // editor's, which is what keeps it usable from another event loop.
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::DroppedFile(path) => {
+                if let Some(state) = self.state.as_mut() {
+                    open_file(&mut state.editor, &path);
+                }
+            }
+            WindowEvent::RedrawRequested => self.render(),
+            WindowEvent::Resized(size) => {
+                if let Some(state) = self.state.as_mut() {
+                    configure_surface(state, size.width, size.height);
+                    let scale = state.window.scale_factor() as f32;
+                    state.editor.handle_event(UiEvent::Resized {
+                        size: Vec2::new(size.width as f32, size.height as f32),
+                        scale,
+                    });
+                }
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                if let Some(state) = self.state.as_mut() {
+                    let size = state.window.inner_size();
+                    state.editor.handle_event(UiEvent::Resized {
+                        size: Vec2::new(size.width as f32, size.height as f32),
+                        scale: scale_factor as f32,
+                    });
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => self.send(UiEvent::PointerMoved(
+                Vec2::new(position.x as f32, position.y as f32),
+            )),
+            WindowEvent::CursorLeft { .. } => self.send(UiEvent::PointerLeft),
+            WindowEvent::MouseInput { state, button, .. } => {
+                if let Some(button) = translate_button(button) {
+                    self.send(UiEvent::PointerButton {
+                        button,
+                        pressed: state == ElementState::Pressed,
+                    });
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let delta = match delta {
+                    // A line is worth about a row of text; the editor works
+                    // in pixels of content.
+                    MouseScrollDelta::LineDelta(x, y) => Vec2::new(x, y) * 32.0,
+                    MouseScrollDelta::PixelDelta(position) => {
+                        Vec2::new(position.x as f32, position.y as f32)
+                    }
+                };
+                self.send(UiEvent::Scroll(delta));
+            }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.modifiers = translate_modifiers(modifiers.state());
+                self.send(UiEvent::ModifiersChanged(self.modifiers));
+            }
+            WindowEvent::Focused(focused) => self.send(UiEvent::FocusChanged(focused)),
+            WindowEvent::KeyboardInput { event, .. } => {
+                let pressed = event.state == ElementState::Pressed;
+                // While the code editor or a text field has the keyboard,
+                // Escape and Ctrl+S are the editor's: leave the field, save
+                // the function being written.
+                let typing = self
+                    .state
+                    .as_ref()
+                    .is_some_and(|state| state.editor.is_typing());
+                if pressed && !typing {
+                    if let WinitKey::Named(NamedKey::Escape) = event.logical_key {
+                        event_loop.exit();
+                        return;
+                    }
+                    // Ctrl+S is the application's, not the editor's: only the
+                    // application knows where the document came from.
+                    if self.modifiers.command()
+                        && matches!(event.logical_key.to_text(), Some("s") | Some("S"))
+                    {
+                        self.save();
+                        return;
+                    }
+                }
+                if let Some(key) = translate_key(&event) {
+                    self.send(UiEvent::Key {
+                        key,
+                        pressed,
+                        repeat: event.repeat,
+                    });
+                }
+                if pressed {
+                    if let Some(text) = event.text.as_ref() {
+                        for character in text.chars() {
+                            self.send(UiEvent::Text(character));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(state) = self.state.as_ref() {
+            state.window.request_redraw();
+        }
+    }
+}
+
+impl App {
+    fn send(&mut self, event: UiEvent) {
+        if let Some(state) = self.state.as_mut() {
+            state.editor.handle_event(event);
+        }
+    }
+}
+
+fn translate_button(button: winit::event::MouseButton) -> Option<MouseButton> {
+    match button {
+        winit::event::MouseButton::Left => Some(MouseButton::Left),
+        winit::event::MouseButton::Right => Some(MouseButton::Right),
+        winit::event::MouseButton::Middle => Some(MouseButton::Middle),
+        _ => None,
+    }
+}
+
+fn translate_modifiers(state: ModifiersState) -> Modifiers {
+    Modifiers {
+        shift: state.shift_key(),
+        ctrl: state.control_key(),
+        alt: state.alt_key(),
+        logo: state.super_key(),
+    }
+}
+
+/// Winit's key to the editor's.
+///
+/// Printable keys become [`Key::Char`] with the *unmodified* lowercase
+/// character, so a shortcut matches however the layout spells shift; typed
+/// text arrives separately as [`UiEvent::Text`].
+fn translate_key(event: &winit::event::KeyEvent) -> Option<Key> {
+    use winit::keyboard::KeyCode;
+
+    if let WinitKey::Named(named) = event.logical_key {
+        let key = match named {
+            NamedKey::Escape => Key::Escape,
+            NamedKey::Enter => Key::Enter,
+            NamedKey::Tab => Key::Tab,
+            NamedKey::Backspace => Key::Backspace,
+            NamedKey::Delete => Key::Delete,
+            NamedKey::Insert => Key::Insert,
+            NamedKey::Home => Key::Home,
+            NamedKey::End => Key::End,
+            NamedKey::PageUp => Key::PageUp,
+            NamedKey::PageDown => Key::PageDown,
+            NamedKey::ArrowLeft => Key::Left,
+            NamedKey::ArrowRight => Key::Right,
+            NamedKey::ArrowUp => Key::Up,
+            NamedKey::ArrowDown => Key::Down,
+            NamedKey::Space => Key::Char(' '),
+            NamedKey::F1 => Key::Function(1),
+            NamedKey::F2 => Key::Function(2),
+            NamedKey::F3 => Key::Function(3),
+            NamedKey::F4 => Key::Function(4),
+            NamedKey::F5 => Key::Function(5),
+            NamedKey::F6 => Key::Function(6),
+            NamedKey::F7 => Key::Function(7),
+            NamedKey::F8 => Key::Function(8),
+            NamedKey::F9 => Key::Function(9),
+            NamedKey::F10 => Key::Function(10),
+            NamedKey::F11 => Key::Function(11),
+            NamedKey::F12 => Key::Function(12),
+            _ => return None,
+        };
+        return Some(key);
+    }
+
+    // The layout's letter without modifiers, so a shortcut follows the
+    // key's label: `Cmd+Z` on AZERTY is the key QWERTY calls W.
+    {
+        use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+        if let WinitKey::Character(text) = event.key_without_modifiers() {
+            let mut chars = text.chars();
+            if let (Some(c), None) = (chars.next(), chars.next()) {
+                if c.is_ascii_alphabetic() {
+                    return Some(Key::Char(c.to_ascii_lowercase()));
+                }
+            }
+        }
+    }
+
+    // Otherwise the physical key: digits whatever the layout does with
+    // shift, a letter on a non-Latin layout, a dead key.
+    if let PhysicalKey::Code(code) = event.physical_key {
+        let character = match code {
+            KeyCode::KeyA => 'a',
+            KeyCode::KeyB => 'b',
+            KeyCode::KeyC => 'c',
+            KeyCode::KeyD => 'd',
+            KeyCode::KeyE => 'e',
+            KeyCode::KeyF => 'f',
+            KeyCode::KeyG => 'g',
+            KeyCode::KeyH => 'h',
+            KeyCode::KeyI => 'i',
+            KeyCode::KeyJ => 'j',
+            KeyCode::KeyK => 'k',
+            KeyCode::KeyL => 'l',
+            KeyCode::KeyM => 'm',
+            KeyCode::KeyN => 'n',
+            KeyCode::KeyO => 'o',
+            KeyCode::KeyP => 'p',
+            KeyCode::KeyQ => 'q',
+            KeyCode::KeyR => 'r',
+            KeyCode::KeyS => 's',
+            KeyCode::KeyT => 't',
+            KeyCode::KeyU => 'u',
+            KeyCode::KeyV => 'v',
+            KeyCode::KeyW => 'w',
+            KeyCode::KeyX => 'x',
+            KeyCode::KeyY => 'y',
+            KeyCode::KeyZ => 'z',
+            KeyCode::Digit0 => '0',
+            KeyCode::Digit1 => '1',
+            KeyCode::Digit2 => '2',
+            KeyCode::Digit3 => '3',
+            KeyCode::Digit4 => '4',
+            KeyCode::Digit5 => '5',
+            KeyCode::Digit6 => '6',
+            KeyCode::Digit7 => '7',
+            KeyCode::Digit8 => '8',
+            KeyCode::Digit9 => '9',
+            KeyCode::Minus => '-',
+            KeyCode::Equal => '=',
+            KeyCode::Space => ' ',
+            _ => return None,
+        };
+        return Some(Key::Char(character));
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// MCP
+// ---------------------------------------------------------------------------
+
+/// The MCP server, when the `mcp` feature is on: one function per thing the
+/// application does with it, and empty stand-ins without it.
+mod mcp {
+    use super::*;
+
+    #[cfg(feature = "mcp")]
+    pub type Mcp = Option<wxsl::mcp::Server>;
+    #[cfg(not(feature = "mcp"))]
+    pub type Mcp = ();
+
+    /// Start the transport the options ask for.
+    #[cfg(feature = "mcp")]
+    pub fn start(options: &Options) -> Result<Mcp, Box<dyn Error>> {
+        use wxsl::mcp::{Root, Server};
+        let root = Root::new(&options.mcp_root)
+            .map_err(|error| format!("--mcp-root {}: {error}", options.mcp_root.display()))?;
+        if options.mcp_stdio {
+            eprintln!(
+                "mcp: serving over stdio, paths under {}",
+                root.path().display()
+            );
+            return Ok(Some(Server::stdio(root)?));
+        }
+        let Some(port) = options.mcp_port else {
+            return Ok(None);
+        };
+        let token = std::env::var("WXSL_MCP_TOKEN").ok();
+        let server = Server::http(root, port, token)?;
+        let (url, token) = (
+            server.url().unwrap_or_default(),
+            server.token().unwrap_or_default(),
+        );
+        eprintln!("mcp: {url}, paths under {}", server.root().path().display());
+        eprintln!(
+            "mcp: claude mcp add --transport http wxsl {url} --header \"Authorization: Bearer {token}\""
+        );
+        Ok(Some(server))
+    }
+
+    #[cfg(not(feature = "mcp"))]
+    pub fn start(options: &Options) -> Result<Mcp, Box<dyn Error>> {
+        if options.mcp_port.is_some() || options.mcp_stdio {
+            return Err(
+                "MCP needs the `mcp` feature: cargo run --example editor --features mcp".into(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Answer the calls that arrived during the frame just drawn.
+    #[cfg(feature = "mcp")]
+    pub fn serve(
+        mcp: &mut Mcp,
+        editor: &mut Editor,
+        gpu: &GpuContext,
+        size: (u32, u32),
+        time: f64,
+    ) {
+        if let Some(server) = mcp.as_mut() {
+            server.serve(
+                editor,
+                &wxsl::mcp::Frame {
+                    device: &gpu.device,
+                    queue: &gpu.queue,
+                    width: size.0,
+                    height: size.1,
+                    time,
+                },
+            );
+        }
+    }
+
+    #[cfg(not(feature = "mcp"))]
+    pub fn serve(_: &mut Mcp, _: &mut Editor, _: &GpuContext, _: (u32, u32), _: f64) {}
+
+    /// No window: an editor on a headless device, answering calls until
+    /// the stdio client goes away (HTTP serves until killed).
+    #[cfg(feature = "mcp")]
+    pub fn headless(
+        options: &Options,
+        graph: Graph,
+        fonts: Fonts,
+        mcp: Mcp,
+    ) -> Result<(), Box<dyn Error>> {
+        let mut server = mcp.ok_or("--headless needs a transport")?;
+        let gpu = pollster::block_on(GpuContext::headless())?;
+        let (width, height) = options.size;
+        let mut config = EditorConfig::new(
+            wxsl::stdlib_library(),
+            wxsl::stdlib::registry(),
+            graph,
+            fonts.ui,
+            fonts.mono,
+        );
+        config.atlas_size = options.atlas;
+        let mut editor = Editor::new(&gpu.device, &gpu.queue, config)?;
+        editor.handle_event(UiEvent::Resized {
+            size: Vec2::new(width as f32, height as f32),
+            scale: 1.0,
+        });
+        if options.pipeline {
+            editor.set_canvas_mode(CanvasMode::Pipeline);
+        }
+        if let Some(scene) = options.scene.as_deref() {
+            open_file(&mut editor, scene);
+        }
+        let started = Instant::now();
+        while !server.is_closed() {
+            if server.wait(std::time::Duration::from_millis(200)) {
+                server.serve(
+                    &mut editor,
+                    &wxsl::mcp::Frame {
+                        device: &gpu.device,
+                        queue: &gpu.queue,
+                        width,
+                        height,
+                        time: started.elapsed().as_secs_f64(),
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "mcp"))]
+    pub fn headless(_: &Options, _: Graph, _: Fonts, _: Mcp) -> Result<(), Box<dyn Error>> {
+        Err("--headless needs the `mcp` feature".into())
+    }
+}

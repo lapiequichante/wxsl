@@ -1,0 +1,53 @@
+// Original planar mirror composite, common to both entries, each in its
+// own file after this one. All colours are linear HDR.
+import package::wxsl::bindings::{point_sampler, environment_lut_sampler, camera};
+import package::wxsl::gbuffer::gbuffer_decode_normal;
+
+@group(3) @binding(0) var color_image: texture_2d<f32>;
+@group(3) @binding(1) var depth_image: texture_2d<f32>;
+@group(3) @binding(2) var reflection_image: texture_2d<f32>;
+@group(3) @binding(3) var reflection_mid: texture_2d<f32>;
+@group(3) @binding(4) var reflection_rough: texture_2d<f32>;
+
+@vertex
+fn vertex(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
+    let x = f32(i32(index & 1u) * 4 - 1);
+    let y = f32(i32(index >> 1u) * 4 - 1);
+    return vec4f(x, y, 0.0, 1.0);
+}
+
+// Mirror the pixel at `position`, shaded with `bumped`, the plane's normal or a
+// receiver's mapped one.
+fn compose(position: vec4f, bumped: vec3f) -> vec4f {
+    let uv = position.xy / vec2f(textureDimensions(color_image));
+    let color = textureLoad(color_image, vec2i(position.xy), 0);
+    let depth = textureSampleLevel(depth_image, point_sampler, uv, 0.0).x;
+    let projected = camera.inverse_view_proj * vec4f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+    let world = projected.xyz / projected.w;
+    let geometric = cross(dpdx(world), dpdy(world));
+    let normal = params.plane.xyz;
+    let alignment = abs(dot(geometric, normal)) / max(length(geometric), 1e-8);
+    if depth >= 1.0 || abs(dot(normal, world) + params.plane.w) > params.tolerance || alignment < 0.95 || dot(normal, camera.position) + params.plane.w <= 0.002 {
+        return color;
+    }
+    let eye = normalize(camera.position - world);
+    let ndv = clamp(dot(bumped, eye), 0.0, 1.0);
+    let fresnel = params.reflectance + (1.0 - params.reflectance) * pow(1.0 - ndv, 5.0);
+    // The bumped ray reaches what it reflects `distance` away. Mirrored through the
+    // plane, that point is where the capture saw it; on the flat plane it is this pixel.
+    let reached = world + reflect(-eye, bumped) * params.distance;
+    let mirrored = reached - 2.0 * (dot(normal, reached) + params.plane.w) * normal;
+    let clip = camera.view_proj * vec4f(mirrored, 1.0);
+    let ndc = clip.xy / max(clip.w, 1e-4);
+    let bent = clamp(vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5), vec2f(0.0), vec2f(1.0));
+    // The camera's X flip preserves winding; undo it when sampling the capture.
+    let at = vec2f(1.0 - bent.x, bent.y);
+    let sharp = textureSampleLevel(reflection_image, environment_lut_sampler, at, 0.0).rgb;
+    let mid = textureSampleLevel(reflection_mid, environment_lut_sampler, at, 0.0).rgb;
+    let rough = textureSampleLevel(reflection_rough, environment_lut_sampler, at, 0.0).rgb;
+    // A bump's tilt also spreads the lobe: its ripples are finer than the capture's texels.
+    let level = clamp(params.roughness * 2.0 + length(bumped - normal) * 4.0, 0.0, 2.0);
+    let reflected = mix(mix(sharp, mid, min(level, 1.0)), rough, max(level - 1.0, 0.0));
+    let weight = clamp(fresnel * params.strength, 0.0, 1.0);
+    return vec4f(mix(color.rgb, reflected, weight), color.a);
+}

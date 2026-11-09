@@ -1,0 +1,27 @@
+//! brdf_lut — the split-sum environment-BRDF LUT, baked once.
+//!
+//! The proof case for execution policies: a pure function of
+//! its own coordinates, written by a compute effect with policy `once`
+//! into a persistent target. `uv.x` is N·V, `uv.y` roughness; the texel
+//! holds the (scale, bias) pair Karis' environment-BRDF approximation
+//! reduces to, integrated over a Hammersley sample set. Nothing here reads
+//! a uniform or the scene, which is exactly why it never has to run again
+//! — and why the scheduler's rule that a policy'd pass writes only stable
+//! storage is not a limitation here but the whole design.
+//!
+//! The integral itself is `brdf_integrate.wxsl`, prepended to this file
+//! and to the fragment fallback that WebGL2 and GL run instead.
+
+@group(3) @binding(0) var lut: texture_storage_2d<rgba16float, write>;
+
+@compute
+@workgroup_size(8, 8)
+fn bake_lut(@builtin(global_invocation_id) id: vec3u) {
+    // The target's own size: the frame's LUT is the four quadrants, a
+    // document's 64-texel target only the first.
+    let side = textureDimensions(lut);
+    if (id.x >= side.x || id.y >= side.y) {
+        return;
+    }
+    textureStore(lut, vec2i(id.xy), lut_quadrant_texel(id.xy));
+}

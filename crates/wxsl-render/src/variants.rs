@@ -1,0 +1,679 @@
+//! The shader variant cache: WXSL in, `wgpu` shader modules out, compiled
+//! once per (shader, macro set, stage).
+//!
+//! Asking a material for a different *stage* means asking for a different
+//! variant; so does flipping a macro variable. Both go through
+//! [`ShaderVariants::material`], which compiles on a miss and hands back a
+//! cached module on a hit — the caller never has to know which happened.
+//!
+//! The key holds the *stage*, not the pipeline, and that is what makes a
+//! pipeline swap cheap: two pipelines that both want a `gbuffer` stage
+//! share the compiled result, so swapping between them costs nothing the
+//! second time.
+//!
+//! A macro is declared, with a default, by the WXSL module that uses it;
+//! the
+//! values here override those defaults. Binding a name no module declares is
+//! ignored rather than an error, because one binding set is applied to every
+//! module in a compilation. The flip side is that a typo in a macro name is
+//! silently ineffective rather than reported.
+
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use std::fmt::Write as _;
+
+use wxsl_core::abi::MaterialStage;
+use wxsl_core::codegen;
+use wxsl_core::lighting::{ChannelRequest, LightingSet};
+use wxsl_core::macros::MacroSet;
+use wxsl_core::wxsl::stable_hash;
+
+use crate::effect::{Effect, EffectShader};
+use crate::error::RenderError;
+use crate::library::ShaderLibrary;
+use crate::material::Material;
+
+/// Which shader a variant is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum VariantKind {
+    /// A material: the module generated from a graph, plus the ABI around it.
+    Material,
+    /// A screen effect's module — the lighting pass or a post effect —
+    /// which has no material graph.
+    Effect,
+}
+
+/// Identity of one compiled shader module.
+///
+/// `identity` folds in the generated source *and* the macro values: the
+/// generated module declares its macros at their effective values, but the
+/// bindings also reach *imported* modules, whose own defaults are not part
+/// of the root source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct VariantKey {
+    /// Material or lighting pass.
+    pub kind: VariantKind,
+    /// Hash of the source and macro values.
+    pub identity: u64,
+    /// The stage the variant was compiled for, or `None` for a shader that
+    /// has no material graph behind it.
+    ///
+    /// Redundant with `identity` — the stage is in the generated source,
+    /// so the hash already separates them — and kept anyway, because a
+    /// cache key that says what it holds is worth more than a byte.
+    pub stage: Option<MaterialStage>,
+}
+
+/// One compiled shader variant.
+pub struct ShaderVariant {
+    /// What this variant is.
+    pub key: VariantKey,
+    /// The `wgpu` module, ready to build pipelines from.
+    pub module: wgpu::ShaderModule,
+    /// The WGSL the WXSL compiler produced.
+    ///
+    /// Kept because it is the only readable answer to "what did my graph
+    /// actually turn into", which is most of shader-graph debugging. It is a
+    /// few kilobytes per variant.
+    pub wgsl: String,
+    /// Label used for the `wgpu` module and in error messages.
+    pub label: String,
+}
+
+/// How often the cache has been hit and missed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CacheStats {
+    /// Requests served from the cache.
+    pub hits: u64,
+    /// Requests that had to compile.
+    pub misses: u64,
+}
+
+/// The variant cache.
+#[derive(Default)]
+pub struct ShaderVariants {
+    entries: HashMap<VariantKey, Arc<ShaderVariant>>,
+    stats: CacheStats,
+    /// Macros the device profile pins over every variant.
+    pins: MacroSet,
+}
+
+impl ShaderVariants {
+    /// An empty cache.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// An empty cache whose every variant compiles with `pins` bound over
+    /// its own macros — the device profile's, which no graph
+    /// can override.
+    pub fn with_pins(pins: MacroSet) -> Self {
+        ShaderVariants {
+            pins,
+            ..Self::default()
+        }
+    }
+
+    /// The macros pinned over every variant.
+    pub fn pins(&self) -> &MacroSet {
+        &self.pins
+    }
+
+    /// The variant of `material` for `stage`, compiling it if it is not
+    /// cached.
+    pub fn material(
+        &mut self,
+        device: &wgpu::Device,
+        library: &ShaderLibrary,
+        material: &Material,
+        stage: MaterialStage,
+    ) -> Result<Arc<ShaderVariant>, RenderError> {
+        // Looked up before the request is built: a request copies the
+        // module's whole source, and a frame asks once per draw run per
+        // pass.
+        let key = pinned_key(Self::material_key(material, stage), &self.pins);
+        if let Some(existing) = self.hit(&key) {
+            return Ok(existing);
+        }
+        let request = MaterialRequest::new(material, stage).pinned(&self.pins);
+        self.get_or_compile(device, request.key, || request.compile(library))
+    }
+
+    /// The key `material`'s `stage` would be cached under, without
+    /// compiling or even looking.
+    pub fn material_key(material: &Material, stage: MaterialStage) -> VariantKey {
+        VariantKey {
+            kind: VariantKind::Material,
+            identity: material.variant_key(stage),
+            stage: Some(stage),
+        }
+    }
+
+    /// Whether `key` is already compiled.
+    pub fn contains(&self, key: &VariantKey) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    /// Adopt an already-compiled module — how a background swap hands its
+    /// results back to the cache it was compiling for
+    /// ([`crate::swap`]).
+    ///
+    /// Counted as a miss, because it is one: the work happened, just not
+    /// on this thread. WGSL the device refuses is an error, and nothing is
+    /// cached.
+    pub fn insert(
+        &mut self,
+        device: &wgpu::Device,
+        key: VariantKey,
+        label: String,
+        wgsl: String,
+    ) -> Result<Arc<ShaderVariant>, RenderError> {
+        if let Some(existing) = self.entries.get(&key) {
+            return Ok(Arc::clone(existing));
+        }
+        self.stats.misses += 1;
+        let variant = Arc::new(build_module(device, key, label, wgsl)?);
+        self.entries.insert(key, Arc::clone(&variant));
+        Ok(variant)
+    }
+
+    /// The variant `effect` runs, for `macros`, the enabled lighting set
+    /// and the enabled features.
+    ///
+    /// Independent of any material: by the time a screen effect runs, the
+    /// material has already been resolved into the G-buffer. The lighting
+    /// effect still varies with the macro set, because the shading
+    /// function it calls has `@if`s of its own (tonemapping, the
+    /// debug-normal view) — and with the set and the features, because its
+    /// module is *generated* from them ([`wxsl_core::lighting`]): its
+    /// switch names the enabled models and its bindings match the
+    /// G-buffer layout the plan asks for. A fixed effect's text is its
+    /// own, so its key folds in only the macros.
+    pub fn effect(
+        &mut self,
+        device: &wgpu::Device,
+        library: &ShaderLibrary,
+        effect: Effect,
+        macros: &MacroSet,
+        set: &LightingSet,
+        features: &[ChannelRequest],
+    ) -> Result<Arc<ShaderVariant>, RenderError> {
+        // Before the request, which builds the module's text: the
+        // lighting pass's is generated.
+        let key = pinned_key(Self::effect_key(&effect, macros, set, features), &self.pins);
+        if let Some(existing) = self.hit(&key) {
+            return Ok(existing);
+        }
+        let request = EffectRequest::new(effect, macros, set, features).pinned(&self.pins);
+        self.get_or_compile(device, request.key, || request.compile(library))
+    }
+
+    /// Compile an explicitly pinned effect request, retaining device pins.
+    pub(crate) fn effect_request(
+        &mut self,
+        device: &wgpu::Device,
+        library: &ShaderLibrary,
+        request: EffectRequest,
+    ) -> Result<Arc<ShaderVariant>, RenderError> {
+        let request = request.pinned(&self.pins);
+        self.get_or_compile(device, request.key, || request.compile(library))
+    }
+
+    /// The key the variant for `effect` is cached under.
+    pub fn effect_key(
+        effect: &Effect,
+        macros: &MacroSet,
+        set: &LightingSet,
+        features: &[ChannelRequest],
+    ) -> VariantKey {
+        let mut identity = String::from(effect.id);
+        identity.push(';');
+        identity.push_str(&effect_macros(effect, macros).signature());
+        // The parameter *layout* — names, types, offsets — never a value:
+        // the struct the shader reads is generated from the declaration,
+        // so a different layout is a different module, while a different
+        // default only changes what a fresh buffer starts at. This is the
+        // material parameters' rule, pass-level, and it is what
+        // keeps a slider a buffer write instead of a recompile.
+        identity.push_str(";params=");
+        identity.push_str(&effect.param_layout().signature());
+        // A graph-authored effect's text is not `&'static` and not implied
+        // by its id: two effects registered under one id at different times
+        // are two shaders, and the cache has to tell them apart by what
+        // they *are* rather than by what they are called.
+        if let EffectShader::Graph { wxsl, .. } = &effect.shader {
+            identity.push(';');
+            let _ = write!(identity, "{}", stable_hash(wxsl.as_bytes()));
+        }
+        if effect.shader == EffectShader::Lighting {
+            identity.push(';');
+            let _ = write!(identity, "{}", set.signature());
+            identity.push(';');
+            let names = features
+                .iter()
+                .map(|request| request.source.name())
+                .collect::<Vec<_>>()
+                .join(",");
+            let _ = write!(identity, "features={names}");
+        }
+        VariantKey {
+            kind: VariantKind::Effect,
+            identity: stable_hash(identity.as_bytes()),
+            stage: None,
+        }
+    }
+
+    fn get_or_compile(
+        &mut self,
+        device: &wgpu::Device,
+        key: VariantKey,
+        build: impl FnOnce() -> (String, Result<String, RenderError>),
+    ) -> Result<Arc<ShaderVariant>, RenderError> {
+        if let Some(existing) = self.hit(&key) {
+            return Ok(existing);
+        }
+        self.stats.misses += 1;
+        let (label, wgsl) = build();
+        let variant = Arc::new(build_module(device, key, label, wgsl?)?);
+        self.entries.insert(key, Arc::clone(&variant));
+        Ok(variant)
+    }
+
+    /// A cached variant, counted as a hit.
+    fn hit(&mut self, key: &VariantKey) -> Option<Arc<ShaderVariant>> {
+        let existing = Arc::clone(self.entries.get(key)?);
+        self.stats.hits += 1;
+        Some(existing)
+    }
+
+    /// A cached variant, without compiling.
+    pub fn get(&self, key: &VariantKey) -> Option<&Arc<ShaderVariant>> {
+        self.entries.get(key)
+    }
+
+    /// Number of cached variants.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether nothing is cached.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Hit and miss counts since the cache was created.
+    pub fn stats(&self) -> CacheStats {
+        self.stats
+    }
+
+    /// Drop every cached variant, keeping the statistics.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+/// Everything needed to compile one material stage, owned.
+///
+/// Owned rather than borrowed so it can be sent to a worker thread: a
+/// background pipeline swap compiles these off the main thread and hands
+/// the WGSL back ([`crate::swap`]).
+#[derive(Clone, Debug)]
+pub struct MaterialRequest {
+    /// The cache key the result belongs under.
+    pub key: VariantKey,
+    /// Label for the `wgpu` module and for error messages.
+    pub label: String,
+    /// The generated WXSL for this stage.
+    pub source: String,
+    /// The macro values to bind.
+    pub macros: MacroSet,
+}
+
+/// `macros` with `pins` bound over them, and `key` with the pins folded in
+/// — unchanged when there are none, so a full-profile cache keys exactly
+/// as before.
+fn pin(key: VariantKey, macros: &MacroSet, pins: &MacroSet) -> (VariantKey, MacroSet) {
+    if pins.is_empty() {
+        return (key, macros.clone());
+    }
+    let mut pinned = macros.clone();
+    pinned.overlay(pins);
+    (pinned_key(key, pins), pinned)
+}
+
+/// `key` with `pins` folded in, as [`pin`] folds them.
+fn pinned_key(mut key: VariantKey, pins: &MacroSet) -> VariantKey {
+    if !pins.is_empty() {
+        key.identity = stable_hash(format!("{}|{}", key.identity, pins.signature()).as_bytes());
+    }
+    key
+}
+
+impl MaterialRequest {
+    /// The same request with `pins` bound over its macros, and folded into
+    /// its key — see [`ShaderVariants::with_pins`].
+    pub fn pinned(mut self, pins: &MacroSet) -> Self {
+        (self.key, self.macros) = pin(self.key, &self.macros, pins);
+        self
+    }
+
+    /// What compiling `material`'s `stage` needs.
+    pub fn new(material: &Material, stage: MaterialStage) -> Self {
+        let shader = material.shader(stage);
+        MaterialRequest {
+            key: ShaderVariants::material_key(material, stage),
+            label: format!("{} ({stage})", material.name),
+            source: shader.source.clone(),
+            macros: shader.macros.clone(),
+        }
+    }
+
+    /// Run the WXSL compiler. Pure, and no device in sight — which is what
+    /// makes it safe to do on a worker thread.
+    pub fn compile(&self, library: &ShaderLibrary) -> (String, Result<String, RenderError>) {
+        let extra = [(
+            codegen::MATERIAL_MODULE,
+            Cow::Borrowed(self.source.as_str()),
+        )];
+        (
+            self.label.clone(),
+            compile(library, &extra, codegen::MATERIAL_MODULE, &self.macros),
+        )
+    }
+}
+
+/// The macro values an effect's shader is compiled under.
+///
+/// Only the generated lighting pass inherits the materials' set: its text
+/// comes from the same ABI templates a material's does, so it has to be
+/// compiled under the same `@if`s. An effect that ships its own source
+/// declares its own knobs and reads no material's — which is also what
+/// keeps a material macro from recompiling every effect in the chain.
+fn effect_macros(effect: &Effect, macros: &MacroSet) -> MacroSet {
+    effect.shader_macros(macros)
+}
+
+/// Everything needed to compile one effect's shader, owned.
+///
+/// Owned rather than borrowed so it can be sent to a worker thread: a
+/// background pipeline swap compiles these off the main thread and hands
+/// the WGSL back ([`crate::swap`]).
+#[derive(Clone, Debug)]
+pub struct EffectRequest {
+    /// The cache key the result belongs under.
+    pub key: VariantKey,
+    /// Label for the `wgpu` module and for error messages.
+    pub label: String,
+    /// The module path the shader is mounted at and compiled from.
+    pub path: &'static str,
+    /// The shader text: the effect's own with the generated parameter
+    /// block appended when it declares any, or the lighting pass
+    /// generated for the enabled set — owned either way, so this can go
+    /// to a worker thread.
+    pub source: Cow<'static, str>,
+    /// The macro values to bind.
+    pub macros: MacroSet,
+}
+
+impl EffectRequest {
+    /// What compiling `effect` for `macros`, `set` and `features` needs.
+    pub fn new(
+        effect: Effect,
+        macros: &MacroSet,
+        set: &LightingSet,
+        features: &[ChannelRequest],
+    ) -> Self {
+        let (path, source) = effect.module_source(set, features);
+        let label = match effect.shader {
+            EffectShader::Lighting => format!("{} ({})", effect.label, set.signature()),
+            _ => effect.label.to_string(),
+        };
+        EffectRequest {
+            key: ShaderVariants::effect_key(&effect, macros, set, features),
+            label,
+            path,
+            source,
+            macros: effect_macros(&effect, macros),
+        }
+    }
+
+    /// The same request with `pins` bound over its macros, and folded into
+    /// its key — see [`ShaderVariants::with_pins`].
+    pub fn pinned(mut self, pins: &MacroSet) -> Self {
+        (self.key, self.macros) = pin(self.key, &self.macros, pins);
+        self
+    }
+
+    /// Run the WXSL compiler, off any thread.
+    pub fn compile(&self, library: &ShaderLibrary) -> (String, Result<String, RenderError>) {
+        let extra = [(self.path, Cow::Borrowed(self.source.as_ref()))];
+        (
+            self.label.clone(),
+            compile(library, &extra, self.path, &self.macros),
+        )
+    }
+}
+
+/// Turn compiled WGSL into a cached variant.
+fn build_module(
+    device: &wgpu::Device,
+    key: VariantKey,
+    label: String,
+    wgsl: String,
+) -> Result<ShaderVariant, RenderError> {
+    let module = shader_module(device, &label, &wgsl)?;
+    Ok(ShaderVariant {
+        key,
+        module,
+        wgsl,
+        label,
+    })
+}
+
+/// Create a shader module, or say why the device refuses `wgsl`.
+///
+/// The WXSL compiler does not type-check function bodies, so a module it
+/// accepts can still be invalid WGSL: a user function with a wrong return
+/// type, a hot-reloaded file with a typo. The device's validation is
+/// caught in an error scope and becomes [`RenderError::ShaderCompile`],
+/// instead of wgpu's uncaptured-error panic. Native validation answers at
+/// once; where the scope answers later (WebGPU) the module is returned
+/// unchecked.
+pub fn shader_module(
+    device: &wgpu::Device,
+    label: &str,
+    wgsl: &str,
+) -> Result<wgpu::ShaderModule, RenderError> {
+    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(label),
+        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(wgsl)),
+    });
+    match ready(scope.pop()).flatten() {
+        Some(error) => Err(RenderError::ShaderCompile {
+            module: label.to_string(),
+            diagnostic: error.to_string(),
+        }),
+        None => Ok(module),
+    }
+}
+
+/// A future's output if it is ready on the first poll.
+fn ready<T>(future: impl core::future::Future<Output = T>) -> Option<T> {
+    struct Noop;
+    impl std::task::Wake for Noop {
+        fn wake(self: Arc<Self>) {}
+    }
+    let waker = std::task::Waker::from(Arc::new(Noop));
+    let mut context = std::task::Context::from_waker(&waker);
+    match core::pin::pin!(future).poll(&mut context) {
+        std::task::Poll::Ready(output) => Some(output),
+        std::task::Poll::Pending => None,
+    }
+}
+
+/// Compile `root` to WGSL against `library`, with `extra` modules mounted on
+/// top and `macros`' flags bound as conditional-translation features.
+///
+/// Public because "what WGSL does this graph produce" is worth answering
+/// without a GPU — the `--dump-wgsl` flag of the demo, and the tests that
+/// check both render paths compile, both go through here.
+pub fn compile(
+    library: &ShaderLibrary,
+    extra: &[(&str, Cow<'_, str>)],
+    root: &str,
+    macros: &MacroSet,
+) -> Result<String, RenderError> {
+    let mut modules = wxsl_lang::Modules::new();
+    for (path, source) in library.iter() {
+        modules.insert(path, source);
+    }
+    for (path, source) in extra {
+        modules.insert(*path, source.as_ref());
+    }
+
+    wxsl_lang::compile_with_macros(&modules, root, macros).map_err(|error| match error {
+        wxsl_lang::CompileError::InvalidModulePath { module } => {
+            RenderError::InvalidModulePath { module }
+        }
+        wxsl_lang::CompileError::ShaderCompile { module, diagnostic } => {
+            RenderError::ShaderCompile { module, diagnostic }
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_effects_variant_key_folds_the_parameter_layout_and_not_the_defaults() {
+        // The pass-level restatement of the material rule: a re-tune is a
+        // buffer write, so two descriptors under one id that differ only
+        // in a default are one variant, while a different layout is a
+        // different module (the struct the shader reads is generated from
+        // the declaration).
+        let macros = MacroSet::new();
+        let set = LightingSet::default();
+        let retuned = Effect {
+            parameters: &[
+                crate::effect::EffectParameter {
+                    name: "threshold",
+                    default: wxsl_core::node::Value::F32(0.5),
+                },
+                crate::effect::EffectParameter {
+                    name: "knee",
+                    default: wxsl_core::node::Value::F32(0.6),
+                },
+                crate::effect::EffectParameter {
+                    name: "strength",
+                    default: wxsl_core::node::Value::F32(0.85),
+                },
+            ],
+            ..crate::effect::BLOOM
+        };
+        assert_eq!(
+            ShaderVariants::effect_key(&crate::effect::BLOOM, &macros, &set, &[]),
+            ShaderVariants::effect_key(&retuned, &macros, &set, &[]),
+            "a different default must not be a different shader"
+        );
+        assert_ne!(
+            ShaderVariants::effect_key(&crate::effect::BLOOM, &macros, &set, &[]),
+            ShaderVariants::effect_key(&crate::effect::TONEMAP, &macros, &set, &[]),
+        );
+    }
+
+    #[test]
+    fn an_effects_request_carries_the_generated_parameter_block() {
+        // Appended, not imported: one module, preserving leading imports,
+        // and the var at the binding after the one
+        // input.
+        let request = EffectRequest::new(
+            crate::effect::BLOOM,
+            &MacroSet::new(),
+            &LightingSet::default(),
+            &[],
+        );
+        assert!(request.source.contains("struct wxsl_bloom_params {"));
+        assert!(request
+            .source
+            .ends_with(&crate::effect::BLOOM.params_header()));
+        assert!(request
+            .source
+            .contains("@group(3) @binding(1) var<uniform> params:"));
+        assert!(
+            request.source.contains("fn bloom_fs("),
+            "{:40}",
+            request.source
+        );
+        // And an effect with no parameters asks for no text of its own.
+        let plain = EffectRequest::new(
+            crate::effect::TONEMAP,
+            &MacroSet::new(),
+            &LightingSet::default(),
+            &[],
+        );
+        assert!(plain.source.starts_with("//! tonemap"));
+    }
+
+    #[test]
+    fn a_missing_module_is_reported_by_name() {
+        let library = ShaderLibrary::new();
+        let macros = MacroSet::new();
+        let error = compile(&library, &[], "package::nope", &macros)
+            .expect_err("nothing to resolve against");
+        match error {
+            RenderError::ShaderCompile { module, .. } => assert_eq!(module, "package::nope"),
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn conditional_translation_follows_the_flags() {
+        let mut library = ShaderLibrary::new();
+        library.insert(
+            "package::root",
+            "@macro const demo_flag: bool = false;
+\n             @if(demo_flag)\nfn value() -> f32 { return 1.0; }\n\
+             @if(!demo_flag)\nfn value() -> f32 { return 0.0; }\n\
+             @fragment fn main() -> @location(0) vec4f { return vec4f(value()); }",
+        );
+
+        let mut macros = MacroSet::new();
+        macros.set("demo_flag", wxsl_core::macros::MacroValue::Flag(true));
+        let enabled = compile(&library, &[], "package::root", &macros).unwrap();
+        assert!(enabled.contains("return 1.0;"), "{enabled}");
+
+        macros.set("demo_flag", wxsl_core::macros::MacroValue::Flag(false));
+        let disabled = compile(&library, &[], "package::root", &macros).unwrap();
+        assert!(disabled.contains("return 0.0;"), "{disabled}");
+    }
+
+    #[test]
+    fn an_undeclared_flag_is_an_error_rather_than_silently_false() {
+        // The old compiler treated an unspecified feature as disabled, so a
+        // typo in an `@if` quietly took the false arm. WXSL requires the
+        // declaration, which turns that class of bug into a diagnostic.
+        let mut library = ShaderLibrary::new();
+        library.insert(
+            "package::root",
+            "@if(never_declared)
+fn value() -> f32 { return 1.0; }
+             @fragment fn main() -> @location(0) vec4f { return vec4f(0.0); }",
+        );
+        let error =
+            compile(&library, &[], "package::root", &MacroSet::new()).expect_err("undeclared flag");
+        let message = error.to_string();
+        assert!(message.contains("never_declared"), "{message}");
+        assert!(message.contains("not a macro declared"), "{message}");
+    }
+
+    #[test]
+    fn invalid_module_paths_are_rejected_before_the_compiler_sees_them() {
+        let library = ShaderLibrary::new();
+        let error = compile(&library, &[], "", &MacroSet::new()).expect_err("malformed root path");
+        assert!(matches!(error, RenderError::InvalidModulePath { .. }));
+    }
+}

@@ -1,0 +1,784 @@
+//! Error types for graph validation ([`GraphError`]) and code generation
+//! ([`CodegenError`]).
+//!
+//! Both are hand-written `std::error::Error` implementations: this crate
+//! deliberately has no error-handling dependency, per the "keep
+//! `wxsl-core` dependency-light" rule in `AGENTS.md`.
+
+use core::fmt;
+
+use crate::graph::{NodeId, SocketRef};
+use crate::macros::MacroValue;
+use crate::node::{GraphDomain, TypeRule, ValueType};
+
+/// A single problem found while validating a [`crate::graph::Graph`].
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub enum GraphError {
+    /// A node references a definition that is not in the registry.
+    UnknownDefinition {
+        /// The offending node.
+        node: NodeId,
+        /// The definition id the node asked for.
+        def: String,
+    },
+    /// A node's definition is not available in the kind of graph it was
+    /// placed in: a surface output in a screen effect, a screen context
+    /// read in a material.
+    NodeOutsideDomain {
+        /// The offending node.
+        node: NodeId,
+        /// The definition id it names.
+        def: String,
+        /// The domain the graph is in.
+        domain: GraphDomain,
+        /// The domains the definition *is* available in, rendered.
+        allowed: String,
+    },
+    /// An edge or parameter references a node that is not in the graph.
+    UnknownNode(NodeId),
+    /// A node has no socket with the requested name.
+    UnknownSocket {
+        /// The socket that could not be resolved.
+        socket: SocketRef,
+        /// Whether an input or an output socket was being looked up.
+        direction: Direction,
+    },
+    /// The two ends of an edge disagree about the value type.
+    TypeMismatch {
+        /// Producing socket.
+        from: SocketRef,
+        /// Consuming socket.
+        to: SocketRef,
+        /// Type produced by `from`.
+        produced: ValueType,
+        /// Type expected by `to`.
+        expected: ValueType,
+    },
+    /// An input socket already has an incoming edge; inputs take exactly one.
+    InputAlreadyConnected {
+        /// The socket that is already driven.
+        socket: SocketRef,
+    },
+    /// Connecting these two sockets would introduce a cycle, so the
+    /// connection was rejected: the graph is acyclic by construction.
+    WouldCycle {
+        /// Producing socket.
+        from: SocketRef,
+        /// Consuming socket.
+        to: SocketRef,
+    },
+    /// The graph contains a cycle. Only reachable for a graph that was not
+    /// built through [`crate::graph::Graph::connect`] (e.g. deserialized).
+    Cycle {
+        /// Nodes that take part in the cycle, in traversal order.
+        nodes: Vec<NodeId>,
+    },
+    /// A parameter value has a different type than the socket it overrides.
+    ParamTypeMismatch {
+        /// The socket the parameter is for.
+        socket: SocketRef,
+        /// Type of the supplied value.
+        supplied: ValueType,
+        /// Type the socket declares.
+        expected: ValueType,
+    },
+    /// A node parameter names a socket the node does not have.
+    UnknownParam {
+        /// The node carrying the parameter.
+        node: NodeId,
+        /// The parameter name.
+        param: String,
+    },
+    /// An input socket is neither connected nor given a value, and its
+    /// definition provides no default.
+    MissingInput {
+        /// The unfed socket.
+        socket: SocketRef,
+    },
+    /// Two nodes declare the same macro with different defaults and the graph
+    /// does not pin the value. Set it explicitly with
+    /// [`crate::graph::Graph::set_macro`] to resolve the ambiguity.
+    ConflictingMacroDefault {
+        /// The macro name.
+        name: String,
+        /// One declared default.
+        first: MacroValue,
+        /// The other declared default.
+        second: MacroValue,
+    },
+    /// A macro name pinned by the graph is not a valid WXSL identifier, so it
+    /// could be neither declared as a const nor named in an `@if`. Only
+    /// reachable from a hand-edited or generated graph file.
+    InvalidMacroName {
+        /// The offending name.
+        name: String,
+    },
+    /// The graph-level value for a macro has a different kind than the
+    /// declaration it overrides (e.g. a flag pinned to a float).
+    MacroKindMismatch {
+        /// The macro name.
+        name: String,
+        /// The value the graph pins.
+        supplied: MacroValue,
+        /// The value the declaration defaults to.
+        declared: MacroValue,
+    },
+    /// A socket is generic over a type parameter that this node instance has
+    /// not resolved: no edge reaching it (directly or transitively, through
+    /// other unresolved generic sockets) settles on a concrete type, and
+    /// nothing pinned it with [`crate::graph::Graph::set_generic`]. Codegen
+    /// has no concrete WGSL type to emit for it — the generic equivalent of
+    /// [`GraphError::MissingInput`].
+    UnresolvedGeneric {
+        /// The node whose parameter is unresolved.
+        node: NodeId,
+        /// The parameter's name.
+        param: String,
+    },
+    /// [`crate::graph::Graph::set_generic`] was asked to resolve a parameter
+    /// to a type its declaration does not allow.
+    InvalidGenericType {
+        /// The node.
+        node: NodeId,
+        /// The parameter's name.
+        param: String,
+        /// The type that was requested.
+        ty: ValueType,
+        /// The types the parameter actually allows.
+        allowed: Vec<ValueType>,
+    },
+    /// A socket's type is derived from two generic parameters by a
+    /// [`crate::node::TypeRule`] (see [`crate::node::Socket::combine`]), and both
+    /// are resolved but do not combine — e.g. `vec2f` and `vec3f`, neither a
+    /// scalar nor matching the other. Codegen has no type to emit for the
+    /// socket; the graph-level analogue of [`GraphError::TypeMismatch`], for
+    /// a type that is derived from two operands rather than read off one
+    /// edge.
+    IncompatibleGenerics {
+        /// The node.
+        node: NodeId,
+        /// The socket whose type could not be derived.
+        socket: String,
+        /// The rule that failed to combine the two, whose
+        /// [`crate::node::TypeRule::requirement`] explains what it wanted.
+        rule: TypeRule,
+        /// The first parameter's name and resolved type.
+        a: (String, ValueType),
+        /// The second parameter's name and resolved type.
+        b: (String, ValueType),
+    },
+    /// A node's string-valued setting is empty, malformed, or a name the
+    /// generated module already uses. See [`crate::node::SettingDef`].
+    InvalidSetting {
+        /// The node carrying it.
+        node: NodeId,
+        /// The setting's name.
+        setting: String,
+        /// The value that was rejected.
+        value: String,
+        /// What was wrong with it.
+        reason: String,
+    },
+    /// An edge was aimed at an input that takes a pinned literal and
+    /// nothing else. See [`crate::node::Socket::constant`].
+    ConstantInput {
+        /// The socket that refused the edge.
+        socket: SocketRef,
+    },
+    /// A node pins a setting its definition does not declare.
+    UnknownSetting {
+        /// The node carrying it.
+        node: NodeId,
+        /// The setting's name.
+        setting: String,
+    },
+    /// Two nodes declare the same uniform parameter, texture or sampler at
+    /// different types. One name is one binding, so there is nothing to
+    /// emit: rename one, or give them the same type.
+    ConflictingDeclaration {
+        /// The declared name.
+        name: String,
+        /// The type one node gives it.
+        first: ValueType,
+        /// The type the other gives it.
+        second: ValueType,
+    },
+    /// A node reads the application's uniform block, but the graph declares
+    /// none. See [`crate::graph::Graph::set_user_block`].
+    NoUserBlock {
+        /// The reading node.
+        node: NodeId,
+    },
+    /// A node reads a field the graph's application block does not declare.
+    UnknownUserField {
+        /// The reading node.
+        node: NodeId,
+        /// The field it asked for.
+        field: String,
+        /// The fields there are.
+        declared: Vec<String>,
+    },
+    /// A node reading the application's block resolved to a different type
+    /// than the block declares for that field.
+    UserFieldTypeMismatch {
+        /// The reading node.
+        node: NodeId,
+        /// The field.
+        field: String,
+        /// The type the node resolved to.
+        resolved: ValueType,
+        /// The type the block declares.
+        declared: ValueType,
+    },
+    /// The graph's application-block declaration is not usable: a bad
+    /// name, a duplicate field, or a field of a resource type.
+    InvalidUserBlock {
+        /// What was wrong with it.
+        reason: String,
+    },
+    /// A node reads an attribute the graph does not declare. See
+    /// [`crate::graph::Graph::declare_attribute`].
+    UnknownAttribute {
+        /// The reading node.
+        node: NodeId,
+        /// The attribute it asked for.
+        attribute: String,
+        /// The attributes there are.
+        declared: Vec<String>,
+    },
+    /// A node reading a declared attribute resolved to a different type
+    /// than the declaration gives it.
+    AttributeTypeMismatch {
+        /// The reading node.
+        node: NodeId,
+        /// The attribute.
+        attribute: String,
+        /// The type the node resolved to.
+        resolved: ValueType,
+        /// The type the graph declares.
+        declared: ValueType,
+    },
+    /// The graph's attribute declarations are not usable: a bad name, a
+    /// duplicate, a type no vertex buffer can carry, or more of them than
+    /// the vertex-slot or inter-stage budget allows.
+    InvalidAttribute {
+        /// What was wrong with them.
+        reason: String,
+    },
+    /// A bake declaration is not usable: a bad texture name, a node it
+    /// does not name or cannot stand in for, a type a texel cannot store.
+    /// Named after the texture the declaration goes by, which is its
+    /// identity.
+    InvalidBake {
+        /// The declaration's texture name.
+        texture: String,
+        /// What was wrong with it.
+        reason: String,
+    },
+    /// More than one terminal node of a kind that allows only one.
+    DuplicateOutput {
+        /// The kind, by its registry id.
+        kind: String,
+        /// Every node of that kind.
+        nodes: Vec<NodeId>,
+    },
+    /// A node that only compiles in one shader stage is reachable from a
+    /// terminal belonging to the other.
+    ///
+    /// The only typing rule partitioning needs: everything else in the
+    /// vocabulary compiles in either stage, so which stage a node lands
+    /// in is otherwise a reachability question with no wrong answers.
+    WrongStage {
+        /// The node that cannot go there.
+        node: NodeId,
+        /// Its definition.
+        def: String,
+        /// The terminal it is reachable from.
+        output: NodeId,
+        /// Why it cannot be compiled into that terminal's stage.
+        reason: String,
+    },
+}
+
+/// Whether a socket lookup was for an input or an output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    /// A node input (consumes a value).
+    Input,
+    /// A node output (produces a value).
+    Output,
+}
+
+impl fmt::Display for Direction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Direction::Input => f.write_str("input"),
+            Direction::Output => f.write_str("output"),
+        }
+    }
+}
+
+impl fmt::Display for GraphError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            GraphError::UnknownDefinition { node, def } => {
+                write!(f, "node {node} references unknown node definition `{def}`")
+            }
+            GraphError::NodeOutsideDomain {
+                node,
+                def,
+                domain,
+                allowed,
+            } => write!(
+                f,
+                "node {node} is a `{def}`, which a {domain} graph has no \
+                 place for (it belongs in: {allowed})"
+            ),
+            GraphError::UnknownNode(id) => write!(f, "no such node: {id}"),
+            GraphError::UnknownSocket { socket, direction } => write!(
+                f,
+                "node {} has no {direction} socket `{}`",
+                socket.node, socket.socket
+            ),
+            GraphError::TypeMismatch {
+                from,
+                to,
+                produced,
+                expected,
+            } => write!(
+                f,
+                "type mismatch connecting {from} ({produced}) to {to} ({expected})"
+            ),
+            GraphError::InputAlreadyConnected { socket } => {
+                write!(f, "input {socket} is already connected")
+            }
+            GraphError::WouldCycle { from, to } => {
+                write!(f, "connecting {from} to {to} would create a cycle")
+            }
+            GraphError::Cycle { nodes } => {
+                f.write_str("graph contains a cycle: ")?;
+                for (i, n) in nodes.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(" -> ")?;
+                    }
+                    write!(f, "{n}")?;
+                }
+                Ok(())
+            }
+            GraphError::ParamTypeMismatch {
+                socket,
+                supplied,
+                expected,
+            } => write!(
+                f,
+                "parameter for {socket} has type {supplied}, but the socket is {expected}"
+            ),
+            GraphError::UnknownParam { node, param } => write!(
+                f,
+                "node {node} has a parameter `{param}` that matches no input socket"
+            ),
+            GraphError::MissingInput { socket } => write!(
+                f,
+                "input {socket} is not connected and has no value or default"
+            ),
+            GraphError::ConflictingMacroDefault {
+                name,
+                first,
+                second,
+            } => write!(
+                f,
+                "macro `{name}` is declared with conflicting defaults ({first} and {second}); pin it on the graph to resolve"
+            ),
+            GraphError::InvalidSetting {
+                node,
+                setting,
+                value,
+                reason,
+            } => write!(
+                f,
+                "node {node}'s `{setting}` setting is `{value}`, which {reason}"
+            ),
+            GraphError::ConstantInput { socket } => write!(
+                f,
+                "input {socket} takes a pinned value and cannot be connected"
+            ),
+            GraphError::UnknownSetting { node, setting } => write!(
+                f,
+                "node {node} pins a setting `{setting}` its definition does not declare"
+            ),
+            GraphError::ConflictingDeclaration {
+                name,
+                first,
+                second,
+            } => write!(
+                f,
+                "`{name}` is declared as both {first} and {second}; one name is one binding"
+            ),
+            GraphError::NoUserBlock { node } => write!(
+                f,
+                "node {node} reads the application's uniform block, but this graph declares none"
+            ),
+            GraphError::UnknownUserField {
+                node,
+                field,
+                declared,
+            } => write!(
+                f,
+                "node {node} reads `{field}`, which the application block does not declare (it has: {})",
+                if declared.is_empty() {
+                    "nothing".to_string()
+                } else {
+                    declared.join(", ")
+                }
+            ),
+            GraphError::UserFieldTypeMismatch {
+                node,
+                field,
+                resolved,
+                declared,
+            } => write!(
+                f,
+                "node {node} reads `{field}` as {resolved}, but the application block declares it {declared}"
+            ),
+            GraphError::InvalidUserBlock { reason } => {
+                write!(f, "the application block declaration is unusable: {reason}")
+            }
+            GraphError::UnknownAttribute {
+                node,
+                attribute,
+                declared,
+            } => write!(
+                f,
+                "node {node} reads the attribute `{attribute}`, which this graph does not declare (it declares: {})",
+                if declared.is_empty() {
+                    "nothing".to_string()
+                } else {
+                    declared.join(", ")
+                }
+            ),
+            GraphError::AttributeTypeMismatch {
+                node,
+                attribute,
+                resolved,
+                declared,
+            } => write!(
+                f,
+                "node {node} reads the attribute `{attribute}` as {resolved}, but this graph declares it {declared}"
+            ),
+            GraphError::InvalidAttribute { reason } => {
+                write!(f, "the attribute declarations are unusable: {reason}")
+            }
+            GraphError::InvalidBake { texture, reason } => {
+                write!(f, "the bake `{texture}` is unusable: {reason}")
+            }
+            GraphError::DuplicateOutput { kind, nodes } => write!(
+                f,
+                "a graph may have one `{kind}` node, and this one has {}: {}",
+                nodes.len(),
+                nodes
+                    .iter()
+                    .map(|node| node.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            GraphError::WrongStage {
+                node,
+                def,
+                output,
+                reason,
+            } => write!(
+                f,
+                "node {node} (`{def}`) feeds node {output}, and {reason}"
+            ),
+            GraphError::InvalidMacroName { name } => {
+                write!(f, "macro name `{name}` is not a valid WXSL identifier")
+            }
+            GraphError::MacroKindMismatch {
+                name,
+                supplied,
+                declared,
+            } => write!(
+                f,
+                "macro `{name}` is declared as {} but the graph pins it to {} ({supplied} vs {declared})",
+                declared.kind(),
+                supplied.kind(),
+            ),
+            GraphError::UnresolvedGeneric { node, param } => write!(
+                f,
+                "node {node} has not resolved its generic parameter `{param}`; connect \
+                 something to a socket that uses it, or pick a type explicitly"
+            ),
+            GraphError::InvalidGenericType {
+                node,
+                param,
+                ty,
+                allowed,
+            } => {
+                write!(
+                    f,
+                    "node {node}'s generic parameter `{param}` cannot be {ty}; it allows "
+                )?;
+                for (index, candidate) in allowed.iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{candidate}")?;
+                }
+                Ok(())
+            }
+            GraphError::IncompatibleGenerics {
+                node,
+                socket,
+                rule,
+                a,
+                b,
+            } => write!(
+                f,
+                "node {node}'s socket `{socket}` cannot combine `{}` ({}) with `{}` ({}) \
+                 as a {rule}: {}",
+                a.0,
+                a.1,
+                b.0,
+                b.1,
+                rule.requirement()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for GraphError {}
+
+/// Every problem found by one [`crate::graph::Graph::validate`] call.
+///
+/// Validation reports as much as it can in a single pass rather than stopping
+/// at the first error, because an editor wants to underline every bad socket
+/// at once, not one per fix.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GraphErrors(pub Vec<GraphError>);
+
+impl GraphErrors {
+    /// The first reported error, if any.
+    pub fn first(&self) -> Option<&GraphError> {
+        self.0.first()
+    }
+
+    /// Number of reported errors.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether the list is empty (i.e. validation succeeded).
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl From<GraphError> for GraphErrors {
+    fn from(value: GraphError) -> Self {
+        GraphErrors(vec![value])
+    }
+}
+
+impl fmt::Display for GraphErrors {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0.split_first() {
+            None => f.write_str("no errors"),
+            Some((first, [])) => write!(f, "{first}"),
+            Some((first, rest)) => {
+                write!(f, "{} graph errors:\n  - {first}", self.0.len())?;
+                for e in rest {
+                    write!(f, "\n  - {e}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl std::error::Error for GraphErrors {}
+
+/// A problem that stopped [`crate::codegen::generate`] from emitting WXSL.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub enum CodegenError {
+    /// The graph did not validate. Codegen always validates first: emitting
+    /// WXSL from an invalid graph would just move the error into the shader
+    /// compiler, where it is much harder to explain.
+    Invalid(GraphErrors),
+    /// The graph is not the kind of graph this generator compiles: a
+    /// material handed to the screen generator, or the other way round.
+    WrongDomain {
+        /// What the generator compiles.
+        expected: GraphDomain,
+        /// What the graph says it is.
+        found: GraphDomain,
+    },
+    /// The graph has no surface-output node, so there is nothing to compile.
+    NoOutputNode,
+    /// The graph has more than one surface-output node.
+    MultipleOutputNodes(Vec<NodeId>),
+    /// The graph's fragment chain asks its G-buffer stage to shade forward,
+    /// and the pipeline's lighting set does not enable `wxsl.preshaded`,
+    /// the route that stage's pixels need.
+    FragmentNeedsPreshaded,
+    /// A node definition's expression template referenced a socket the node
+    /// does not declare. A bug in the node definition, not in the graph.
+    BadTemplate {
+        /// Definition id whose template is wrong.
+        def: String,
+        /// The placeholder that could not be resolved.
+        placeholder: String,
+    },
+    /// A node definition declares a different number of expressions than
+    /// outputs. Also a node-definition bug.
+    OutputArityMismatch {
+        /// Definition id at fault.
+        def: String,
+        /// Number of declared outputs.
+        outputs: usize,
+        /// Number of expressions supplied.
+        exprs: usize,
+    },
+    /// A value could not be written as a WXSL literal (non-finite float).
+    UnrepresentableValue {
+        /// Where the value came from.
+        socket: SocketRef,
+    },
+    /// A declaring node names a parameter or field the computed interface
+    /// does not hold. Only reachable if codegen and
+    /// [`crate::graph::Graph::interface_of`] disagreed about what is
+    /// reachable, which is a bug in this crate rather than in the graph.
+    UndeclaredParam {
+        /// The reading node.
+        node: NodeId,
+        /// The name it asked for.
+        name: String,
+    },
+    /// A node reads an attribute that is not in the computed geometry
+    /// interface. Only reachable if codegen ran on an unvalidated graph.
+    UndeclaredAttribute {
+        /// The reading node.
+        node: NodeId,
+        /// The attribute it asked for.
+        name: String,
+    },
+    /// A node reads the application's uniform block and the graph declares
+    /// none — reported by [`crate::graph::Graph::validate`] first, so this
+    /// is the same belt-and-braces case as above.
+    NoUserBlock {
+        /// The reading node.
+        node: NodeId,
+    },
+}
+
+impl fmt::Display for CodegenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CodegenError::Invalid(errors) => write!(f, "graph is invalid: {errors}"),
+            CodegenError::WrongDomain { expected, found } => write!(
+                f,
+                "this is a {found} graph, and a {expected} graph is what compiles here"
+            ),
+            CodegenError::NoOutputNode => f.write_str("graph has no surface output node"),
+            CodegenError::FragmentNeedsPreshaded => f.write_str(
+                "the fragment output makes this material shade in the G-buffer pass, \
+                 which needs `wxsl.preshaded` in the pipeline's lighting set",
+            ),
+            CodegenError::MultipleOutputNodes(nodes) => {
+                write!(
+                    f,
+                    "graph has {} surface output nodes (expected 1): ",
+                    nodes.len()
+                )?;
+                for (i, n) in nodes.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{n}")?;
+                }
+                Ok(())
+            }
+            CodegenError::BadTemplate { def, placeholder } => write!(
+                f,
+                "node definition `{def}` has an expression template referencing unknown socket `{placeholder}`"
+            ),
+            CodegenError::OutputArityMismatch {
+                def,
+                outputs,
+                exprs,
+            } => write!(
+                f,
+                "node definition `{def}` declares {outputs} outputs but supplies {exprs} expressions"
+            ),
+            CodegenError::UnrepresentableValue { socket } => {
+                write!(f, "value for {socket} cannot be written as a WXSL literal")
+            }
+            CodegenError::UndeclaredParam { node, name } => write!(
+                f,
+                "node {node} reads `{name}`, which this material's interface does not declare"
+            ),
+            CodegenError::UndeclaredAttribute { node, name } => write!(
+                f,
+                "node {node} reads the attribute `{name}`, which this graph does not declare"
+            ),
+            CodegenError::NoUserBlock { node } => write!(
+                f,
+                "node {node} reads the application's uniform block, but this graph declares none"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CodegenError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            CodegenError::Invalid(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<GraphErrors> for CodegenError {
+    fn from(value: GraphErrors) -> Self {
+        CodegenError::Invalid(value)
+    }
+}
+
+/// Check a document's pinned versions against what this build reads.
+///
+/// Every serialized document kind — node format, scene, pipeline — carries
+/// a `version` (its wire schema) and an `abi` (the [`crate::abi::REVISION`]
+/// its vocabulary is written against). Both default to 1, which is what a
+/// file from before versioning means, so existing documents parse
+/// unchanged. A *newer* version than this build knows is refused rather
+/// than guessed at; so is an ABI revision other than the one this build
+/// implements, because a revision bump is exactly a change in what stored
+/// names mean. The `kind` is the document's own word for itself ("graph",
+/// "scene") so the error names it, and `schema` is the newest version
+/// this build reads for that kind.
+///
+/// The error is a `String` because the check runs inside the wire types'
+/// `try_from` conversions, where serde folds whatever the conversion says
+/// into the parse error the caller already handles.
+pub(crate) fn check_document_version(
+    version: u32,
+    schema: u32,
+    abi: u32,
+    kind: &str,
+) -> Result<(), String> {
+    if version > schema {
+        return Err(format!(
+            "{kind} document has schema version {version}, but this build reads \
+             version {schema} — upgrade wxsl to load it"
+        ));
+    }
+    if abi != crate::abi::REVISION {
+        return Err(format!(
+            "{kind} document pins ABI revision {abi}, but this build implements \
+             revision {} — the document was written against a different shader ABI",
+            crate::abi::REVISION,
+        ));
+    }
+    Ok(())
+}

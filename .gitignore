@@ -1,0 +1,22 @@
+/target/
+/dawn/CMakeUserPresets.json
+/refs/
+**/target/
+
+# Keep Cargo.lock for reproducible workspace builds.
+
+.agent-tmp
+
+
+# for the ressources that can easily be computed : 
+/screenshots
+*.color.prt
+*.blend1
+
+# Editor/OS cruft
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+

@@ -1,0 +1,6 @@
+
+// The mirror on the flat plane.
+@fragment
+fn fragment(@builtin(position) position: vec4f) -> @location(0) vec4f {
+    return compose(position, params.plane.xyz);
+}

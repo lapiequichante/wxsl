@@ -1,0 +1,23 @@
+[package]
+name = "wxsl-lang"
+description = "WXSL: lexer, parser, template monomorphization and WGSL backend for the WXSL shading language. No wgpu, no GUI toolkit."
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[dependencies]
+lalrpop-util = { workspace = true }
+# The graph model, for the one thing this crate answers in its terms: a node
+# definition derived from a `.wxsl` file. No wgpu, no GUI comes
+# with it — the arrow points into `wxsl-core` like every other one.
+wxsl-core = { workspace = true }
+
+[build-dependencies]
+lalrpop = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -1,0 +1,2342 @@
+//! The editor, driven for a few frames on a real device.
+//!
+//! The editor draws itself with the renderer, so "does it work" is
+//! a question about a `wgpu` device: the UI shader has to compile, the
+//! instance buffer has to be accepted, the glyph atlas has to fill, and the
+//! preview has to render into its own target inside the same encoder. None of
+//! that is provable without an adapter — everything that *is* provable
+//! without one is tested in `wxsl-render` and `wxsl-editor` themselves.
+//!
+//! Like `render_cube.rs`, this **skips** (prints a note and passes) when no
+//! adapter is available, so do not read a pass as proof that it ran.
+
+use glam::Vec2;
+use wxsl::core::graph::Graph;
+use wxsl::core::node::ValueType;
+use wxsl::editor::{Command, Editor, EditorConfig, ThemeMode};
+use wxsl::render::gpu::{GpuContext, OffscreenTarget};
+use wxsl::render::ui::input::{Key, MouseButton, UiEvent};
+use wxsl::render::ui::{MsdfBackend, UiTarget};
+
+/// The demo graph, so the editor has a real material to compile and draw.
+const DEMO_GRAPH: &str = include_str!("../assets/pbr_cube.wxsl.json");
+
+/// A device, or `None` when the machine has no adapter.
+fn gpu() -> Option<GpuContext> {
+    match pollster::block_on(GpuContext::headless()) {
+        Ok(gpu) => Some(gpu),
+        Err(error) => {
+            println!("skipping: no wgpu adapter ({error})");
+            None
+        }
+    }
+}
+
+/// The two fonts, or `None` when this machine has neither.
+///
+/// The renderer ships no font, so a test needs one from the
+/// outside. The repo's defaults (`resources/fonts/`) come first, so the
+/// test runs — and renders the same text — on every machine; a machine
+/// without even a system fallback font is a skip, not a failure.
+fn fonts() -> Option<(Vec<u8>, Vec<u8>)> {
+    let repo_ui = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../resources/fonts/Inter-Regular.ttf"
+    );
+    let repo_mono = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../resources/fonts/JetBrainsMono-Regular.ttf"
+    );
+    let candidates = [
+        repo_ui,
+        "C:/Windows/Fonts/segoeui.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+    ];
+    let mono_candidates = [
+        repo_mono,
+        "C:/Windows/Fonts/consola.ttf",
+        "C:/Windows/Fonts/cour.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+        "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
+        "/System/Library/Fonts/Menlo.ttc",
+    ];
+    let read = |paths: &[&str]| paths.iter().find_map(|path| std::fs::read(path).ok());
+    match (read(&candidates), read(&mono_candidates)) {
+        (Some(ui), Some(mono)) => Some((ui, mono)),
+        // A monospaced font is not on every machine; the proportional one
+        // serves for both rather than skipping the whole test.
+        (Some(ui), None) => Some((ui.clone(), ui)),
+        _ => {
+            println!("skipping: no system font found");
+            None
+        }
+    }
+}
+
+/// An editor over the demo graph, and a target to draw it into.
+fn editor(gpu: &GpuContext, backend: MsdfBackend) -> Option<(Editor, OffscreenTarget)> {
+    let (ui_font, mono_font) = fonts()?;
+    let graph: Graph = serde_json::from_str(DEMO_GRAPH).expect("the demo graph parses");
+    let mut config = EditorConfig::new(
+        wxsl::stdlib_library(),
+        wxsl::stdlib::registry(),
+        graph,
+        ui_font,
+        mono_font,
+    );
+    config.msdf_backend = backend;
+    // Small enough to keep the test quick, large enough that the panels are
+    // not degenerate.
+    let (width, height) = (1280, 800);
+    let mut editor = Editor::new(&gpu.device, &gpu.queue, config).expect("the editor starts");
+    editor.handle_event(UiEvent::Resized {
+        size: Vec2::new(width as f32, height as f32),
+        scale: 1.0,
+    });
+    Some((editor, OffscreenTarget::new(&gpu.device, width, height)))
+}
+
+/// Draw one frame at `time`, and return the pixels.
+fn frame(gpu: &GpuContext, editor: &mut Editor, target: &OffscreenTarget, time: f64) -> Vec<u8> {
+    let mut encoder = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("editor test frame"),
+        });
+    editor
+        .frame(
+            &gpu.device,
+            &gpu.queue,
+            &mut encoder,
+            &UiTarget {
+                view: target.view(),
+                format: target.format(),
+                width: target.width(),
+                height: target.height(),
+                clear: None,
+            },
+            time,
+        )
+        .expect("the frame records");
+    gpu.queue.submit([encoder.finish()]);
+    target.read_rgba8(&gpu.device, &gpu.queue)
+}
+
+/// How many pixels differ from the most common colour.
+///
+/// A cheap "is there an interface here": a frame that drew nothing is one
+/// flat colour, and a frame that drew panels, text and a preview is not.
+fn painted_pixels(pixels: &[u8]) -> usize {
+    let mut histogram = std::collections::HashMap::new();
+    for texel in pixels.chunks_exact(4) {
+        *histogram
+            .entry([texel[0], texel[1], texel[2]])
+            .or_insert(0usize) += 1;
+    }
+    let total = pixels.len() / 4;
+    let most_common = histogram.values().copied().max().unwrap_or(total);
+    total - most_common
+}
+
+#[test]
+fn the_editor_draws_an_interface() {
+    let Some(gpu) = gpu() else { return };
+    let Some((mut editor, target)) = editor(&gpu, MsdfBackend::Cpu) else {
+        return;
+    };
+
+    // Two frames: the first fills the glyph atlas and compiles the material,
+    // the second is the steady state.
+    let first = frame(&gpu, &mut editor, &target, 0.0);
+    let painted = painted_pixels(&first);
+    assert!(
+        painted > 10_000,
+        "only {painted} pixels differ from the background — the interface did not draw"
+    );
+    assert!(
+        editor.preview().status().is_ok(),
+        "the demo graph should compile: {:?}",
+        editor.preview().status()
+    );
+    assert!(
+        editor.preview().wxsl().contains("fn wxsl_material"),
+        "the WXSL panel has no material function"
+    );
+    assert!(
+        editor.preview().wgsl().contains("fn fs_forward_lit"),
+        "the WGSL panel is not showing the forward pipeline's shading stage"
+    );
+
+    let second = frame(&gpu, &mut editor, &target, 0.016);
+    assert!(painted_pixels(&second) > 10_000);
+    println!(
+        "drew {painted} painted pixels; {} glyphs cached",
+        editor.preview().wxsl().lines().count()
+    );
+}
+
+#[test]
+fn both_msdf_backends_draw_the_same_interface() {
+    // The GPU generator is a transliteration of the CPU one, and
+    // this is the test that keeps them honest: the same frame, drawn with
+    // glyphs from each, must look the same.
+    let Some(gpu) = gpu() else { return };
+    let Some((mut cpu, cpu_target)) = editor(&gpu, MsdfBackend::Cpu) else {
+        return;
+    };
+    let Some((mut gpu_editor, gpu_target)) = editor(&gpu, MsdfBackend::Gpu) else {
+        return;
+    };
+    assert_eq!(gpu_editor.msdf_backend(), MsdfBackend::Gpu);
+
+    // Both need a frame to fill their atlas, then a frame to compare.
+    frame(&gpu, &mut cpu, &cpu_target, 0.0);
+    frame(&gpu, &mut gpu_editor, &gpu_target, 0.0);
+    // The preview spins, so freeze it: only the text is under test here.
+    let with_cpu = frame(&gpu, &mut cpu, &cpu_target, 0.0);
+    let with_gpu = frame(&gpu, &mut gpu_editor, &gpu_target, 0.0);
+
+    assert_eq!(with_cpu.len(), with_gpu.len());
+    let differing = with_cpu
+        .chunks_exact(4)
+        .zip(with_gpu.chunks_exact(4))
+        .filter(|(left, right)| {
+            // A generated field can differ by a byte between the two
+            // implementations (float ordering, and `round` at the encoding
+            // step), which is a hair of coverage on a glyph's edge.
+            left.iter()
+                .zip(right.iter())
+                .any(|(a, b)| a.abs_diff(*b) > 12)
+        })
+        .count();
+    let total = with_cpu.len() / 4;
+    let fraction = differing as f32 / total as f32;
+    assert!(
+        fraction < 0.01,
+        "{differing} of {total} pixels ({:.2}%) differ between the MSDF backends",
+        fraction * 100.0
+    );
+    println!(
+        "MSDF backends agree on {:.3}% of pixels",
+        100.0 - fraction * 100.0
+    );
+}
+
+#[test]
+fn editing_the_graph_recompiles_the_material() {
+    let Some(gpu) = gpu() else { return };
+    let Some((mut editor, target)) = editor(&gpu, MsdfBackend::Cpu) else {
+        return;
+    };
+    frame(&gpu, &mut editor, &target, 0.0);
+    let before = editor.preview().wxsl().to_string();
+    let nodes_before = editor.graph().node_count();
+
+    // Add a node the way the palette does, and check the recompile lands.
+    // `math.add` is generic (one node kind serving every type instead of a
+    // separate `math.add.f32`/`.vec3f`/…): it arrives at its default types,
+    // and picking one is a command like any other.
+    let added = editor
+        .apply(Command::AddNode {
+            document: Default::default(),
+            node: wxsl::core::graph::Node::new("math.add"),
+        })
+        .expect("math.add is in the library")
+        .added[0];
+    editor
+        .apply(Command::SetGeneric {
+            document: Default::default(),
+            node: added,
+            param: "A".into(),
+            ty: ValueType::Vec3,
+        })
+        .expect("vec3f is one of A's allowed types");
+    assert_eq!(
+        editor.graph().generic_type(added, "A"),
+        Some(ValueType::Vec3)
+    );
+    assert_eq!(editor.graph().node_count(), nodes_before + 1);
+    frame(&gpu, &mut editor, &target, 0.032);
+
+    // An unconnected node reaches no output, so the *shader* is unchanged —
+    // which is the codegen behaviour worth pinning down: a work-in-progress
+    // branch costs nothing.
+    assert_eq!(
+        editor.preview().wxsl(),
+        before,
+        "an unconnected node should not change the shader"
+    );
+    assert!(editor.is_modified(), "the document changed");
+
+    // Removing it again leaves the graph as it was; undoing the removal
+    // brings it back under the same id, and redoing removes it again.
+    editor
+        .apply(Command::RemoveNodes {
+            document: Default::default(),
+            nodes: vec![added],
+        })
+        .expect("the node exists");
+    frame(&gpu, &mut editor, &target, 0.048);
+    assert_eq!(editor.graph().node_count(), nodes_before);
+    assert!(editor.preview().status().is_ok());
+    editor.apply(Command::Undo).expect("a removal to undo");
+    assert!(editor.graph().node(added).is_some());
+    editor.apply(Command::Redo).expect("a removal to redo");
+    frame(&gpu, &mut editor, &target, 0.064);
+    assert_eq!(editor.graph().node_count(), nodes_before);
+    assert!(editor.preview().status().is_ok());
+}
+
+#[test]
+fn a_node_drag_is_one_undo_step_and_command_z_undoes_it() {
+    // the canvas emits a move per frame of the drag, and the
+    // history merges them while the button is down.
+    use wxsl::editor::{Answer, Query};
+    use wxsl::render::ui::input::Modifiers;
+
+    let Some(gpu) = gpu() else { return };
+    let Some((mut editor, target)) = editor(&gpu, MsdfBackend::Cpu) else {
+        return;
+    };
+    frame(&gpu, &mut editor, &target, 0.0);
+    let before = editor.graph().clone();
+    let depth = |editor: &Editor| match editor.query(&Query::History) {
+        Answer::History { undo, redo, .. } => (undo, redo),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(depth(&editor), (0, 0));
+
+    // Press on a node's title strip, drag in three steps, release.
+    let (_, node) = editor
+        .graph()
+        .nodes()
+        .find(|(_, node)| node.position.is_some())
+        .expect("the demo graph is laid out");
+    let grab = Vec2::from_array(node.position.unwrap()) + Vec2::new(30.0, 6.0);
+    let start = editor.canvas_view().to_screen(editor.canvas_rect(), grab);
+    editor.handle_event(UiEvent::PointerMoved(start));
+    frame(&gpu, &mut editor, &target, 0.1);
+    editor.handle_event(UiEvent::PointerButton {
+        button: MouseButton::Left,
+        pressed: true,
+    });
+    frame(&gpu, &mut editor, &target, 0.11);
+    for step in 1..=3 {
+        editor.handle_event(UiEvent::PointerMoved(
+            start + Vec2::new(20.0, 10.0) * step as f32,
+        ));
+        frame(&gpu, &mut editor, &target, 0.11 + 0.01 * step as f64);
+    }
+    editor.handle_event(UiEvent::PointerButton {
+        button: MouseButton::Left,
+        pressed: false,
+    });
+    frame(&gpu, &mut editor, &target, 0.2);
+    assert_ne!(editor.graph(), &before, "the drag moved a node");
+    assert_eq!(depth(&editor), (1, 0), "three frames of drag, one step");
+
+    let shortcut = |editor: &mut Editor, shift: bool, time: f64| {
+        let modifiers = Modifiers {
+            logo: true,
+            shift,
+            ..Modifiers::NONE
+        };
+        editor.handle_event(UiEvent::ModifiersChanged(modifiers));
+        for pressed in [true, false] {
+            editor.handle_event(UiEvent::Key {
+                key: Key::Char('z'),
+                pressed,
+                repeat: false,
+            });
+        }
+        editor.handle_event(UiEvent::ModifiersChanged(Modifiers::NONE));
+        frame(&gpu, editor, &target, time);
+    };
+    shortcut(&mut editor, false, 0.3);
+    assert_eq!(editor.graph(), &before, "command-Z puts the node back");
+    assert_eq!(depth(&editor), (0, 1));
+    shortcut(&mut editor, true, 0.4);
+    assert_ne!(editor.graph(), &before, "shift-command-Z moves it again");
+    assert_eq!(depth(&editor), (1, 0));
+}
+
+#[test]
+fn the_editor_survives_a_frame_of_every_input_event() {
+    // Not "does it do the right thing" — the interaction rules are tested
+    // without a device — but "does anything panic or fail to record": a
+    // click in a panel, a drag on the canvas, typing, and a scroll all in
+    // one frame is the shape of a real user's frame.
+    let Some(gpu) = gpu() else { return };
+    let Some((mut editor, target)) = editor(&gpu, MsdfBackend::Cpu) else {
+        return;
+    };
+    frame(&gpu, &mut editor, &target, 0.0);
+
+    let events = [
+        UiEvent::PointerMoved(Vec2::new(640.0, 300.0)),
+        UiEvent::PointerButton {
+            button: MouseButton::Left,
+            pressed: true,
+        },
+        UiEvent::PointerMoved(Vec2::new(660.0, 320.0)),
+        UiEvent::PointerButton {
+            button: MouseButton::Left,
+            pressed: false,
+        },
+        UiEvent::Scroll(Vec2::new(0.0, -120.0)),
+        UiEvent::PointerMoved(Vec2::new(120.0, 60.0)),
+        UiEvent::Text('a'),
+        UiEvent::Key {
+            key: Key::Char('f'),
+            pressed: true,
+            repeat: false,
+        },
+        UiEvent::Key {
+            key: Key::Char('m'),
+            pressed: true,
+            repeat: false,
+        },
+        UiEvent::PointerButton {
+            button: MouseButton::Right,
+            pressed: true,
+        },
+        UiEvent::PointerButton {
+            button: MouseButton::Right,
+            pressed: false,
+        },
+        UiEvent::FocusChanged(false),
+        UiEvent::FocusChanged(true),
+    ];
+    for (index, event) in events.into_iter().enumerate() {
+        editor.handle_event(event);
+        frame(&gpu, &mut editor, &target, 0.1 + index as f64 * 0.016);
+    }
+    // Whatever the clicks did, the editor is still in a state that draws.
+    let pixels = frame(&gpu, &mut editor, &target, 1.0);
+    assert!(painted_pixels(&pixels) > 10_000);
+}
+
+#[test]
+fn switching_pipeline_and_mesh_keeps_the_preview_compiling() {
+    let Some(gpu) = gpu() else { return };
+    let Some((mut editor, target)) = editor(&gpu, MsdfBackend::Cpu) else {
+        return;
+    };
+    frame(&gpu, &mut editor, &target, 0.0);
+    let forward = editor.preview().wgsl().to_string();
+    assert_eq!(
+        editor.preview().pipeline(),
+        wxsl::render::StockPipeline::Forward
+    );
+
+    // `D` requests the deferred pipeline, `M` cycles the mesh: the same
+    // graph, compiled for the other pipeline's stages.
+    for (index, key) in [Key::Char('d'), Key::Char('m'), Key::Char('m')]
+        .into_iter()
+        .enumerate()
+    {
+        editor.handle_event(UiEvent::Key {
+            key,
+            pressed: true,
+            repeat: false,
+        });
+        frame(&gpu, &mut editor, &target, 0.2 + index as f64 * 0.016);
+    }
+
+    // The swap is requested rather than applied, so the editor keeps
+    // drawing the forward pipeline until the G-buffer stage is compiled.
+    // Every one of those frames is a complete frame.
+    let mut waited = 0;
+    while editor.preview().swap_progress().is_some() {
+        let during = frame(&gpu, &mut editor, &target, 0.3 + waited as f64 * 0.016);
+        assert!(
+            painted_pixels(&during) > 10_000,
+            "a frame during the pipeline swap drew nothing"
+        );
+        waited += 1;
+        assert!(waited < 1_000, "the pipeline swap never landed");
+    }
+    // One more frame, for the code panel to pick up the stage that landed.
+    frame(&gpu, &mut editor, &target, 0.4);
+
+    assert_eq!(
+        editor.preview().pipeline(),
+        wxsl::render::StockPipeline::Deferred
+    );
+    assert!(
+        editor.preview().status().is_ok(),
+        "{:?}",
+        editor.preview().status()
+    );
+    let deferred = editor.preview().wgsl().to_string();
+    assert_ne!(
+        forward, deferred,
+        "the deferred pipeline should show a different stage's WGSL"
+    );
+    assert!(
+        deferred.contains("pack_gbuffer") || deferred.contains("GBuffer"),
+        "the deferred material should write a G-buffer"
+    );
+}
+
+#[test]
+fn dragging_a_palette_row_onto_the_canvas_adds_a_node_there() {
+    // The bug this pins down: clicking (and so dragging) a palette row did
+    // nothing at all, because a premature `active` reset ate every release
+    // before the widget that owned it ever saw it (see
+    // `wxsl_editor::ui::Interaction`). This drives the exact gesture a user
+    // does — press on a row, drag onto the canvas, release — through the
+    // real `Editor`, frame by frame, the way `App::window_event` really
+    // delivers it.
+    let Some(gpu) = gpu() else { return };
+    let Some((mut editor, target)) = editor(&gpu, MsdfBackend::Cpu) else {
+        return;
+    };
+    frame(&gpu, &mut editor, &target, 0.0);
+    let nodes_before = editor.graph().node_count();
+
+    // The palette occupies the left strip and the canvas the middle, but
+    // exactly where the first row falls depends on font metrics (the
+    // category-button row wraps based on measured text width) — so this
+    // probes a vertical strip of the palette for a row, rather than
+    // hard-coding one pixel position that would silently test nothing if a
+    // future layout tweak shifted it by a few pixels.
+    let canvas_center = Vec2::new(700.0, 400.0);
+    let mut placed = false;
+    for row in 0..20 {
+        let press_point = Vec2::new(120.0, 90.0 + row as f64 as f32 * 16.0);
+
+        editor.handle_event(UiEvent::PointerMoved(press_point));
+        frame(&gpu, &mut editor, &target, 0.1 + row as f64 * 0.05);
+        editor.handle_event(UiEvent::PointerButton {
+            button: MouseButton::Left,
+            pressed: true,
+        });
+        frame(&gpu, &mut editor, &target, 0.11 + row as f64 * 0.05);
+
+        // Drag onto the canvas.
+        editor.handle_event(UiEvent::PointerMoved(canvas_center));
+        frame(&gpu, &mut editor, &target, 0.12 + row as f64 * 0.05);
+        editor.handle_event(UiEvent::PointerButton {
+            button: MouseButton::Left,
+            pressed: false,
+        });
+        frame(&gpu, &mut editor, &target, 0.13 + row as f64 * 0.05);
+
+        if editor.graph().node_count() == nodes_before + 1 {
+            placed = true;
+            break;
+        }
+        // Nothing was under the press point (a gap between rows, or past
+        // the last one): harmless, and the next iteration tries lower.
+        assert_eq!(
+            editor.graph().node_count(),
+            nodes_before,
+            "a node appeared without a row under the press point"
+        );
+    }
+
+    assert!(
+        placed,
+        "no row in the probed strip produced a node; the palette layout \
+         may have moved outside the range this test scans"
+    );
+    let added = editor
+        .selection()
+        .first()
+        .copied()
+        .expect("the newly dropped node is selected");
+    let position = editor
+        .graph()
+        .node(added)
+        .and_then(|node| node.position)
+        .expect("a dropped node is placed, not left without a position");
+    let dropped_at = editor
+        .canvas_view()
+        .to_graph(editor.canvas_rect(), canvas_center);
+    let distance = (Vec2::from(position) - dropped_at).length();
+    assert!(
+        distance < 1.0,
+        "the node landed at {position:?}, expected close to {dropped_at:?}"
+    );
+}
+
+#[test]
+fn space_and_a_moving_pointer_pans_and_a_space_tap_toggles_the_spin() {
+    let Some(gpu) = gpu() else { return };
+    let Some((mut editor, target)) = editor(&gpu, MsdfBackend::Cpu) else {
+        return;
+    };
+    let space = |pressed| UiEvent::Key {
+        key: Key::Char(' '),
+        pressed,
+        repeat: false,
+    };
+    let start = Vec2::new(700.0, 400.0);
+    editor.handle_event(UiEvent::PointerMoved(start));
+    frame(&gpu, &mut editor, &target, 0.0);
+    let pan = editor.canvas_view().pan;
+    assert!(editor.preview().spinning);
+
+    editor.handle_event(space(true));
+    frame(&gpu, &mut editor, &target, 0.1);
+    editor.handle_event(UiEvent::PointerMoved(start + Vec2::new(60.0, -30.0)));
+    frame(&gpu, &mut editor, &target, 0.2);
+    editor.handle_event(space(false));
+    frame(&gpu, &mut editor, &target, 0.3);
+    let moved = editor.canvas_view().pan - pan;
+    assert!(
+        moved.x < 0.0 && moved.y > 0.0,
+        "the canvas followed the pointer: {moved:?}"
+    );
+    assert!(editor.preview().spinning, "a pan is not a tap");
+
+    // Holding still, a second pointer move pans nothing.
+    let pan = editor.canvas_view().pan;
+    editor.handle_event(UiEvent::PointerMoved(start));
+    frame(&gpu, &mut editor, &target, 0.4);
+    assert_eq!(editor.canvas_view().pan, pan, "no space, no pan");
+
+    editor.handle_event(space(true));
+    frame(&gpu, &mut editor, &target, 0.5);
+    editor.handle_event(space(false));
+    frame(&gpu, &mut editor, &target, 0.6);
+    assert!(!editor.preview().spinning, "a tap toggles the spin");
+}
+
+#[test]
+fn clicking_the_theme_button_toggles_light_and_dark() {
+    // The button is pinned to the toolbar's top-right corner and always
+    // reaches the panel's right edge (its width only grows leftward to fit
+    // "theme: dark" vs "theme: light"), so a point a few pixels in from the
+    // top-right corner is inside it regardless of exactly how wide the
+    // label measures.
+    let Some(gpu) = gpu() else { return };
+    let Some((mut editor, target)) = editor(&gpu, MsdfBackend::Cpu) else {
+        return;
+    };
+    frame(&gpu, &mut editor, &target, 0.0);
+    assert_eq!(editor.theme().mode, ThemeMode::Dark, "a new editor is dark");
+
+    let click = |editor: &mut Editor, time: f64| {
+        let point = Vec2::new(1270.0, 18.0);
+        editor.handle_event(UiEvent::PointerMoved(point));
+        frame(&gpu, editor, &target, time);
+        editor.handle_event(UiEvent::PointerButton {
+            button: MouseButton::Left,
+            pressed: true,
+        });
+        frame(&gpu, editor, &target, time + 0.01);
+        editor.handle_event(UiEvent::PointerButton {
+            button: MouseButton::Left,
+            pressed: false,
+        });
+        frame(&gpu, editor, &target, time + 0.02);
+    };
+
+    click(&mut editor, 0.1);
+    assert_eq!(
+        editor.theme().mode,
+        ThemeMode::Light,
+        "one click should switch to the light theme"
+    );
+    click(&mut editor, 0.2);
+    assert_eq!(
+        editor.theme().mode,
+        ThemeMode::Dark,
+        "a second click should switch back"
+    );
+}
+
+#[test]
+fn the_pipeline_canvas_edits_the_pipeline_live() {
+    // The regression: the deferred preset, opened in the
+    // editor's second canvas, gains a bloom pass by edit, and the preview
+    // runs it — no window between "the document changed" and "the
+    // renderer runs it", because the canvas compiles onto the same
+    // renderer the preview draws with. The drop itself is the same edit
+    // `wxsl-editor::pipeline`'s device-free tests make; this one goes
+    // through the editor's own API and lands on a real device.
+    use wxsl::core::graph::SocketRef;
+    use wxsl::core::pipeline as doc;
+    use wxsl::editor::CanvasMode;
+
+    let Some(gpu) = gpu() else { return };
+    let Some((mut editor, target)) = editor(&gpu, MsdfBackend::Cpu) else {
+        return;
+    };
+    frame(&gpu, &mut editor, &target, 0.0);
+
+    // Onto the pipeline canvas: it opens on the deferred preset and
+    // compiles it onto the preview's renderer at the next frame.
+    editor.set_canvas_mode(CanvasMode::Pipeline);
+    frame(&gpu, &mut editor, &target, 0.016);
+    assert!(
+        editor.pipeline_status().is_empty(),
+        "the deferred preset compiles: {:?}",
+        editor.pipeline_status()
+    );
+    let passes_before = editor.preview().render_graph().passes().len();
+
+    // The bloom drop: a `pass.screen` with its effect named, a resource
+    // for it to write into, and the tonemap's image wire picked up and
+    // re-dropped on the new pass's output.
+    {
+        use wxsl::core::graph::Node;
+        use wxsl::editor::Document::Pipeline;
+        let graph = editor.pipeline_graph().expect("the canvas is open");
+        let tonemap = graph
+            .nodes()
+            .find(|(_, node)| node.label.as_deref() == Some("tonemap"))
+            .map(|(id, _)| id)
+            .expect("the preset ends in tonemap");
+        let scene = graph
+            .nodes()
+            .find(|(_, node)| node.def == doc::RESOURCE_COLOR)
+            .map(|(id, _)| id)
+            .expect("the preset has an intermediate target");
+
+        let mut add = |node: Node| {
+            editor
+                .apply(Command::AddNode {
+                    document: Pipeline,
+                    node,
+                })
+                .expect("a document node")
+                .added[0]
+        };
+        let bloom = add(Node::new(doc::PASS_SCREEN)
+            .with_setting(doc::SETTING_EFFECT, "wxsl.bloom")
+            .with_label("bloom"));
+        let bloomed =
+            add(Node::new(doc::RESOURCE_COLOR).with_setting(doc::SETTING_PRECISION, "hdr"));
+        let connect = |from: (_, &str), to: (_, &str)| Command::Connect {
+            document: Pipeline,
+            from: SocketRef::new(from.0, from.1),
+            to: SocketRef::new(to.0, to.1),
+        };
+        // `connect` replaces what fed tonemap's image.
+        editor
+            .apply(Command::Batch {
+                commands: vec![
+                    connect((scene, "color"), (bloom, "image")),
+                    connect((bloomed, "color"), (bloom, "into")),
+                    connect((bloomed, "color"), (tonemap, "image")),
+                ],
+            })
+            .expect("bloom wires between the scene and tonemap");
+    }
+    frame(&gpu, &mut editor, &target, 0.032);
+
+    assert!(
+        editor.pipeline_status().is_empty(),
+        "the edited document compiles: {:?}",
+        editor.pipeline_status()
+    );
+    let passes = editor.preview().render_graph().passes();
+    assert!(
+        passes.iter().any(|pass| pass.label == "bloom"),
+        "the running pass list runs bloom: {:?}",
+        passes.iter().map(|pass| &pass.label).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        passes.len(),
+        passes_before + 1,
+        "a bloom drop adds exactly one pass"
+    );
+
+    // And the frame is still a picture: the mesh renders through the
+    // edited pass list, and the material document was untouched.
+    let pixels = frame(&gpu, &mut editor, &target, 0.048);
+    assert!(
+        painted_pixels(&pixels) > 10_000,
+        "the pipeline canvas drew nothing"
+    );
+    assert!(editor.preview().status().is_ok());
+    assert_eq!(editor.canvas_mode(), CanvasMode::Pipeline);
+
+    // The parameter face: the installed block starts at the
+    // declared defaults, and a slider move — what the inspector's editors
+    // drive — is a buffer write, compiling nothing.
+    use wxsl::core::node::Value;
+    assert_eq!(
+        editor.preview().pass_param("bloom", "threshold"),
+        Some(Value::F32(1.0)),
+        "the block starts at the descriptor's defaults"
+    );
+    let variants_before = editor.preview().variant_stats().0;
+    editor
+        .apply(Command::SetPassParam {
+            pass: "bloom".into(),
+            name: "threshold".into(),
+            value: Value::F32(0.5),
+        })
+        .expect("bloom declares a threshold");
+    frame(&gpu, &mut editor, &target, 0.056);
+    assert_eq!(
+        editor.preview().pass_param("bloom", "threshold"),
+        Some(Value::F32(0.5)),
+        "the move is visible through the same offsets"
+    );
+    assert_eq!(
+        editor.preview().variant_stats().0,
+        variants_before,
+        "a slider move compiles nothing"
+    );
+
+    // Back to the material canvas: the stock pipeline the material chose
+    // comes back, which is what lets the two canvases share one renderer.
+    editor.set_canvas_mode(CanvasMode::Material);
+    frame(&gpu, &mut editor, &target, 0.064);
+    assert!(editor.preview().status().is_ok());
+    assert!(
+        !editor
+            .preview()
+            .render_graph()
+            .passes()
+            .iter()
+            .any(|pass| pass.label == "bloom"),
+        "the stock pass list came back with the material canvas"
+    );
+}
+
+/// The features panel: a checkbox toggles the pipeline's
+/// channel live — the plan widens, the budget bar's numbers move with it,
+/// and the material is regenerated against the new plan rather than the
+/// frame failing its handshake check.
+#[test]
+fn a_features_checkbox_widens_the_plan_and_the_budget_bar_moves() {
+    let Some(gpu) = gpu() else { return };
+    let Some((mut editor, target)) = editor(&gpu, MsdfBackend::Cpu) else {
+        return;
+    };
+    frame(&gpu, &mut editor, &target, 0.0);
+    frame(&gpu, &mut editor, &target, 0.016);
+    assert!(
+        editor.preview().features().is_empty(),
+        "a new editor carries no feature channels"
+    );
+    let bytes = |editor: &Editor| {
+        wxsl::render::pipeline::gbuffer_layout_bytes_per_sample(
+            editor
+                .preview()
+                .pipeline_config()
+                .plan()
+                .expect("the renderer's plan is valid")
+                .layout(),
+        )
+    };
+    let before = bytes(&editor);
+
+    // The click points are the layout's own arithmetic at scale 1: the
+    // code panel's tab strip is the first row of the bottom panel's inner
+    // rect (y = 800 - 24 - 240 + 8 = 544..566), the tabs occupy its first
+    // 340 px in four equal cells, so "features" (index 2) centres at
+    // x ≈ 220; the checkbox row is the first feature row under the budget
+    // bar (y ≈ 596..618).
+    let click = |editor: &mut Editor, point: Vec2, time: f64| {
+        editor.handle_event(UiEvent::PointerMoved(point));
+        frame(&gpu, editor, &target, time);
+        editor.handle_event(UiEvent::PointerButton {
+            button: MouseButton::Left,
+            pressed: true,
+        });
+        frame(&gpu, editor, &target, time + 0.01);
+        editor.handle_event(UiEvent::PointerButton {
+            button: MouseButton::Left,
+            pressed: false,
+        });
+        frame(&gpu, editor, &target, time + 0.02);
+    };
+
+    click(&mut editor, Vec2::new(220.0, 555.0), 0.1);
+    click(&mut editor, Vec2::new(100.0, 607.0), 0.2);
+    assert_eq!(
+        editor.preview().features(),
+        vec!["subsurface"],
+        "one click on the checkbox enables the channel"
+    );
+    assert!(
+        bytes(&editor) > before,
+        "the budget bar's bytes must move with the plan: {} then {}",
+        before,
+        bytes(&editor)
+    );
+    // The regenerated material resolved against the widened plan, which is
+    // the handshake both sides check by name — and the preview still runs.
+    assert!(
+        editor.preview().status().is_ok(),
+        "the material recompiled against the new plan: {:?}",
+        editor.preview().status()
+    );
+
+    // And back off: the channel leaves, the bytes return.
+    click(&mut editor, Vec2::new(220.0, 555.0), 0.3);
+    click(&mut editor, Vec2::new(100.0, 607.0), 0.4);
+    assert!(editor.preview().features().is_empty());
+    assert_eq!(bytes(&editor), before);
+    assert!(editor.preview().status().is_ok());
+}
+
+/// The policy inspector's reset: fresh run bookkeeping, every
+/// pass due again — the `once` policy's observable half. The "run now"
+/// button rides the same request path for `on demand` passes, which the
+/// stock presets carry none of; `mark_pass` itself is the execution-policy
+/// tests' ground.
+#[test]
+fn the_policy_inspectors_reset_makes_every_pass_due_again() {
+    use wxsl::editor::CanvasMode;
+
+    let Some(gpu) = gpu() else { return };
+    let Some((mut editor, target)) = editor(&gpu, MsdfBackend::Cpu) else {
+        return;
+    };
+    frame(&gpu, &mut editor, &target, 0.0);
+    editor.set_canvas_mode(CanvasMode::Pipeline);
+    frame(&gpu, &mut editor, &target, 0.016);
+    frame(&gpu, &mut editor, &target, 0.032);
+    frame(&gpu, &mut editor, &target, 0.048);
+    let tonemap = editor.preview().pass_run_count("tonemap");
+    assert_eq!(tonemap, Some(3), "a per-frame pass runs once per frame");
+
+    // The reset button sits at the left of the passes panel's meta row —
+    // the same first row of the bottom panel's inner rect as the material
+    // canvas's tabs (y = 544..566), left of the right-aligned counts.
+    editor.handle_event(UiEvent::PointerMoved(Vec2::new(305.0, 555.0)));
+    frame(&gpu, &mut editor, &target, 0.064);
+    editor.handle_event(UiEvent::PointerButton {
+        button: MouseButton::Left,
+        pressed: true,
+    });
+    frame(&gpu, &mut editor, &target, 0.072);
+    editor.handle_event(UiEvent::PointerButton {
+        button: MouseButton::Left,
+        pressed: false,
+    });
+    // The request applies at the end of the frame the click landed in, so
+    // it is the *next* frame that runs against fresh bookkeeping.
+    frame(&gpu, &mut editor, &target, 0.08);
+    frame(&gpu, &mut editor, &target, 0.096);
+    assert_eq!(
+        editor.preview().pass_run_count("tonemap"),
+        Some(1),
+        "the reset cleared the bookkeeping and the pass ran once more"
+    );
+}
+
+/// The resolved material in the inspector: the demo graph's
+/// `tint` parameter as a drag value. Dragging it moves the value in the
+/// preview's buffer and pins it on the `param` node, and compiles nothing
+/// — a parameter's value is not part of the variant key.
+#[test]
+fn dragging_a_material_parameter_writes_the_buffer_and_compiles_nothing() {
+    let Some(gpu) = gpu() else { return };
+    let Some((mut editor, target)) = editor(&gpu, MsdfBackend::Cpu) else {
+        return;
+    };
+    // Nothing selected, so the material section sits right under the
+    // "no node selected" row; at scale 1 the tint's first component is the
+    // field at x ≈ 1086, y ≈ 439.
+    editor.select([]);
+    frame(&gpu, &mut editor, &target, 0.0);
+    frame(&gpu, &mut editor, &target, 0.016);
+    let tint = |editor: &Editor| match editor.preview().material_params().as_slice() {
+        [(name, wxsl::core::node::Value::Vec3(value))] if name == "tint" => *value,
+        other => panic!("the demo graph declares one vec3f tint: {other:?}"),
+    };
+    assert_eq!(tint(&editor), [1.0, 1.0, 1.0]);
+    // Drawing looks variants up every frame, so the baseline is what eight
+    // idle frames — as many as the drag below takes — add to the counters.
+    let (_, idle_start) = editor.preview().variant_stats();
+    for step in 0..8 {
+        frame(&gpu, &mut editor, &target, 0.02 + 0.01 * step as f64);
+    }
+    let (_, compiles_before) = editor.preview().variant_stats();
+    let idle = (
+        compiles_before.hits - idle_start.hits,
+        compiles_before.misses - idle_start.misses,
+    );
+
+    let start = Vec2::new(1086.0, 439.0);
+    editor.handle_event(UiEvent::PointerMoved(start));
+    frame(&gpu, &mut editor, &target, 0.1);
+    editor.handle_event(UiEvent::PointerButton {
+        button: MouseButton::Left,
+        pressed: true,
+    });
+    frame(&gpu, &mut editor, &target, 0.11);
+    for step in 1..=4 {
+        editor.handle_event(UiEvent::PointerMoved(
+            start - Vec2::new(10.0 * step as f32, 0.0),
+        ));
+        frame(&gpu, &mut editor, &target, 0.11 + 0.01 * step as f64);
+    }
+    editor.handle_event(UiEvent::PointerButton {
+        button: MouseButton::Left,
+        pressed: false,
+    });
+    frame(&gpu, &mut editor, &target, 0.2);
+    frame(&gpu, &mut editor, &target, 0.21);
+
+    let moved = tint(&editor);
+    assert!(
+        moved[0] < 1.0,
+        "dragging left lowers the red component: {moved:?}"
+    );
+    assert_eq!(&moved[1..], &[1.0, 1.0], "only the dragged component moves");
+    let pinned: Vec<_> = editor
+        .graph()
+        .nodes()
+        .filter(|(_, node)| node.def == "param.value")
+        .filter_map(|(_, node)| node.params.get("value").copied())
+        .collect();
+    assert_eq!(
+        pinned,
+        vec![wxsl::core::node::Value::Vec3(moved)],
+        "the value is pinned on the param node, so it saves with the graph"
+    );
+    let (_, compiles_after) = editor.preview().variant_stats();
+    // Hits too: a rebuild of the same graph would be a cache *hit*, so
+    // only both counters moving exactly as idle frames do says nothing was
+    // regenerated.
+    assert_eq!(
+        (
+            compiles_after.hits - compiles_before.hits,
+            compiles_after.misses - compiles_before.misses,
+        ),
+        idle,
+        "a parameter drag neither regenerates nor compiles anything"
+    );
+    assert!(editor.is_modified());
+    assert!(editor.preview().status().is_ok());
+}
+
+/// The toolbar's pipeline dropdown: its list opens over the canvas, and
+/// picking the third row previews the material through the pipeline
+/// canvas's document; picking `forward` puts a stock pipeline back.
+#[test]
+fn the_pipeline_dropdown_previews_through_the_document() {
+    let Some(gpu) = gpu() else { return };
+    let Some((mut editor, target)) = editor(&gpu, MsdfBackend::Cpu) else {
+        return;
+    };
+    frame(&gpu, &mut editor, &target, 0.0);
+    let click = |editor: &mut Editor, point: Vec2, time: f64| {
+        editor.handle_event(UiEvent::PointerMoved(point));
+        frame(&gpu, editor, &target, time);
+        editor.handle_event(UiEvent::PointerButton {
+            button: MouseButton::Left,
+            pressed: true,
+        });
+        frame(&gpu, editor, &target, time + 0.01);
+        editor.handle_event(UiEvent::PointerButton {
+            button: MouseButton::Left,
+            pressed: false,
+        });
+        frame(&gpu, editor, &target, time + 0.02)
+    };
+    // At scale 1 the pipeline dropdown sits right of the name field
+    // (x ≈ 330..490), and its list opens under it, one 22 px row per
+    // option starting at y ≈ 35.
+    let dropdown = Vec2::new(400.0, 19.0);
+    click(&mut editor, dropdown, 0.1);
+    click(&mut editor, Vec2::new(400.0, 90.0), 0.2);
+    for step in 0..3 {
+        frame(&gpu, &mut editor, &target, 0.3 + 0.01 * step as f64);
+    }
+    assert!(
+        editor.previews_document(),
+        "the third row previews through the document"
+    );
+    assert!(
+        editor.pipeline_graph().is_some(),
+        "choosing the document opens it"
+    );
+    assert!(
+        editor.pipeline_status().is_empty(),
+        "the document compiled: {:?}",
+        editor.pipeline_status()
+    );
+    assert!(
+        editor.preview().runs_document(),
+        "the renderer runs the installed document, not a stock pass list"
+    );
+    assert_eq!(
+        editor.canvas_mode(),
+        wxsl::editor::CanvasMode::Material,
+        "the canvas stays on the material"
+    );
+    assert!(editor.preview().status().is_ok());
+
+    // And back to a stock pipeline through the same list.
+    click(&mut editor, dropdown, 0.4);
+    click(&mut editor, Vec2::new(400.0, 68.0), 0.5);
+    for step in 0..30 {
+        frame(&gpu, &mut editor, &target, 0.6 + 0.01 * step as f64);
+        if editor.preview().swap_progress().is_none() {
+            break;
+        }
+    }
+    assert!(!editor.previews_document());
+    assert!(!editor.preview().runs_document());
+    assert_eq!(
+        editor.preview().pipeline(),
+        wxsl::render::StockPipeline::Deferred
+    );
+    assert!(editor.preview().status().is_ok());
+}
+
+/// The G-buffer debug views: with the subsurface channel in the
+/// plan and the material writing a strength of one half, the toolbar's
+/// `subsurface` view shows that stored value and nothing else — every
+/// covered pixel the same encoded red, no light, no curve — and `shaded`
+/// brings the lighting back.
+#[test]
+fn the_subsurface_debug_view_isolates_the_channel() {
+    use wxsl::core::macros::MacroValue;
+
+    let Some(gpu) = gpu() else { return };
+    let Some((mut editor, target)) = editor(&gpu, MsdfBackend::Cpu) else {
+        return;
+    };
+    frame(&gpu, &mut editor, &target, 0.0);
+    let click = |editor: &mut Editor, point: Vec2, time: f64| {
+        editor.handle_event(UiEvent::PointerMoved(point));
+        frame(&gpu, editor, &target, time);
+        editor.handle_event(UiEvent::PointerButton {
+            button: MouseButton::Left,
+            pressed: true,
+        });
+        frame(&gpu, editor, &target, time + 0.01);
+        editor.handle_event(UiEvent::PointerButton {
+            button: MouseButton::Left,
+            pressed: false,
+        });
+        frame(&gpu, editor, &target, time + 0.02);
+    };
+    let settle = |editor: &mut Editor, time: f64| {
+        for step in 0..30 {
+            frame(&gpu, editor, &target, time + 0.01 * step as f64);
+            if editor.preview().swap_progress().is_none() && step >= 3 {
+                break;
+            }
+        }
+    };
+
+    // The subsurface channel (the features tab's first checkbox, as in
+    // the features test), the material's pin of it, then deferred.
+    click(&mut editor, Vec2::new(220.0, 555.0), 0.1);
+    click(&mut editor, Vec2::new(100.0, 607.0), 0.2);
+    assert_eq!(editor.preview().features(), vec!["subsurface"]);
+    for (name, value) in [
+        ("wxsl_subsurface", MacroValue::Flag(true)),
+        ("wxsl_subsurface_strength", MacroValue::Float(0.5)),
+    ] {
+        editor
+            .apply(Command::SetMacro {
+                document: Default::default(),
+                name: name.into(),
+                value: Some(value),
+            })
+            .expect("a macro pins");
+    }
+    click(&mut editor, Vec2::new(400.0, 19.0), 0.3);
+    click(&mut editor, Vec2::new(400.0, 68.0), 0.4);
+    settle(&mut editor, 0.5);
+    assert_eq!(
+        editor.preview().pipeline(),
+        wxsl::render::StockPipeline::Deferred
+    );
+    assert!(editor.preview().status().is_ok());
+
+    // The view menu sits right of the pipeline one (x ≈ 494..686); its
+    // rows are 22 px from y ≈ 35: shaded, the ten base views the menu
+    // lists (the four forward ones greyed under deferred), then
+    // subsurface, the first feature channel.
+    let view_menu = Vec2::new(590.0, 19.0);
+    click(&mut editor, view_menu, 1.0);
+    click(&mut editor, Vec2::new(590.0, 288.0), 1.1);
+    settle(&mut editor, 1.2);
+    let shown = wxsl::core::lighting::debug_views()
+        .into_iter()
+        .find(|view| view.id == editor.preview().debug_view());
+    assert_eq!(
+        shown.and_then(|view| view.channel),
+        Some("subsurface"),
+        "the twelfth row is the subsurface view"
+    );
+    assert!(
+        editor.preview().status().is_ok(),
+        "{:?}",
+        editor.preview().status()
+    );
+
+    let pixels = editor.preview().read_rgba8(&gpu.device, &gpu.queue);
+    let background = [pixels[0], pixels[1], pixels[2]];
+    let near = |a: u8, b: u8| a.abs_diff(b) <= 2;
+    let mut red = 0;
+    for texel in pixels.chunks_exact(4) {
+        // Nothing lit: no channel rises above the clear colour but the
+        // stored strength's red, at the mesh's edges blended with it.
+        assert!(
+            texel[1] <= background[1] + 2 && texel[2] <= background[2] + 2,
+            "a lit pixel under the subsurface view: {texel:?} over {background:?}"
+        );
+        if near(texel[0], 128) && texel[1] <= 2 && texel[2] <= 2 {
+            red += 1;
+        }
+    }
+    assert!(
+        red > 5_000,
+        "the cube shows the stored 0.5 unbent ({red} pixels)"
+    );
+
+    // And back: shading returns, with its light.
+    click(&mut editor, view_menu, 2.0);
+    click(&mut editor, Vec2::new(590.0, 46.0), 2.1);
+    settle(&mut editor, 2.2);
+    assert_eq!(editor.preview().debug_view(), 0);
+    let pixels = editor.preview().read_rgba8(&gpu.device, &gpu.queue);
+    let lit = pixels
+        .chunks_exact(4)
+        .filter(|texel| texel[1] > background[1] + 16)
+        .count();
+    assert!(lit > 1_000, "shading lights the cube again ({lit} pixels)");
+}
+
+/// The A/B split: the preview header's dropdown puts a deferred
+/// B side beside the forward A side, both frames render the same material
+/// within the forward/deferred parity the render tests assert, and dragging
+/// the edge moves the cut.
+#[test]
+fn the_ab_split_shows_two_pipelines_and_its_edge_drags() {
+    let Some(gpu) = gpu() else { return };
+    let Some((mut editor, target)) = editor(&gpu, MsdfBackend::Cpu) else {
+        return;
+    };
+    frame(&gpu, &mut editor, &target, 0.0);
+    let click = |editor: &mut Editor, point: Vec2, time: f64| {
+        editor.handle_event(UiEvent::PointerMoved(point));
+        frame(&gpu, editor, &target, time);
+        editor.handle_event(UiEvent::PointerButton {
+            button: MouseButton::Left,
+            pressed: true,
+        });
+        frame(&gpu, editor, &target, time + 0.01);
+        editor.handle_event(UiEvent::PointerButton {
+            button: MouseButton::Left,
+            pressed: false,
+        });
+        frame(&gpu, editor, &target, time + 0.02)
+    };
+    // At scale 1 the inspector's header holds the dropdown at its right
+    // end (x ≈ 1172..1272, y ≈ 39..59); its list opens beneath, one 22 px
+    // row per option: off, forward, deferred (y ≈ 119).
+    click(&mut editor, Vec2::new(1210.0, 49.0), 0.1);
+    click(&mut editor, Vec2::new(1210.0, 119.0), 0.2);
+    for step in 0..30 {
+        frame(&gpu, &mut editor, &target, 0.3 + 0.01 * step as f64);
+        if step >= 3 && editor.preview().swap_progress().is_none() {
+            break;
+        }
+    }
+    assert_eq!(
+        editor.preview().compare(),
+        Some(wxsl::render::StockPipeline::Deferred)
+    );
+    assert_eq!(
+        editor.preview().pipeline(),
+        wxsl::render::StockPipeline::Forward,
+        "A keeps its pipeline"
+    );
+    assert!(editor.preview().status().is_ok());
+
+    // The same frame, two pipelines: both drew the cube, and they agree
+    // as closely as `render_cube` asserts forward and deferred do.
+    let a = editor.preview().read_rgba8(&gpu.device, &gpu.queue);
+    let b = editor.preview().compare_rgba8(&gpu.device, &gpu.queue);
+    assert!(painted_pixels(&a) > 5_000 && painted_pixels(&b) > 5_000);
+    let diff: u64 = a
+        .iter()
+        .zip(&b)
+        .map(|(x, y)| u64::from(x.abs_diff(*y)))
+        .sum();
+    let mean = diff as f64 / a.len() as f64 / 255.0;
+    assert!(mean < 0.01, "forward and deferred disagree: {mean}");
+
+    // The edge sits mid-image (x ≈ 1150 of 1047..1253); dragging it left
+    // shows more of B.
+    let before = editor.preview().split;
+    editor.handle_event(UiEvent::PointerMoved(Vec2::new(1150.0, 200.0)));
+    frame(&gpu, &mut editor, &target, 1.0);
+    editor.handle_event(UiEvent::PointerButton {
+        button: MouseButton::Left,
+        pressed: true,
+    });
+    frame(&gpu, &mut editor, &target, 1.01);
+    editor.handle_event(UiEvent::PointerMoved(Vec2::new(1100.0, 200.0)));
+    frame(&gpu, &mut editor, &target, 1.02);
+    editor.handle_event(UiEvent::PointerButton {
+        button: MouseButton::Left,
+        pressed: false,
+    });
+    frame(&gpu, &mut editor, &target, 1.03);
+    let after = editor.preview().split;
+    assert!(
+        after < before - 0.1,
+        "the edge follows the drag: {before} then {after}"
+    );
+
+    // And off again.
+    click(&mut editor, Vec2::new(1210.0, 49.0), 1.1);
+    click(&mut editor, Vec2::new(1210.0, 75.0), 1.2);
+    // The dropdown reads its pick back the frame after the click.
+    frame(&gpu, &mut editor, &target, 1.3);
+    frame(&gpu, &mut editor, &target, 1.31);
+    assert_eq!(editor.preview().compare(), None);
+}
+
+/// Pass stepping: the frame tab freezes the preview on one
+/// frame and runs the pass list cut after any pass, showing what that pass
+/// wrote; `live` puts the stock pass list back.
+#[test]
+fn stepping_runs_the_frame_one_pass_at_a_time() {
+    let Some(gpu) = gpu() else { return };
+    let Some((mut editor, target)) = editor(&gpu, MsdfBackend::Cpu) else {
+        return;
+    };
+    frame(&gpu, &mut editor, &target, 0.0);
+    let click = |editor: &mut Editor, point: Vec2, time: f64| {
+        editor.handle_event(UiEvent::PointerMoved(point));
+        frame(&gpu, editor, &target, time);
+        editor.handle_event(UiEvent::PointerButton {
+            button: MouseButton::Left,
+            pressed: true,
+        });
+        frame(&gpu, editor, &target, time + 0.01);
+        editor.handle_event(UiEvent::PointerButton {
+            button: MouseButton::Left,
+            pressed: false,
+        });
+        frame(&gpu, editor, &target, time + 0.02);
+        frame(&gpu, editor, &target, time + 0.03)
+    };
+    click(&mut editor, Vec2::new(400.0, 19.0), 0.1);
+    click(&mut editor, Vec2::new(400.0, 68.0), 0.2);
+    for step in 0..30 {
+        frame(&gpu, &mut editor, &target, 0.3 + 0.01 * step as f64);
+        if step >= 3 && editor.preview().swap_progress().is_none() {
+            break;
+        }
+    }
+    // The frame tab (the fourth of five cells over the tab strip's 420
+    // px), then `step` at the start of its bar.
+    click(&mut editor, Vec2::new(294.0, 555.0), 0.7);
+    click(&mut editor, Vec2::new(40.0, 581.0), 0.8);
+    let step = editor.preview().stepping().expect("the frame is stepped");
+    let total = step.passes.len();
+    assert_eq!(step.count, total, "stepping starts with every pass run");
+    assert_eq!(step.shown, None, "the last pass wrote the frame itself");
+    let preview = |editor: &Editor| editor.preview().read_rgba8(&gpu.device, &gpu.queue);
+    let full = preview(&editor);
+    frame(&gpu, &mut editor, &target, 1.5);
+    assert_eq!(preview(&editor), full, "a stepped frame does not move");
+
+    // `previous` twice: the lighting pass, then the G-buffer pass, whose
+    // first drawable output is the albedo target — unlit.
+    click(&mut editor, Vec2::new(83.0, 581.0), 2.0);
+    click(&mut editor, Vec2::new(83.0, 581.0), 2.1);
+    let step = editor.preview().stepping().expect("still stepping");
+    assert_eq!(step.count, total - 2);
+    assert_eq!(step.passes[step.count - 1], "deferred material");
+    assert_eq!(step.shown.as_deref(), Some("gbuffer base_color"));
+    assert!(editor.preview().status().is_ok());
+    let albedo = preview(&editor);
+    assert!(painted_pixels(&albedo) > 5_000, "the albedo shows the cube");
+    assert_ne!(albedo, full, "the G-buffer is not the lit frame");
+
+    // The show dropdown (x ≈ 170..362) lists the last pass's output, then
+    // every texture written so far: shadow maps, the three G-buffer
+    // targets, depth — the sixth row, at y ≈ 608 + 5 * 22.
+    click(&mut editor, Vec2::new(265.0, 581.0), 3.0);
+    click(&mut editor, Vec2::new(265.0, 718.0), 3.1);
+    // The dropdown's pick lands after the click's last frame has drawn.
+    frame(&gpu, &mut editor, &target, 3.2);
+    let step = editor.preview().stepping().expect("still stepping");
+    assert_eq!(step.shown.as_deref(), Some("gbuffer depth"));
+    assert!(step.pinned);
+    let depth = preview(&editor);
+    assert!(painted_pixels(&depth) > 5_000, "depth shows the cube");
+    assert!(
+        depth
+            .chunks_exact(4)
+            .all(|texel| texel[0] == texel[1] && texel[1] == texel[2]),
+        "depth is drawn grey"
+    );
+
+    // `live`: the stock pass list again, moving.
+    click(&mut editor, Vec2::new(25.0, 581.0), 4.0);
+    assert!(editor.preview().stepping().is_none());
+    assert!(!editor.preview().runs_document());
+    assert_eq!(
+        editor.preview().pipeline(),
+        wxsl::render::StockPipeline::Deferred
+    );
+    assert!(editor.preview().status().is_ok());
+    let a = preview(&editor);
+    frame(&gpu, &mut editor, &target, 4.5);
+    assert_ne!(preview(&editor), a, "the live preview spins again");
+}
+
+/// Hot reload: an edited library module on disk lands in the
+/// preview, a broken edit is reported in the problems panel while the last
+/// working library keeps rendering, and the fix lands again.
+#[test]
+fn an_edited_shader_file_reloads_into_the_preview() {
+    let Some(gpu) = gpu() else { return };
+    let Some((mut editor, target)) = editor(&gpu, MsdfBackend::Cpu) else {
+        return;
+    };
+    // A source tree holding one module verbatim: the filmic curve the
+    // tonemap pass applies to every pixel of the frame.
+    let root = std::env::temp_dir().join(format!("wxsl-hot-reload-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("color")).unwrap();
+    let file = root.join("color").join("tonemap_filmic.wxsl");
+    let original = wxsl::stdlib_library()
+        .get("package::color::tonemap_filmic")
+        .expect("the library has the curve")
+        .to_string();
+    std::fs::write(&file, &original).unwrap();
+    assert_eq!(editor.watch_shaders(&root), 1);
+
+    // Each write gets a later modification time, so a coarse filesystem
+    // clock cannot hide it.
+    let mut stamp = std::time::SystemTime::now();
+    let mut write = |text: &str| {
+        stamp += std::time::Duration::from_secs(5);
+        std::fs::write(&file, text).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(stamp)
+            .unwrap();
+    };
+    let body = original.find("    let x =").expect("the curve's body");
+    let edited = |tail: &str| format!("{}{tail}\n}}\n", &original[..body]);
+    let red = |pixels: &[u8]| {
+        pixels
+            .chunks_exact(4)
+            .all(|texel| texel[0] == 255 && texel[1] == 0 && texel[2] == 0)
+    };
+
+    frame(&gpu, &mut editor, &target, 0.0);
+    let before = editor.preview().read_rgba8(&gpu.device, &gpu.queue);
+    assert!(!red(&before));
+
+    write(&edited("    return vec3f(1.0, 0.0, 0.0);"));
+    frame(&gpu, &mut editor, &target, 1.0);
+    let pixels = editor.preview().read_rgba8(&gpu.device, &gpu.queue);
+    assert!(red(&pixels), "the edited curve paints every pixel red");
+    assert_eq!(editor.message(), "reloaded tonemap_filmic.wxsl");
+    assert!(editor.preview().reload_errors().is_empty());
+
+    write(&edited("    return vec3f(1.0, 0.0;"));
+    frame(&gpu, &mut editor, &target, 2.0);
+    assert!(
+        !editor.preview().reload_errors().is_empty(),
+        "the broken edit is reported"
+    );
+    assert!(editor.message().contains("does not compile"));
+    let errors = editor.preview().reload_errors().join("\n");
+    assert!(
+        errors.contains(&format!(
+            "package::color::tonemap_filmic:{}",
+            original[..body].lines().count() + 1
+        )),
+        "the span names the edited module and line: {errors}"
+    );
+    let pixels = editor.preview().read_rgba8(&gpu.device, &gpu.queue);
+    assert!(red(&pixels), "the last working curve keeps rendering");
+
+    write(&original);
+    frame(&gpu, &mut editor, &target, 3.0);
+    assert!(editor.preview().reload_errors().is_empty());
+    let pixels = editor.preview().read_rgba8(&gpu.device, &gpu.queue);
+    assert!(!red(&pixels), "the original curve is back");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Pass timings: with timestamp queries the pipeline canvas's
+/// pass list carries each pass's GPU time a few frames in, and the frame's
+/// total is their sum.
+#[test]
+fn the_pass_list_shows_gpu_timings() {
+    use wxsl::editor::CanvasMode;
+
+    let Some(gpu) = gpu() else { return };
+    let Some((mut editor, target)) = editor(&gpu, MsdfBackend::Cpu) else {
+        return;
+    };
+    if !editor.preview().timed() {
+        println!("skipping: the device writes no timestamps");
+        return;
+    }
+    editor.set_canvas_mode(CanvasMode::Pipeline);
+    for step in 0..40 {
+        frame(&gpu, &mut editor, &target, 0.05 * step as f64);
+        if step > 4
+            && editor.preview().swap_progress().is_none()
+            && editor.preview().pass_time("deferred lighting").is_some()
+        {
+            break;
+        }
+    }
+    let preview = editor.preview();
+    let lighting = preview
+        .pass_time("deferred lighting")
+        .expect("the lighting pass is timed");
+    let frame_time = preview.frame_time().expect("the frame is timed");
+    let summed: f32 = preview
+        .render_graph()
+        .passes()
+        .iter()
+        .filter_map(|pass| preview.pass_time(&pass.label))
+        .sum();
+    assert!(lighting > 0.0 && lighting <= frame_time);
+    assert!((frame_time - summed).abs() < 1e-3 * frame_time.max(1.0));
+}
+
+#[test]
+fn a_feature_toggled_under_the_document_pipeline_recompiles_it() {
+    // The crash this pins down: the preview running the pipeline canvas's
+    // document (the pipeline dropdown's third row) kept the pass list
+    // compiled against the old plan when a feature was ticked, so the
+    // regenerated lighting pass read a G-buffer channel the pass list did
+    // not bind — a wgpu validation panic, not an error.
+    let Some(gpu) = gpu() else { return };
+    let Some((mut editor, target)) = editor(&gpu, MsdfBackend::Cpu) else {
+        return;
+    };
+    frame(&gpu, &mut editor, &target, 0.0);
+    let click = |editor: &mut Editor, point: Vec2, time: f64| {
+        editor.handle_event(UiEvent::PointerMoved(point));
+        frame(&gpu, editor, &target, time);
+        editor.handle_event(UiEvent::PointerButton {
+            button: MouseButton::Left,
+            pressed: true,
+        });
+        frame(&gpu, editor, &target, time + 0.01);
+        editor.handle_event(UiEvent::PointerButton {
+            button: MouseButton::Left,
+            pressed: false,
+        });
+        frame(&gpu, editor, &target, time + 0.02);
+    };
+    // The document row of the pipeline dropdown, as in
+    // `the_pipeline_dropdown_previews_through_the_document`, then the
+    // features tab's first checkbox, as in the features test.
+    click(&mut editor, Vec2::new(400.0, 19.0), 0.1);
+    click(&mut editor, Vec2::new(400.0, 90.0), 0.2);
+    for step in 0..10 {
+        frame(&gpu, &mut editor, &target, 0.3 + step as f64 * 0.01);
+    }
+    let resources = editor.preview().render_graph().resources().len();
+    click(&mut editor, Vec2::new(220.0, 555.0), 0.5);
+    click(&mut editor, Vec2::new(100.0, 607.0), 0.6);
+    assert_eq!(editor.preview().features(), vec!["subsurface"]);
+    for step in 0..10 {
+        frame(&gpu, &mut editor, &target, 0.7 + step as f64 * 0.01);
+    }
+    assert_eq!(
+        editor.preview().render_graph().resources().len(),
+        resources + 1,
+        "the document's pass list was recompiled with the channel's target"
+    );
+    assert!(editor.preview().status().is_ok());
+}
+
+/// The code editor: a function typed into the `function` tab
+/// and saved with Ctrl+S is a node in the same session — registered,
+/// offered by the palette, wired into the graph and compiled into the
+/// material — and a syntax error typed into it afterwards is reported on
+/// its own line while the last good node keeps working; undo takes it back.
+#[test]
+fn a_function_written_in_the_editor_becomes_a_node() {
+    use wxsl::render::ui::input::Modifiers;
+
+    let Some(gpu) = gpu() else { return };
+    let Some((mut editor, target)) = editor(&gpu, MsdfBackend::Cpu) else {
+        return;
+    };
+    let mut time = 0.0;
+    let mut tick = |editor: &mut Editor| {
+        time += 0.016;
+        frame(&gpu, editor, &target, time);
+    };
+    tick(&mut editor);
+    tick(&mut editor);
+    let click = |editor: &mut Editor, point: Vec2, tick: &mut dyn FnMut(&mut Editor)| {
+        editor.handle_event(UiEvent::PointerMoved(point));
+        tick(editor);
+        for pressed in [true, false] {
+            editor.handle_event(UiEvent::PointerButton {
+                button: MouseButton::Left,
+                pressed,
+            });
+            tick(editor);
+        }
+    };
+    let key = |editor: &mut Editor, key: Key, modifiers: Modifiers| {
+        editor.handle_event(UiEvent::ModifiersChanged(modifiers));
+        for pressed in [true, false] {
+            editor.handle_event(UiEvent::Key {
+                key,
+                pressed,
+                repeat: false,
+            });
+        }
+        editor.handle_event(UiEvent::ModifiersChanged(Modifiers::NONE));
+    };
+    let command = Modifiers {
+        ctrl: true,
+        ..Modifiers::NONE
+    };
+
+    // The bottom panel's tab strip at scale 1: six cells of ~84 px from
+    // x = 8, "function" last; the editor fills the panel under its bar.
+    click(&mut editor, Vec2::new(470.0, 555.0), &mut tick);
+    click(&mut editor, Vec2::new(600.0, 690.0), &mut tick);
+    assert!(
+        editor.is_typing(),
+        "a click in the buffer gives it the keyboard"
+    );
+
+    // Replace the template, one typed line per frame. Enter indents the
+    // next line itself, so the lines are typed without their own.
+    key(&mut editor, Key::Char('a'), command);
+    // Its own frame: text arriving beside a command chord is the chord's.
+    tick(&mut editor);
+    let source = [
+        "// Glow",
+        "//",
+        "// A colour doubled, written in the editor.",
+        "",
+        "fn glow(",
+        "color: vec3f, // @default 1.0, 0.5, 0.25",
+        ") -> vec3f {",
+        "return color * 2.0;",
+        "}",
+    ];
+    for line in source {
+        for character in line.chars() {
+            editor.handle_event(UiEvent::Text(character));
+        }
+        key(&mut editor, Key::Enter, Modifiers::NONE);
+        tick(&mut editor);
+    }
+    key(&mut editor, Key::Char('s'), command);
+    tick(&mut editor);
+    assert!(
+        editor.registry().contains("user.glow"),
+        "saving registers the node: {}\n{}",
+        editor.message(),
+        editor.function_text()
+    );
+    assert!(
+        editor.message().contains("user.glow"),
+        "{}",
+        editor.message()
+    );
+    assert!(editor.function_problems().is_empty());
+    assert!(
+        editor
+            .registry()
+            .categories_in(editor.graph().domain())
+            .contains(&"user"),
+        "the palette offers it under its package"
+    );
+
+    // Use it: the material compiles the function the editor wrote.
+    let output = editor
+        .graph()
+        .nodes()
+        .find(|(_, node)| node.def == wxsl::core::abi::SURFACE_OUTPUT_ID)
+        .map(|(id, _)| id)
+        .expect("the demo graph has an output");
+    let glow = editor
+        .apply(Command::AddNode {
+            document: Default::default(),
+            node: wxsl::core::graph::Node::new("user.glow"),
+        })
+        .expect("the saved function is a node")
+        .added[0];
+    editor
+        .apply(Command::Connect {
+            document: Default::default(),
+            from: wxsl::core::graph::SocketRef::new(glow, "out"),
+            to: wxsl::core::graph::SocketRef::new(output, "emissive"),
+        })
+        .expect("a vec3f is an emissive");
+    tick(&mut editor);
+    assert!(
+        editor.preview().status().is_ok(),
+        "the graph using the new node compiles: {:?}",
+        editor.preview().status()
+    );
+    assert!(editor.preview().wxsl().contains("glow"));
+
+    // Break line 8 ("return color * 2.0;") and save: the error is on that
+    // line, and the node that last saved keeps the preview running.
+    key(
+        &mut editor,
+        Key::Up,
+        Modifiers {
+            logo: true,
+            ..Modifiers::NONE
+        },
+    );
+    for _ in 0..7 {
+        key(&mut editor, Key::Down, Modifiers::NONE);
+    }
+    key(&mut editor, Key::End, Modifiers::NONE);
+    key(&mut editor, Key::Left, Modifiers::NONE);
+    tick(&mut editor);
+    for character in " +".chars() {
+        editor.handle_event(UiEvent::Text(character));
+    }
+    tick(&mut editor);
+    let text = editor.function_text().to_string();
+    assert_eq!(
+        text.lines().nth(7).map(str::trim),
+        Some("return color * 2.0 +;")
+    );
+    key(&mut editor, Key::Char('s'), command);
+    tick(&mut editor);
+    let marks = editor.function_problems();
+    assert_eq!(
+        marks.first().map(|mark| mark.line),
+        Some(7),
+        "the syntax error is reported on its own line: {marks:?}"
+    );
+    assert!(
+        editor.message().starts_with("line 8:"),
+        "{}",
+        editor.message()
+    );
+    assert!(
+        editor.preview().status().is_ok(),
+        "the last good node still runs"
+    );
+
+    // Undo takes the typing back, and the buffer saves cleanly again.
+    key(&mut editor, Key::Char('z'), command);
+    tick(&mut editor);
+    assert_eq!(
+        editor.function_text().lines().nth(7).map(str::trim),
+        Some("return color * 2.0;")
+    );
+    key(&mut editor, Key::Char('s'), command);
+    tick(&mut editor);
+    assert!(editor.function_problems().is_empty());
+
+    // Escape leaves the buffer, and the single-key shortcuts come back.
+    key(&mut editor, Key::Escape, Modifiers::NONE);
+    tick(&mut editor);
+    assert!(!editor.is_typing());
+}
+
+#[test]
+fn the_scene_mode_draws_a_scene_and_a_click_opens_its_material() {
+    // a scene through the preview's renderer, picked on the CPU,
+    // its material edited in the material canvas and written back.
+    use wxsl::editor::{Answer, CanvasMode, Query};
+
+    let Some(gpu) = gpu() else { return };
+    let Some((mut editor, target)) = editor(&gpu, MsdfBackend::Cpu) else {
+        return;
+    };
+    let scene = |editor: &Editor| match editor.query(&Query::Scene) {
+        Answer::Scene {
+            scene,
+            selected,
+            material,
+        } => (scene, selected, material),
+        other => panic!("{other:?}"),
+    };
+    frame(&gpu, &mut editor, &target, 0.0);
+    let loose = editor.graph().clone();
+    // The sheen scene names a lighting model the editor's renderer does
+    // not start with: the set widens rather than the load failing.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/sheen.scene.json");
+    editor
+        .apply(Command::OpenScene {
+            path: path.to_string(),
+        })
+        .expect("the scene opens");
+    editor.set_canvas_mode(CanvasMode::Scene);
+    let mut pixels = Vec::new();
+    for step in 0..3 {
+        pixels = frame(&gpu, &mut editor, &target, 0.1 * step as f64);
+    }
+    if let Ok(path) = std::env::var("WXSL_SCENE_SHOT") {
+        image::RgbaImage::from_raw(target.width(), target.height(), pixels.clone())
+            .unwrap()
+            .save(path)
+            .unwrap();
+    }
+    assert!(
+        !editor.message().contains("cannot"),
+        "the scene loads: {}",
+        editor.message()
+    );
+
+    // The viewport is the canvas rectangle; the cube, framed, is in its
+    // middle and is not the canvas colour.
+    let viewport = editor.canvas_rect();
+    let centre = viewport.center();
+    let at = |pixels: &[u8], point: Vec2| {
+        let index = (point.y as usize * target.width() as usize + point.x as usize) * 4;
+        [pixels[index], pixels[index + 1], pixels[index + 2]]
+    };
+    let cube = at(&pixels, centre);
+
+    // A click on it selects it and opens its material.
+    editor.handle_event(UiEvent::PointerMoved(centre));
+    frame(&gpu, &mut editor, &target, 0.5);
+    for pressed in [true, false] {
+        editor.handle_event(UiEvent::PointerButton {
+            button: MouseButton::Left,
+            pressed,
+        });
+        frame(&gpu, &mut editor, &target, 0.6);
+    }
+    let (_, selected, material) = scene(&editor);
+    assert_eq!((selected, material), (Some(0), Some(0)));
+    assert_eq!(editor.graph().name(), "fragment sheen tint and roughness");
+
+    // An edit in the material canvas lands in the scene's copy, and an
+    // undo takes it back out.
+    let output = editor
+        .graph()
+        .nodes()
+        .find(|(_, node)| node.def == "output.surface")
+        .map(|(id, _)| id)
+        .expect("the material has an output");
+    editor
+        .apply(Command::SetParam {
+            document: wxsl::editor::Document::Material,
+            node: output,
+            socket: "roughness".into(),
+            value: wxsl::core::node::Value::F32(0.9),
+        })
+        .unwrap();
+    frame(&gpu, &mut editor, &target, 0.7);
+    let edited = scene(&editor).0.unwrap().materials[0].graph.clone();
+    assert_eq!(&edited, editor.graph());
+    editor.apply(Command::Undo).unwrap();
+    assert_ne!(scene(&editor).0.unwrap().materials[0].graph, edited);
+
+    // A transform from the inspector's command moves the cube out of the
+    // middle, and closing the scene gives the canvas its graph back.
+    editor
+        .apply(Command::SetTransform {
+            instance: 0,
+            transform: glam::Mat4::from_translation(glam::Vec3::new(50.0, 0.0, 0.0))
+                .to_cols_array(),
+        })
+        .unwrap();
+    let pixels = frame(&gpu, &mut editor, &target, 0.8);
+    let distance = |a: [u8; 3], b: [u8; 3]| {
+        a.iter()
+            .zip(b)
+            .map(|(a, b)| (*a as i32 - b as i32).abs())
+            .sum::<i32>()
+    };
+    assert!(
+        distance(at(&pixels, centre), cube) > 30,
+        "the cube was in the middle and left it: {cube:?} then {:?}",
+        at(&pixels, centre)
+    );
+    editor.apply(Command::CloseScene).unwrap();
+    frame(&gpu, &mut editor, &target, 0.9);
+    assert_eq!(editor.graph(), &loose);
+    assert_eq!(scene(&editor), (None, None, None));
+}
+
+#[cfg(feature = "gltf")]
+#[test]
+fn a_gltf_file_imports_into_the_scene_mode_and_a_second_one_joins_it() {
+    // the import is a command, and a second import appends.
+    use wxsl::editor::{Answer, CanvasMode, Query};
+
+    let Some(gpu) = gpu() else { return };
+    let Some((mut editor, target)) = editor(&gpu, MsdfBackend::Cpu) else {
+        return;
+    };
+    let scene = |editor: &Editor| match editor.query(&Query::Scene) {
+        Answer::Scene { scene, .. } => scene.expect("a scene is open"),
+        other => panic!("{other:?}"),
+    };
+    let helmet = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../resources/glb/DamagedHelmet/DamagedHelmet.glb"
+    );
+    editor
+        .apply(Command::ImportGltf {
+            path: helmet.to_string(),
+        })
+        .expect("the helmet imports");
+    editor.set_canvas_mode(CanvasMode::Scene);
+    let mut pixels = Vec::new();
+    for step in 0..3 {
+        pixels = frame(&gpu, &mut editor, &target, 0.1 * step as f64);
+    }
+    if let Ok(path) = std::env::var("WXSL_GLTF_SHOT") {
+        image::RgbaImage::from_raw(target.width(), target.height(), pixels.clone())
+            .unwrap()
+            .save(path)
+            .unwrap();
+    }
+    let first = scene(&editor);
+    assert!(!first.instances.is_empty());
+    let viewport = editor.canvas_rect();
+    let centre = viewport.center();
+    let index = (centre.y as usize * target.width() as usize + centre.x as usize) * 4;
+    let corner =
+        (viewport.min.y as usize + 4) * target.width() as usize + viewport.min.x as usize + 4;
+    assert_ne!(
+        pixels[index..index + 3],
+        pixels[corner * 4..corner * 4 + 3],
+        "the helmet is drawn in the middle"
+    );
+
+    let colors = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/vertex_colors.gltf");
+    editor
+        .apply(Command::ImportGltf {
+            path: colors.to_string(),
+        })
+        .expect("the second file imports");
+    frame(&gpu, &mut editor, &target, 0.5);
+    let both = scene(&editor);
+    assert!(both.instances.len() > first.instances.len());
+    assert_eq!(both.meshes.len(), first.meshes.len() + 1);
+    assert!(both.validate().is_empty());
+
+    editor.apply(Command::Undo).unwrap();
+    frame(&gpu, &mut editor, &target, 0.6);
+    assert_eq!(scene(&editor), first);
+}
+
+/// Settle the preview after a pipeline or view change: a stock pipeline
+/// swaps in once its shaders are compiled.
+fn settle(gpu: &GpuContext, editor: &mut Editor, target: &OffscreenTarget, time: f64) {
+    for step in 0..30 {
+        frame(gpu, editor, target, time + 0.01 * step as f64);
+        if editor.preview().swap_progress().is_none() && step >= 3 {
+            break;
+        }
+    }
+}
+
+/// The preview's pixels, as RGB, and how many differ from the corner's.
+fn preview_rgb(gpu: &GpuContext, editor: &Editor) -> (Vec<[u8; 3]>, usize) {
+    let pixels: Vec<[u8; 3]> = editor
+        .preview()
+        .read_rgba8(&gpu.device, &gpu.queue)
+        .chunks_exact(4)
+        .map(|texel| [texel[0], texel[1], texel[2]])
+        .collect();
+    let corner = pixels[0];
+    let covered = pixels.iter().filter(|texel| **texel != corner).count();
+    (pixels, covered)
+}
+
+/// The scene debug views. A surface view shows in forward as
+/// it does in deferred, the forward-only ones are offered only there, and
+/// the frame views run over both pipelines' pass lists, live.
+#[test]
+fn the_debug_views_show_on_both_pipelines() {
+    use wxsl::editor::{Answer, Query};
+
+    let Some(gpu) = gpu() else { return };
+    let Some((mut editor, target)) = editor(&gpu, MsdfBackend::Cpu) else {
+        return;
+    };
+    let views = |editor: &Editor| match editor.query(&Query::View) {
+        Answer::View {
+            debug_view,
+            debug_views,
+            ..
+        } => (debug_view, debug_views),
+        other => panic!("{other:?}"),
+    };
+    let show = |editor: &mut Editor, view: &str| {
+        editor
+            .apply(Command::SetDebugView { view: view.into() })
+            .unwrap_or_else(|error| panic!("`{view}`: {error}"));
+    };
+    // A still cube, so a view's pixels compare with the shaded ones.
+    let space = |pressed| UiEvent::Key {
+        key: Key::Char(' '),
+        pressed,
+        repeat: false,
+    };
+    editor.handle_event(UiEvent::PointerMoved(Vec2::new(700.0, 400.0)));
+    editor.handle_event(space(true));
+    frame(&gpu, &mut editor, &target, 0.0);
+    editor.handle_event(space(false));
+    frame(&gpu, &mut editor, &target, 0.0);
+    assert!(!editor.preview().spinning);
+    for (index, pipeline) in ["forward", "deferred"].into_iter().enumerate() {
+        let time = index as f64 * 10.0;
+        editor
+            .apply(Command::SetPipeline {
+                pipeline: pipeline.into(),
+            })
+            .unwrap();
+        settle(&gpu, &mut editor, &target, time);
+        let (_, offered) = views(&editor);
+        for view in [
+            "albedo",
+            "normal",
+            "light count",
+            "cascades",
+            "shadow atlas",
+        ] {
+            assert!(offered.iter().any(|v| v == view), "{pipeline}: {offered:?}");
+        }
+        for view in ["uv", "instance id", "material id", "overdraw"] {
+            assert_eq!(
+                offered.iter().any(|v| v == view),
+                pipeline == "forward",
+                "{view} is a forward view: {offered:?}"
+            );
+        }
+        assert!(offered.iter().any(|v| v == "wireframe"), "{offered:?}");
+
+        // Shaded, then the surface normal: the colours change, and a
+        // normal view has no warm key light in it.
+        let (shaded, covered) = preview_rgb(&gpu, &editor);
+        assert!(covered > 5_000, "{pipeline}: the cube is drawn ({covered})");
+        show(&mut editor, "normal");
+        settle(&gpu, &mut editor, &target, time + 1.0);
+        assert_eq!(views(&editor).0, "normal");
+        let (normal, _) = preview_rgb(&gpu, &editor);
+        let changed = shaded.iter().zip(&normal).filter(|(a, b)| a != b).count();
+        assert!(
+            changed > 5_000,
+            "{pipeline}: the normal view differs ({changed})"
+        );
+
+        if pipeline == "forward" {
+            // The uv view: red and green ramps, never blue.
+            show(&mut editor, "uv");
+            settle(&gpu, &mut editor, &target, time + 2.0);
+            let (uv, _) = preview_rgb(&gpu, &editor);
+            let ramp = uv
+                .iter()
+                .filter(|texel| texel[0] > 40 && texel[1] > 40 && texel[2] < 8)
+                .count();
+            assert!(ramp > 2_000, "the uv view shows the ramps ({ramp})");
+
+            // One instance and one material: each id view is one flat,
+            // saturated colour over the cube.
+            for (step, view) in ["instance id", "material id"].into_iter().enumerate() {
+                show(&mut editor, view);
+                settle(&gpu, &mut editor, &target, time + 2.1 + step as f64 * 0.1);
+                let (ids, covered) = preview_rgb(&gpu, &editor);
+                let first = *ids.iter().find(|texel| **texel != ids[0]).unwrap();
+                let same = ids.iter().filter(|texel| **texel == first).count();
+                assert!(
+                    same * 10 > covered * 9 && covered > 5_000,
+                    "{view}: one colour ({same} of {covered})"
+                );
+                let (max, min) = (first.iter().max().unwrap(), first.iter().min().unwrap());
+                assert!(max - min > 100, "{view}: saturated ({first:?})");
+            }
+
+            // Overdraw: a constant per fragment, added up with no depth
+            // test or culling, so the cube's back faces count too: warm,
+            // and brighter than one layer alone.
+            show(&mut editor, "overdraw");
+            settle(&gpu, &mut editor, &target, time + 2.3);
+            assert_eq!(views(&editor).0, "overdraw");
+            let (counted, covered) = preview_rgb(&gpu, &editor);
+            let warm = counted
+                .iter()
+                .filter(|texel| texel[0] > texel[1] && texel[1] > texel[2])
+                .count();
+            assert!(
+                warm * 10 > covered * 9 && covered > 5_000,
+                "warm ({warm} of {covered})"
+            );
+            let one_layer = (0.1f32.powf(1.0 / 2.2) * 255.0) as u8;
+            let brightest = counted.iter().map(|texel| texel[0]).max().unwrap();
+            assert!(
+                brightest > one_layer + 20,
+                "two layers or more ({brightest})"
+            );
+        }
+
+        // Wireframe: the same shading, drawn as lines, so far less of the
+        // preview is covered.
+        show(&mut editor, "wireframe");
+        settle(&gpu, &mut editor, &target, time + 2.5);
+        assert_eq!(views(&editor).0, "wireframe");
+        let (_, lines) = preview_rgb(&gpu, &editor);
+        assert!(
+            lines > 50 && lines * 4 < covered,
+            "{pipeline}: lines only ({lines} of {covered})"
+        );
+
+        // The light count: the preview's lights are unranged, so none is
+        // local and every covered pixel is the "none" blue, shaded.
+        show(&mut editor, "light count");
+        settle(&gpu, &mut editor, &target, time + 3.0);
+        assert_eq!(views(&editor).0, "light count");
+        let (counted, _) = preview_rgb(&gpu, &editor);
+        assert_eq!(counted[0], [0, 0, 0], "the background is black");
+        let blue = counted
+            .iter()
+            .filter(|texel| texel[2] > 40 && texel[0] < 40 && texel[1] < 40)
+            .count();
+        assert!(
+            blue > 5_000,
+            "{pipeline}: the cube reads no local light ({blue})"
+        );
+
+        // The preview's lights cast no shadow: the cascades view is the
+        // grey of "no tile covers it", and the atlas holds nothing.
+        show(&mut editor, "cascades");
+        settle(&gpu, &mut editor, &target, time + 4.0);
+        let (cascades, covered) = preview_rgb(&gpu, &editor);
+        let coloured = cascades
+            .iter()
+            .filter(|texel| {
+                let (max, min) = (texel.iter().max().unwrap(), texel.iter().min().unwrap());
+                max - min > 30
+            })
+            .count();
+        assert!(
+            covered > 5_000 && coloured == 0,
+            "{pipeline}: grey ({coloured})"
+        );
+        show(&mut editor, "shadow atlas");
+        settle(&gpu, &mut editor, &target, time + 5.0);
+        assert_eq!(views(&editor).0, "shadow atlas");
+
+        // At the reference's time, since the preview's lights move with
+        // it, and on average: the views leave nothing behind, but a pixel
+        // may round differently.
+        show(&mut editor, "shaded");
+        settle(&gpu, &mut editor, &target, time);
+        let (back, _) = preview_rgb(&gpu, &editor);
+        let mean = |pixels: &[[u8; 3]]| {
+            let covered: Vec<_> = pixels.iter().filter(|texel| **texel != pixels[0]).collect();
+            core::array::from_fn::<f32, 3, _>(|channel| {
+                covered
+                    .iter()
+                    .map(|texel| f32::from(texel[channel]))
+                    .sum::<f32>()
+                    / covered.len().max(1) as f32
+            })
+        };
+        let (was, now) = (mean(&shaded), mean(&back));
+        assert!(
+            (0..3).all(|channel| (was[channel] - now[channel]).abs() < 12.0),
+            "{pipeline}: shading comes back ({now:?} against {was:?})"
+        );
+    }
+
+    // A frame view outlives a pipeline change, through the swap.
+    show(&mut editor, "wireframe");
+    settle(&gpu, &mut editor, &target, 30.0);
+    editor
+        .apply(Command::SetPipeline {
+            pipeline: "forward".into(),
+        })
+        .unwrap();
+    settle(&gpu, &mut editor, &target, 31.0);
+    assert_eq!(views(&editor).0, "wireframe");
+    let (_, lines) = preview_rgb(&gpu, &editor);
+    assert!(lines > 50 && lines < 5_000, "still lines ({lines})");
+}
+
+/// The pixel probe: one point read in every texture the frame's
+/// passes wrote, generically; the G-buffer's albedo is the material's, and
+/// a corner reads cleared depth.
+#[test]
+fn a_probe_reads_every_texture_the_frame_wrote() {
+    use wxsl::editor::{Answer, ProbeSummary, Query};
+
+    let Some(gpu) = gpu() else { return };
+    let Some((mut editor, target)) = editor(&gpu, MsdfBackend::Cpu) else {
+        return;
+    };
+    editor
+        .apply(Command::SetPipeline {
+            pipeline: "deferred".into(),
+        })
+        .unwrap();
+    settle(&gpu, &mut editor, &target, 0.0);
+    let probe = |editor: &mut Editor, x: f32, y: f32, time: f64| -> ProbeSummary {
+        editor.apply(Command::ProbePixel { x, y }).unwrap();
+        frame(&gpu, editor, &target, time);
+        match editor.query(&Query::Probe) {
+            Answer::Probe { probe } => probe.expect("the frame was probed"),
+            other => panic!("{other:?}"),
+        }
+    };
+    let value = |probe: &ProbeSummary, label: &str| {
+        probe
+            .resources
+            .iter()
+            .find(|resource| resource.resource.contains(label))
+            .unwrap_or_else(|| {
+                let labels: Vec<_> = probe.resources.iter().map(|r| &r.resource).collect();
+                panic!("no `{label}` among {labels:?}")
+            })
+            .value
+            .clone()
+            .expect("decoded")
+    };
+
+    let centre = probe(&mut editor, 0.5, 0.5, 1.0);
+    assert_eq!(centre.pixel, [256, 256]);
+    let depth = value(&centre, "depth")[0];
+    assert!(depth > 0.0 && depth < 1.0, "the cube's depth: {depth}");
+    // The demo's base colour is an fbm mix of two colours, in 0..1, and
+    // the G-buffer stores it with metallic in alpha.
+    let albedo = value(&centre, "base_color");
+    assert_eq!(albedo.len(), 4);
+    assert!(
+        albedo[..3].iter().all(|c| (0.0..=1.0).contains(c)),
+        "{albedo:?}"
+    );
+    assert!(albedo[..3].iter().any(|c| *c > 0.01), "{albedo:?}");
+    assert!(
+        centre.shown[..3].iter().any(|c| *c > 10),
+        "{:?}",
+        centre.shown
+    );
+    assert_eq!(centre.instance, None, "no scene, no instance");
+
+    let corner = probe(&mut editor, 0.0, 0.0, 2.0);
+    assert_eq!(corner.pixel, [0, 0]);
+    assert_eq!(value(&corner, "depth")[0], 1.0, "nothing was drawn there");
+
+    // Outside the viewport is refused by name.
+    assert!(editor
+        .apply(Command::ProbePixel { x: 1.5, y: 0.5 })
+        .is_err());
+
+    // And the frame's counters: the cube's twelve triangles in the
+    // G-buffer pass, timings or not.
+    let Answer::Frame { frame: summary } = editor.query(&Query::Frame) else {
+        panic!("a frame answer")
+    };
+    assert!(summary.draws >= 1 && summary.triangles >= 12, "{summary:?}");
+    assert!(summary.pipelines > 0 && summary.variants > 0, "{summary:?}");
+    assert!(summary.passes.iter().any(|pass| pass.triangles >= 12));
+    assert_eq!(summary.dropped_lights, 0);
+}
+
+/// The scene's side of the debug views and the probe: under a
+/// shadowed sun the cascades view colours what its shadow box covers, the
+/// atlas shows the caster, and a probe names the instance it lands on.
+#[test]
+fn a_scene_shows_its_cascades_and_a_probe_names_the_instance() {
+    use wxsl::editor::{Answer, CanvasMode, Query};
+
+    let Some(gpu) = gpu() else { return };
+    let Some((mut editor, target)) = editor(&gpu, MsdfBackend::Cpu) else {
+        return;
+    };
+    // The sheen cube, lit by a shadowed sun from above and the side.
+    let mut scene: serde_json::Value =
+        serde_json::from_str(include_str!("../assets/sheen.scene.json")).unwrap();
+    let tilt = glam::Mat4::from_rotation_x(-0.9) * glam::Mat4::from_rotation_y(0.4);
+    scene["nodes"] = serde_json::json!([{"name": "sun", "transform": tilt.to_cols_array()}]);
+    scene["environment"] = serde_json::json!({"lights": [{
+        "name": "sun", "node": 0, "kind": "directional", "intensity": 3.0, "casts_shadow": true
+    }]});
+    let path = std::env::temp_dir().join(format!("wxsl_e2_{}.scene.json", std::process::id()));
+    std::fs::write(&path, scene.to_string()).unwrap();
+    frame(&gpu, &mut editor, &target, 0.0);
+    editor
+        .apply(Command::OpenScene {
+            path: path.display().to_string(),
+        })
+        .expect("the scene opens");
+    editor.set_canvas_mode(CanvasMode::Scene);
+    for step in 0..3 {
+        frame(&gpu, &mut editor, &target, 0.1 * step as f64);
+    }
+    let _ = std::fs::remove_file(&path);
+    assert!(!editor.message().contains("cannot"), "{}", editor.message());
+
+    editor
+        .apply(Command::SetDebugView {
+            view: "cascades".into(),
+        })
+        .unwrap();
+    settle(&gpu, &mut editor, &target, 1.0);
+    let (cascades, _) = preview_rgb(&gpu, &editor);
+    let red = cascades
+        .iter()
+        .filter(|texel| texel[0] > 60 && texel[1] < texel[0] / 2 && texel[2] < texel[0] / 2)
+        .count();
+    assert!(red > 2_000, "the first cascade covers the cube ({red})");
+
+    editor
+        .apply(Command::SetDebugView {
+            view: "shadow atlas".into(),
+        })
+        .unwrap();
+    settle(&gpu, &mut editor, &target, 2.0);
+    let (_, drawn) = preview_rgb(&gpu, &editor);
+    assert!(drawn > 500, "the atlas holds the cube's depth ({drawn})");
+
+    // The probe in the middle of the viewport lands on the cube: its
+    // depth, the instance and its material.
+    editor
+        .apply(Command::SetDebugView {
+            view: "shaded".into(),
+        })
+        .unwrap();
+    settle(&gpu, &mut editor, &target, 3.0);
+    editor
+        .apply(Command::ProbePixel { x: 0.5, y: 0.5 })
+        .unwrap();
+    frame(&gpu, &mut editor, &target, 4.0);
+    let Answer::Probe { probe: Some(probe) } = editor.query(&Query::Probe) else {
+        panic!("probed")
+    };
+    assert_eq!((probe.instance, probe.material), (Some(0), Some(0)));
+    let atlas = probe
+        .resources
+        .iter()
+        .find(|resource| resource.resource.contains("shadow"))
+        .expect("the atlas is among the probed textures");
+    assert!(atlas.value.is_some(), "{atlas:?}");
+
+    let Answer::Frame { frame: summary } = editor.query(&Query::Frame) else {
+        panic!("a frame answer")
+    };
+    assert!(summary.warnings.is_empty(), "{:?}", summary.warnings);
+    assert!(
+        summary.triangles >= 24,
+        "the shadow pass draws too: {summary:?}"
+    );
+}

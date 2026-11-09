@@ -1,0 +1,428 @@
+//! [`RenderError`]: everything that can go wrong between a graph and a frame.
+
+use core::fmt;
+
+use wxsl_core::error::CodegenError;
+
+/// An error from compiling a material or running a pipeline.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum RenderError {
+    /// The graph could not be turned into WXSL.
+    Codegen(CodegenError),
+    /// The WXSL compiler rejected the module.
+    ///
+    /// The diagnostic is kept as pre-rendered text rather than as a
+    /// `wxsl_lang::Diagnostics`: it is already pretty-printed with source
+    /// spans and a caret, and
+    /// keeping the compiler's error type out of this crate's public API means
+    /// a change to the compiler's own error type does not become a
+    /// breaking change here.
+    ShaderCompile {
+        /// Root module that was being compiled.
+        module: String,
+        /// The compiler's diagnostic.
+        diagnostic: String,
+    },
+    /// A module the shader imports is not in the [`crate::library::ShaderLibrary`].
+    ///
+    /// Almost always a missing `library.add_stdlib(…)`-shaped call: the
+    /// generated module imports the shader ABI, which `wxsl-stdlib`
+    /// provides and this crate deliberately does not depend on.
+    MissingModule {
+        /// The module that could not be resolved.
+        module: String,
+    },
+    /// A module path is not valid WXSL syntax.
+    InvalidModulePath {
+        /// The offending path.
+        module: String,
+    },
+    /// A lighting model could not be resolved, or the set is not usable.
+    ///
+    /// Kept as pre-rendered text, like the compiler's diagnostic: the
+    /// registry's error lives in `wxsl-core` and the material's name is
+    /// what the reader needs here.
+    Lighting {
+        /// The material whose model could not be resolved.
+        material: String,
+        /// The rendered error.
+        error: String,
+    },
+    /// A pipeline was asked to record a frame before `configure` gave it a
+    /// target size and format.
+    NotConfigured,
+    /// A screen pass names an effect this renderer does not know. The
+    /// pass list came from a graph built by hand rather than compiled by
+    /// [`crate::pipeline_doc`] — the compiler rejects the same name
+    /// against its registry's list, which is the message a document
+    /// author sees.
+    UnknownEffect {
+        /// The effect id the pass named.
+        effect: String,
+    },
+    /// A pass runs an effect this renderer's device profile cannot run: a
+    /// native-only effect, or a compute pass on a device without compute
+    /// that was not lowered to its fragment arm — a hand-built pass list,
+    /// or a document compiled for another profile.
+    NativeOnly {
+        /// The pass's label.
+        pass: String,
+        /// The effect it runs.
+        effect: String,
+        /// The renderer's profile.
+        profile: crate::Profile,
+    },
+    /// A pass list could not be ordered, validated or allocated.
+    Graph(crate::graph::ScheduleError),
+    /// A background pipeline swap will never finish: the thread compiling
+    /// it is gone. Only reachable if that thread panicked, and reported
+    /// rather than left as an indicator counting to a total it can no
+    /// longer reach.
+    SwapAbandoned,
+    /// A parameter could not be written: no such name, or the wrong type
+    /// for the one there is.
+    MaterialParameter {
+        /// The parameter that was addressed.
+        name: String,
+        /// What `wxsl-core`'s layout objected to.
+        reason: String,
+    },
+    /// An *effect* parameter could not be written on the pass labelled
+    /// `pass`: the pass runs no effect with parameters, or the name is
+    /// not one its descriptor declares, or the value is the wrong type.
+    /// The pass-level twin of [`RenderError::MaterialParameter`].
+    EffectParameter {
+        /// The pass that was addressed, by its label.
+        pass: String,
+        /// The parameter that was addressed.
+        name: String,
+        /// What the layout objected to, or that there was no layout.
+        reason: String,
+    },
+    /// A texture or sampler was bound under a name the material's graph
+    /// does not declare. Almost always a typo against the `name` setting
+    /// on a `texture.*` node.
+    UndeclaredMaterialResource {
+        /// The name that was used.
+        name: String,
+    },
+    /// A texture was bound where the graph declares a sampler, or the
+    /// other way round.
+    MaterialResourceKind {
+        /// The resource's name.
+        name: String,
+        /// What the graph declares it as.
+        declared: String,
+    },
+    /// A declared texture or sampler was never bound, so there is no bind
+    /// group to build. Named, because "the surface is black" is a much
+    /// worse way to find this out.
+    UnboundMaterialResource {
+        /// The resource's name.
+        name: String,
+        /// What kind of resource it is.
+        kind: String,
+    },
+    /// A draw's material declares a group the draw did not carry: either
+    /// [`crate::draw::DrawItem::bindings`] for its own parameters and
+    /// textures, or [`crate::draw::DrawItem::user`] for the block it
+    /// expects the application to supply.
+    MissingDrawBindings {
+        /// The material's name.
+        material: String,
+        /// Which group is missing, by its `abi::BIND_GROUPS` name.
+        group: &'static str,
+    },
+    /// A per-vertex stream is not as long as the mesh it was given to.
+    VertexStreamLength {
+        /// The mesh's label.
+        mesh: String,
+        /// The stream's name.
+        attribute: String,
+        /// How many values were supplied.
+        supplied: usize,
+        /// How many vertices the mesh has.
+        vertices: usize,
+    },
+    /// A material declares a per-vertex attribute the mesh it is drawn on
+    /// does not carry.
+    ///
+    /// Reported when the frame is compiled, before any pass is opened, so
+    /// it names the material, the attribute and the mesh rather than
+    /// arriving as a `wgpu` complaint about vertex buffer 4 — or, worse,
+    /// as a frame that merely looks wrong.
+    MissingVertexAttribute {
+        /// The material that declares it.
+        material: String,
+        /// The attribute's name.
+        attribute: String,
+        /// The mesh's label.
+        mesh: String,
+        /// What the mesh does carry.
+        available: Vec<String>,
+    },
+    /// A mesh carries the declared attribute under a different type.
+    VertexAttributeType {
+        /// The material that declares it.
+        material: String,
+        /// The attribute's name.
+        attribute: String,
+        /// The mesh's label.
+        mesh: String,
+        /// The type the mesh supplies.
+        supplied: wxsl_core::node::ValueType,
+        /// The type the graph declares.
+        declared: wxsl_core::node::ValueType,
+    },
+    /// A material declares a per-instance attribute the draw does not
+    /// supply. See `DrawItem::with_attributes`.
+    MissingInstanceAttribute {
+        /// The material that declares it.
+        material: String,
+        /// The attribute's name.
+        attribute: String,
+        /// Which draw, by its index in the list.
+        draw: usize,
+    },
+    /// A draw supplies a per-instance attribute at the wrong type.
+    InstanceAttributeType {
+        /// The material that declares it.
+        material: String,
+        /// The attribute's name.
+        attribute: String,
+        /// What `wxsl-core`'s layout objected to.
+        reason: String,
+    },
+    /// A pass wants a resource the graph does not own and nobody supplied a
+    /// view for. Every imported resource — the frame's target above all —
+    /// has to be handed to [`crate::graph::RenderGraph::record`].
+    MissingImport {
+        /// The resource's label.
+        resource: String,
+    },
+    /// A view was supplied for a resource the current pass list declares
+    /// nothing about — the other half of [`RenderError::MissingImport`]:
+    /// the graph wanted a view nobody gave it, this is a view nobody's
+    /// graph wants. Whatever created the texture was unloaded (or never
+    /// loaded) while the pass list stayed.
+    UnknownResource {
+        /// The label the view was supplied under.
+        name: String,
+    },
+    /// A geometry file could not be read.
+    ///
+    /// Only reachable with the `gltf` feature; the variant exists either
+    /// way so that matching on this enum does not change with the feature
+    /// set.
+    Import {
+        /// The file that was being read.
+        path: String,
+        /// What the importer objected to.
+        reason: String,
+    },
+    /// The UI atlas has no room left for an entry of that size.
+    ///
+    /// Not silently dropped: a missing glyph is a hole in the interface, and
+    /// the caller is the only one who can decide between repacking, growing
+    /// the atlas and living with it. See [`crate::ui::Atlas::clear`].
+    AtlasFull {
+        /// Width of the entry that did not fit.
+        width: u32,
+        /// Height of the entry that did not fit.
+        height: u32,
+    },
+    /// The frame's `Environment::shadow_atlas_size` is not the installed
+    /// pipeline's: its cascades would snap to the wrong texel grid.
+    ShadowAtlasSize {
+        /// The installed pass list's atlas edge.
+        pipeline: u32,
+        /// The environment's.
+        environment: u32,
+    },
+    /// A font's bytes could not be parsed.
+    InvalidFont {
+        /// What the parser objected to.
+        reason: String,
+    },
+    /// No `wgpu` adapter matched the requested options.
+    NoAdapter,
+    /// `wgpu` refused to create a device.
+    NoDevice(wgpu::RequestDeviceError),
+}
+
+impl fmt::Display for RenderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RenderError::Codegen(error) => write!(f, "cannot generate WXSL: {error}"),
+            RenderError::ShaderCompile { module, diagnostic } => {
+                write!(f, "cannot compile `{module}`:\n{diagnostic}")
+            }
+            RenderError::MissingModule { module } => write!(
+                f,
+                "the shader library has no module `{module}`; the ABI modules come from \
+                 wxsl-stdlib, which this crate does not depend on — add them to the \
+                 library (see `ShaderLibrary::insert`)"
+            ),
+            RenderError::InvalidModulePath { module } => {
+                write!(f, "`{module}` is not a valid WXSL module path")
+            }
+            RenderError::Lighting { material, error } if material.is_empty() => {
+                write!(f, "the lighting set is not usable: {error}")
+            }
+            RenderError::Lighting { material, error } => write!(
+                f,
+                "material `{material}`: {error} - a material's model must be one the                  enabled set names (see `Renderer::set_lighting` and `Material::with_lighting`)"
+            ),
+            RenderError::NotConfigured => {
+                f.write_str("pipeline has no target yet: call `configure` first")
+            }
+            RenderError::UnknownEffect { effect } => write!(
+                f,
+                "a screen pass runs `{effect}`, which is not an effect this renderer \
+                 knows — register it with `Renderer::add_effect`"
+            ),
+            RenderError::NativeOnly {
+                pass,
+                effect,
+                profile,
+            } => write!(
+                f,
+                "pass `{pass}` runs `{effect}`, which a device with the `{profile}` \
+                 profile cannot run; compile the document with the renderer's \
+                 `pipeline_config()` so it lowers or refuses it"
+            ),
+            RenderError::Graph(error) => write!(f, "cannot run the pass list: {error}"),
+            RenderError::SwapAbandoned => {
+                f.write_str("the pipeline swap was abandoned: its compiler thread is gone")
+            }
+            RenderError::MaterialParameter { name, reason } => {
+                write!(f, "cannot set parameter `{name}`: {reason}")
+            }
+            RenderError::EffectParameter { pass, name, reason } => {
+                write!(f, "cannot set parameter `{name}` on pass `{pass}`: {reason}")
+            }
+            RenderError::VertexStreamLength {
+                mesh,
+                attribute,
+                supplied,
+                vertices,
+            } => write!(
+                f,
+                "stream `{attribute}` has {supplied} values and mesh `{mesh}` has {vertices} vertices"
+            ),
+            RenderError::MissingVertexAttribute {
+                material,
+                attribute,
+                mesh,
+                available,
+            } => write!(
+                f,
+                "material `{material}` requires the per-vertex attribute `{attribute}`, \
+                 which mesh `{mesh}` does not carry (it carries: {})",
+                if available.is_empty() {
+                    "nothing beyond the base vertex".to_string()
+                } else {
+                    available.join(", ")
+                }
+            ),
+            RenderError::VertexAttributeType {
+                material,
+                attribute,
+                mesh,
+                supplied,
+                declared,
+            } => write!(
+                f,
+                "material `{material}` declares `{attribute}` as {declared}, and mesh \
+                 `{mesh}` supplies it as {supplied}"
+            ),
+            RenderError::MissingInstanceAttribute {
+                material,
+                attribute,
+                draw,
+            } => write!(
+                f,
+                "material `{material}` requires the per-instance attribute `{attribute}`, \
+                 which draw {draw} does not supply"
+            ),
+            RenderError::InstanceAttributeType {
+                material,
+                attribute,
+                reason,
+            } => write!(
+                f,
+                "material `{material}`'s per-instance attribute `{attribute}`: {reason}"
+            ),
+            RenderError::UndeclaredMaterialResource { name } => write!(
+                f,
+                "this material declares no texture or sampler called `{name}`"
+            ),
+            RenderError::MaterialResourceKind { name, declared } => write!(
+                f,
+                "`{name}` is declared as {declared}, and was bound as something else"
+            ),
+            RenderError::UnboundMaterialResource { name, kind } => write!(
+                f,
+                "the {kind} `{name}` was never bound, so this material cannot draw"
+            ),
+            RenderError::MissingDrawBindings { material, group } => write!(
+                f,
+                "`{material}` declares a `{group}` bind group, but the draw carried none"
+            ),
+            RenderError::MissingImport { resource } => write!(
+                f,
+                "no view was supplied for the imported resource `{resource}`"
+            ),
+            RenderError::UnknownResource { name } => write!(
+                f,
+                "a view was supplied for resource `{name}`, which the current \
+                 pass list does not declare"
+            ),
+            RenderError::Import { path, reason } => {
+                write!(f, "cannot import `{path}`: {reason}")
+            }
+            RenderError::AtlasFull { width, height } => write!(
+                f,
+                "the UI atlas has no room for a {width}x{height} entry; clear it, or                  build it larger (see `Atlas::new`)"
+            ),
+            RenderError::ShadowAtlasSize {
+                pipeline,
+                environment,
+            } => write!(
+                f,
+                "the pipeline's shadow atlas is {pipeline}² texels but the environment \
+                 says {environment}²: set `Environment::shadow_atlas_size` to the \
+                 `PipelineConfig`'s"
+            ),
+            RenderError::InvalidFont { reason } => {
+                write!(f, "cannot read the font: {reason}")
+            }
+            RenderError::NoAdapter => f.write_str("no suitable wgpu adapter"),
+            RenderError::NoDevice(error) => write!(f, "wgpu refused a device: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for RenderError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            RenderError::Codegen(error) => Some(error),
+            RenderError::Graph(error) => Some(error),
+            RenderError::NoDevice(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<CodegenError> for RenderError {
+    fn from(value: CodegenError) -> Self {
+        RenderError::Codegen(value)
+    }
+}
+
+impl From<crate::graph::ScheduleError> for RenderError {
+    fn from(value: crate::graph::ScheduleError) -> Self {
+        RenderError::Graph(value)
+    }
+}

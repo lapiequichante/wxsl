@@ -1,0 +1,76 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/wxsl-core",
+    "crates/wxsl-lang",
+    "crates/wxsl-frame",
+    "crates/wxsl-ffi",
+    "crates/wxsl-render",
+    "crates/wxsl-editor",
+    "crates/wxsl-stdlib",
+    "crates/wxsl-gltf",
+    "crates/wxsl-mcp",
+    "crates/wxsl-prt",
+    "crates/wxsl",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.82"
+authors = ["Florian Villard"]
+repository = "https://github.com/lapiequichante/wxsl"
+homepage = "https://github.com/lapiequichante/wxsl"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+wxsl-core = { path = "crates/wxsl-core", version = "0.1.0" }
+wxsl-lang = { path = "crates/wxsl-lang", version = "0.1.0" }
+wxsl-frame = { path = "crates/wxsl-frame", version = "0.1.0" }
+wxsl-render = { path = "crates/wxsl-render", version = "0.1.0" }
+wxsl-editor = { path = "crates/wxsl-editor", version = "0.1.0" }
+wxsl-stdlib = { path = "crates/wxsl-stdlib", version = "0.1.0" }
+wxsl-gltf = { path = "crates/wxsl-gltf", version = "0.1.0" }
+wxsl-mcp = { path = "crates/wxsl-mcp", version = "0.1.0" }
+wxsl-prt = { path = "crates/wxsl-prt", version = "0.1.0" }
+
+# Parser generator for the WXSL shading language. Build
+# dependency of wxsl-lang only; `lalrpop-util` is the runtime half.
+lalrpop = { version = "0.22", default-features = false }
+lalrpop-util = { version = "0.22", default-features = false }
+# GPU API for wxsl-render.
+wgpu = "30.0.1"
+# The shader translator wgpu itself runs, for the corpus gate's GLSL ES
+# column. Test-only: the same version wgpu pins, never a
+# library dependency.
+naga = { version = "30.0.1", features = ["wgsl-in", "glsl-out"] }
+bytemuck = { version = "1.25", features = ["derive"] }
+bitflags = "2"
+glam = { version = "0.33", features = ["bytemuck"] }
+serde = { version = "1.0", features = ["derive"] }
+# Glyph outlines for the renderer's MSDF text stack. Pure Rust,
+# no transitive dependencies; the MSDF generation itself is ours.
+ttf-parser = "0.25"
+# glTF import, used only by wxsl-gltf. The extension features are
+# the ones the importer maps; `extensions` exposes the rest as raw JSON.
+gltf = { version = "1.4", default-features = false, features = [
+    "import",
+    "utils",
+    "names",
+    "extensions",
+    "KHR_lights_punctual",
+    "KHR_materials_emissive_strength",
+    "KHR_materials_ior",
+    "KHR_materials_transmission",
+    "KHR_materials_volume",
+    "KHR_texture_transform",
+] }
+
+serde_json = "1.0"
+
+# Demo/example-only (dev-dependencies; never in a library's dependency list).
+winit = "0.30"
+pollster = "1.0"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[profile.dev.package."*"]
+opt-level = 1

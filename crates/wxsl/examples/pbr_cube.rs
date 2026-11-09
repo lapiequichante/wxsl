@@ -1,0 +1,1327 @@
+//! A PBR cube whose material is a node graph, rendered through either the
+//! forward or the deferred path.
+//!
+//! The material is not written in this file: it is loaded from
+//! `assets/pbr_cube.wxsl.json`, the node format, and compiled to WXSL at
+//! startup. Nothing in the graph mentions forward or deferred — the same
+//! graph drives both, because the render path is a property of the pipeline
+//! and the difference is conditional translation inside one WXSL module.
+//!
+//! ```text
+//! cargo run --example pbr_cube                       # windowed, forward
+//! cargo run --example pbr_cube -- --path deferred    # windowed, deferred
+//! cargo run --example pbr_cube -- --headless         # render both to PNG
+//! cargo run --example pbr_cube -- --dump-wxsl        # what the graph became
+//! cargo run --example pbr_cube -- --dump-wgsl --path deferred
+//! cargo run --example pbr_cube -- --list-macros
+//! cargo run --example pbr_cube -- --macro WXSL_FBM_OCTAVES=2
+//! ```
+//!
+//! In the window: `F`/`D` switch path, `N` toggles the debug-normal view,
+//! `T` the tonemap, `R` ridged noise, `Up`/`Down` change the noise octave
+//! count, `Space` pauses the rotation, `Esc` quits. Every one of those but
+//! `Space` changes which shader is compiled, and the status line shows the
+//! variant cache absorbing it.
+//!
+//! `[` and `]` are the other half of that story: they change the graph's
+//! `tint` **parameter**, which is a field of the material's uniform buffer
+//! rather than a constant in the shader, so the compile count does not
+//! move at all. The graph also samples a texture — this file
+//! generates one, because the material *declares* what it needs and the
+//! application supplies it.
+
+use std::borrow::Cow;
+use std::error::Error;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Instant;
+
+use glam::{Mat4, Vec3};
+use winit::application::ApplicationHandler;
+use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::window::{Window, WindowId};
+use wxsl::core::abi::{self, MaterialStage};
+use wxsl::core::codegen;
+use wxsl::core::graph::Graph;
+use wxsl::core::macros::{MacroSet, MacroValue};
+use wxsl::core::node::{NodeRegistry, Value};
+use wxsl::render::gpu::{GpuContext, OffscreenTarget};
+use wxsl::render::material::Material;
+use wxsl::render::material::MaterialConfig;
+use wxsl::render::variants;
+use wxsl::render::{
+    compile_pipeline, Camera, DrawItem, DrawList, Environment, InstanceAttributes, Light, Mesh,
+    PipelineConfig, RenderRequest, Renderer, StockPipeline, TargetConfig,
+};
+
+/// The graph used when `--graph` is not given.
+const DEFAULT_GRAPH: &str = include_str!("../assets/pbr_cube.wxsl.json");
+
+const USAGE: &str = "\
+pbr_cube — a PBR cube whose material is a wxsl node graph
+
+USAGE:
+    cargo run --example pbr_cube -- [OPTIONS]
+
+OPTIONS:
+    --pipeline <forward|deferred>
+                               Pipeline to start in (default: forward)
+    --graph <FILE>             Node-format graph to load (default: the shipped one)
+    --macro <NAME=VALUE>       Override a macro variable; repeatable.
+                               VALUE is true/false, an integer, or a decimal.
+    --headless                 Render one frame per pipeline to PNG and exit
+    --out <DIR>                Where --headless writes (default: current directory)
+    --size <WIDTHxHEIGHT>      Render size (default: 1280x720, or 800x600 headless)
+    --instances <N>            Draw N copies of the cube in a row (default: 1)
+    --models <A,B,...>         Lighting models the deferred path enables, from:
+                               lambert, phong, pbr, clearcoat, cloth, preshaded,
+                               iridescent, sheen, subsurface
+                               (default: pbr)
+    --model <NAME>             Which model shades this material (default: pbr)
+    --forward-shaded           Shade the material in the geometry pass under
+                               either pipeline; adds `preshaded` to
+                               the set and gives up received shadows
+    --dump-wxsl                Print the WXSL generated from the graph and exit
+    --dump-wgsl                Print the WGSL the active pipeline's shading
+                               stage compiles to and exit
+    --stage <NAME>             Which stage --dump-wxsl and --dump-wgsl print
+                               (forward_lit, gbuffer, depth_only)
+    --list-nodes               List the node library and exit
+    --list-macros              List the macro variables in effect and exit
+    -h, --help                 Print this help
+
+KEYS (windowed):
+    F / D          forward / deferred pipeline
+    N              toggle the debug-normal view
+    T              toggle the tonemap
+    R              toggle ridged noise
+    Up / Down      noise octaves +/- 1
+    [ / ]          dim / brighten the `tint` parameter (no recompile)
+    Space          pause rotation
+    Esc or Q       quit
+";
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let options = match Options::parse(std::env::args().skip(1)) {
+        Ok(options) => options,
+        Err(message) => {
+            eprintln!("error: {message}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
+    if options.help {
+        print!("{USAGE}");
+        return Ok(());
+    }
+
+    let registry = wxsl::stdlib::registry();
+    let graph = load_graph(options.graph.as_deref())?;
+    graph.validate(&registry)?;
+
+    if options.list_nodes {
+        list_nodes(&registry);
+        return Ok(());
+    }
+
+    let lighting = options.lighting_set()?;
+    let material =
+        Material::with_lighting(&graph, &registry, &options.material_config(), &lighting)?;
+
+    if options.list_macros {
+        list_macros(&graph, &registry, &material);
+        return Ok(());
+    }
+    if options.dump_wxsl {
+        print!("{}", material.wxsl(dump_stage(&options)));
+        return Ok(());
+    }
+    if options.dump_wgsl {
+        print!("{}", dump_wgsl(&material, dump_stage(&options))?);
+        return Ok(());
+    }
+
+    if options.headless {
+        return run_headless(&options, &graph, &material, &lighting);
+    }
+    run_windowed(options, graph, registry, material, lighting)
+}
+
+// ---------------------------------------------------------------------------
+// Command line
+// ---------------------------------------------------------------------------
+
+struct Options {
+    pipeline: StockPipeline,
+    /// Whether the pass list ends in the `tonemap` effect, which `T`
+    /// toggles by rebuilding it.
+    tonemap: bool,
+    stage: Option<MaterialStage>,
+    graph: Option<PathBuf>,
+    macros: MacroSet,
+    headless: bool,
+    out_dir: PathBuf,
+    size: Option<(u32, u32)>,
+    instances: u32,
+    dump_wxsl: bool,
+    dump_wgsl: bool,
+    list_nodes: bool,
+    list_macros: bool,
+    help: bool,
+    /// The lighting models the deferred path enables, by name.
+    models: Option<Vec<String>>,
+    /// Which model shades this material, by name.
+    model: Option<String>,
+    /// Shade the material in the geometry pass under either pipeline,
+    /// and enable the preshaded route the deferred lighting
+    /// pass routes it by.
+    forward_shaded: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options {
+            pipeline: StockPipeline::Forward,
+            tonemap: true,
+            stage: None,
+            graph: None,
+            macros: MacroSet::new(),
+            headless: false,
+            out_dir: PathBuf::from("."),
+            size: None,
+            instances: 1,
+            dump_wxsl: false,
+            dump_wgsl: false,
+            list_nodes: false,
+            list_macros: false,
+            help: false,
+            models: None,
+            model: None,
+            forward_shaded: false,
+        }
+    }
+}
+
+impl Options {
+    /// The lighting models the deferred path enables, resolved against the
+    /// shipped registry. The default is just `pbr`, which needs no id
+    /// channel and generates no dispatch; `--models lambert,phong,pbr` is
+    /// the three-model demo. A forward-shaded material always adds
+    /// `wxsl.preshaded` — the route its pixels travel.
+    fn lighting_set(&self) -> Result<wxsl::core::lighting::LightingSet, String> {
+        let Some(names) = &self.models else {
+            if !self.forward_shaded {
+                return Ok(wxsl::core::lighting::LightingSet::default());
+            }
+            return Options {
+                models: Some(vec![
+                    "pbr".to_string(),
+                    wxsl::core::lighting::PRESHADED_MODEL.to_string(),
+                ]),
+                ..Options::default()
+            }
+            .lighting_set();
+        };
+        let mut chosen: Vec<_> = names
+            .iter()
+            .map(|name| {
+                wxsl::core::lighting::DEFAULT_MODELS
+                    .iter()
+                    .copied()
+                    // Bare spellings resolve against the shipped package.
+                    .find(|model| {
+                        model.name == wxsl::core::identity::resolve(name.as_str()).as_ref()
+                    })
+                    .ok_or_else(|| {
+                        format!(
+                            "unknown lighting model `{name}` (shipped: {})",
+                            wxsl::core::lighting::DEFAULT_MODELS
+                                .iter()
+                                .map(|model| model.name)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    })
+            })
+            .collect::<Result<_, _>>()?;
+        if self.forward_shaded
+            && !chosen
+                .iter()
+                .any(|model| model.name == wxsl::core::lighting::PRESHADED_MODEL)
+        {
+            chosen.push(
+                wxsl::core::lighting::DEFAULT_MODELS
+                    .iter()
+                    .copied()
+                    .find(|model| model.name == wxsl::core::lighting::PRESHADED_MODEL)
+                    .expect("the shipped registry carries the route"),
+            );
+        }
+        wxsl::core::lighting::LightingSet::new(chosen).map_err(|error| error.to_string())
+    }
+
+    /// The material configuration the demo compiles, flags included.
+    fn material_config(&self) -> MaterialConfig {
+        MaterialConfig {
+            macros: self.macros.clone(),
+            model: self.model.clone(),
+            forward_shaded: self.forward_shaded,
+            // A forward-shaded surface is shaded before any shadow map
+            // exists; resolution refuses the combination.
+            receive_shadow: !self.forward_shaded,
+            ..MaterialConfig::default()
+        }
+    }
+
+    fn parse(args: impl Iterator<Item = String>) -> Result<Self, String> {
+        let mut options = Options::default();
+        let mut args = args.peekable();
+        while let Some(arg) = args.next() {
+            let mut value = || args.next().ok_or_else(|| format!("`{arg}` needs a value"));
+            match arg.as_str() {
+                "-h" | "--help" => options.help = true,
+                "--headless" => options.headless = true,
+                "--dump-wxsl" => options.dump_wxsl = true,
+                "--dump-wgsl" => options.dump_wgsl = true,
+                "--list-nodes" => options.list_nodes = true,
+                "--list-macros" => options.list_macros = true,
+                "--pipeline" | "--path" => {
+                    let text = value()?;
+                    options.pipeline = StockPipeline::parse(&text)
+                        .ok_or_else(|| format!("unknown pipeline `{text}`"))?;
+                }
+                "--stage" => {
+                    let text = value()?;
+                    options.stage = Some(
+                        MaterialStage::parse(&text)
+                            .ok_or_else(|| format!("unknown material stage `{text}`"))?,
+                    );
+                }
+                "--graph" => options.graph = Some(PathBuf::from(value()?)),
+                "--models" => {
+                    let text = value()?;
+                    let names: Vec<String> = text
+                        .split(',')
+                        .map(|name| name.trim().to_string())
+                        .filter(|name| !name.is_empty())
+                        .collect();
+                    if names.is_empty() {
+                        return Err("`--models` wants at least one name".to_string());
+                    }
+                    options.models = Some(names);
+                }
+                "--model" => options.model = Some(value()?.trim().to_string()),
+                "--forward-shaded" => options.forward_shaded = true,
+                "--instances" => {
+                    let text = value()?;
+                    options.instances = text
+                        .trim()
+                        .parse()
+                        .map_err(|_| format!("`--instances` wants a number, got `{text}`"))?;
+                }
+                "--out" => options.out_dir = PathBuf::from(value()?),
+                "--size" => {
+                    let text = value()?;
+                    let (width, height) = text
+                        .split_once(['x', 'X'])
+                        .ok_or_else(|| format!("`--size` wants WIDTHxHEIGHT, got `{text}`"))?;
+                    options.size = Some((
+                        width.trim().parse().map_err(|_| "bad width".to_string())?,
+                        height
+                            .trim()
+                            .parse()
+                            .map_err(|_| "bad height".to_string())?,
+                    ));
+                }
+                "--macro" => {
+                    let text = value()?;
+                    let (name, raw) = text
+                        .split_once('=')
+                        .ok_or_else(|| format!("`--macro` wants NAME=VALUE, got `{text}`"))?;
+                    let parsed = MacroValue::parse(raw)
+                        .ok_or_else(|| format!("cannot read `{raw}` as a macro value"))?;
+                    options.macros.set(name.trim().to_string(), parsed);
+                }
+                other => return Err(format!("unexpected argument `{other}`")),
+            }
+        }
+        Ok(options)
+    }
+}
+
+fn load_graph(path: Option<&std::path::Path>) -> Result<Graph, Box<dyn Error>> {
+    let json = match path {
+        Some(path) => Cow::Owned(std::fs::read_to_string(path)?),
+        None => Cow::Borrowed(DEFAULT_GRAPH),
+    };
+    Ok(serde_json::from_str(&json)?)
+}
+
+// ---------------------------------------------------------------------------
+// Inspection
+// ---------------------------------------------------------------------------
+
+fn list_nodes(registry: &NodeRegistry) {
+    println!("{} nodes in the library:\n", registry.len());
+    for category in registry.categories() {
+        println!("{category}:");
+        for def in registry.iter().filter(|def| def.category == category) {
+            let inputs = def
+                .inputs
+                .iter()
+                .map(|socket| format!("{}: {}", socket.name, socket.ty))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let outputs = def
+                .outputs
+                .iter()
+                .map(|socket| format!("{}: {}", socket.name, socket.ty))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("  {:<34} ({inputs}) -> ({outputs})", def.id);
+        }
+        println!();
+    }
+}
+
+fn list_macros(graph: &Graph, registry: &NodeRegistry, material: &Material) {
+    let (declared, _) = graph.declared_macros(registry);
+    println!("Macro variables in effect for this material:\n");
+    println!("  {:<26} {:<9} {:<8} DECLARED BY", "NAME", "VALUE", "KIND");
+    for (name, value) in material.macros().iter() {
+        let (kind, source) = match declared.get(name) {
+            Some(decl) => (decl.kind(), "a node in the graph"),
+            None if abi::abi_macros()
+                .iter()
+                .any(|decl| decl.name.as_str() == name) =>
+            {
+                (value.kind(), "the shader ABI")
+            }
+            None => (value.kind(), "the graph only"),
+        };
+        println!("  {name:<26} {:<9} {kind:<8} {source}", value.to_string());
+    }
+    println!(
+        "\nSet one with --macro NAME=VALUE, or pin it in the graph's `macros` object.\n\
+         Flags become @if conditions; numbers become const declarations."
+    );
+}
+
+fn dump_wgsl(material: &Material, stage: MaterialStage) -> Result<String, Box<dyn Error>> {
+    let library = wxsl::stdlib_library();
+    let shader = material.shader(stage);
+    // The generated module declares its own macros now, so the material
+    // source is the only thing to mount alongside the library.
+    let extra = [(
+        codegen::MATERIAL_MODULE,
+        Cow::Borrowed(shader.source.as_str()),
+    )];
+    Ok(variants::compile(
+        &library,
+        &extra,
+        codegen::MATERIAL_MODULE,
+        &shader.macros,
+    )?)
+}
+
+/// Which stage `--dump-wxsl` and `--dump-wgsl` print: whatever `--stage`
+/// asked for, else the one the chosen pipeline shades with.
+fn dump_stage(options: &Options) -> MaterialStage {
+    options.stage.unwrap_or(match options.pipeline {
+        StockPipeline::Forward => MaterialStage::FORWARD_LIT,
+        StockPipeline::Deferred => MaterialStage::GBUFFER,
+    })
+}
+
+/// A stock pipeline's document with the display transform taken off the
+/// end: what `T` switches to.
+///
+/// Document surgery rather than a second hand-written pipeline, because a
+/// pipeline *is* a document and this is what editing one looks
+/// like: find the `tonemap` pass, hand what it was reading straight to
+/// `present`, and drop it and the colour target it read.
+fn without_tonemap(stock: StockPipeline) -> Graph {
+    use wxsl::core::graph::SocketRef;
+    use wxsl::core::pipeline as doc;
+
+    let registry = wxsl::core::pipeline::registry();
+    let mut document = stock.document();
+    let tonemap = document
+        .nodes()
+        .find(|(_, node)| {
+            node.settings
+                .get(doc::SETTING_EFFECT)
+                .is_some_and(|spelled| {
+                    wxsl::core::identity::resolve(spelled).as_ref() == "wxsl.tonemap"
+                })
+        })
+        .map(|(id, _)| id)
+        .expect("every stock document ends in the tonemap pass");
+    // What it read, and who wrote into that.
+    let image = document
+        .edge_into(&SocketRef::new(tonemap, "image"))
+        .expect("the tonemap reads an image")
+        .from
+        .node;
+    let head = document
+        .nodes()
+        .map(|(id, _)| id)
+        .find(|id| {
+            document
+                .edge_into(&SocketRef::new(*id, "into"))
+                .is_some_and(|edge| edge.from.node == image)
+        })
+        .expect("something shades into it");
+    let present = document
+        .edge_from(&SocketRef::new(tonemap, "color"))
+        .expect("the tonemap presents")
+        .to
+        .node;
+
+    document.disconnect(&registry, &SocketRef::new(head, "into"));
+    document.remove_node(&registry, tonemap);
+    document.remove_node(&registry, image);
+    document
+        .wire(&registry, (head, "color"), (present, "surface"))
+        .expect("the head of the chain now presents");
+    document
+}
+
+/// Compile `document` and put `renderer` on it — the two public calls an
+/// application makes to run a pipeline of its own.
+fn set_document(renderer: &mut Renderer, document: &Graph) -> Result<(), String> {
+    let graph = compile_pipeline(
+        document,
+        // The shipped vocabulary plus a node per registered compute
+        // effect: a superset of the static registry, so every
+        // document that compiled before still does.
+        &wxsl::render::document_registry(renderer.effects()),
+        renderer.effects(),
+        &PipelineConfig::new(renderer.target()),
+    )
+    .map_err(|error| error.to_string())?;
+    renderer.set_graph(graph).map_err(|error| error.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// The scene
+// ---------------------------------------------------------------------------
+
+fn demo_environment(aspect: f32, time: f32) -> Environment {
+    Environment {
+        camera: Camera {
+            eye: Vec3::new(2.4, 1.9, 3.2),
+            target: Vec3::ZERO,
+            aspect,
+            ..Camera::default()
+        },
+        lights: vec![
+            // Key light: warm, close, so its inverse-square falloff is
+            // visible across the cube's faces.
+            Light::point(Vec3::new(2.6, 3.0, 2.2), Vec3::new(1.0, 0.86, 0.72), 42.0),
+            // Fill: cool, from the other side, dimmer.
+            Light::point(Vec3::new(-3.0, 1.2, -1.6), Vec3::new(0.5, 0.65, 1.0), 18.0),
+            // Rim: directional, so it does not fall off with distance.
+            Light::directional(Vec3::new(-0.4, 0.7, -1.0), Vec3::new(0.7, 0.75, 0.9), 1.1),
+        ],
+        ambient_sky: Vec3::new(0.14, 0.19, 0.28),
+        ambient_ground: Vec3::new(0.05, 0.04, 0.035),
+        exposure: 1.0,
+        time,
+        // Nothing here has a velocity stage to be the previous frame of.
+        previous_time: time,
+        previous_camera: None,
+        origin: Default::default(),
+        cluster_lights: true,
+        probe: None,
+        planar_reflections: Vec::new(),
+        shadow_atlas_size: wxsl::core::abi::SHADOW_ATLAS_SIZE,
+    }
+}
+
+/// A procedural 64x64 texture for whatever the graph declares.
+///
+/// Generated rather than loaded so the example stays a single file with no
+/// asset to find: a warm checker with a little per-texel variation, in
+/// **linear** space, because the ABI encodes sRGB itself at the end of
+/// shading and a material samples linear values like everything else.
+fn demo_texture(device: &wgpu::Device, queue: &wgpu::Queue) -> (wgpu::TextureView, wgpu::Sampler) {
+    const SIDE: u32 = 64;
+    let mut texels = Vec::with_capacity((SIDE * SIDE * 4) as usize);
+    for y in 0..SIDE {
+        for x in 0..SIDE {
+            let square = ((x / 8) + (y / 8)) % 2 == 0;
+            let grain = (((x * 7 + y * 13) % 11) as f32 / 11.0 - 0.5) * 0.06;
+            let base = if square { 0.82 } else { 0.30 };
+            let level = ((base + grain).clamp(0.0, 1.0) * 255.0) as u8;
+            // Slightly warm on the light squares, so the checker is
+            // visible in the shaded image rather than only in the albedo.
+            texels.extend_from_slice(&[
+                level,
+                (level as f32 * 0.94) as u8,
+                (level as f32 * 0.86) as u8,
+                255,
+            ]);
+        }
+    }
+    let extent = wgpu::Extent3d {
+        width: SIDE,
+        height: SIDE,
+        depth_or_array_layers: 1,
+    };
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("pbr_cube checker"),
+        size: extent,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        texture.as_image_copy(),
+        &texels,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(SIDE * 4),
+            rows_per_image: Some(SIDE),
+        },
+        extent,
+    );
+    (
+        texture.create_view(&wgpu::TextureViewDescriptor::default()),
+        device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("pbr_cube sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        }),
+    )
+}
+
+/// Fill in everything `material`'s graph declares.
+///
+/// The application does not decide what a material needs — it *reads*
+/// what the graph declared and supplies it by name. Which is why this
+/// works unchanged for `--graph`: point the example at a graph declaring
+/// three textures and all three get the checker.
+fn demo_bindings(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    renderer: &mut Renderer,
+    material: &Material,
+    texture: &wgpu::TextureView,
+    sampler: &wgpu::Sampler,
+) -> Result<wxsl::render::MaterialBindings, Box<dyn Error>> {
+    let mut bindings = renderer.material_bindings(device, material);
+    for resource in &material.interface().resources {
+        let name = resource.name.as_str();
+        if resource.ty == wxsl::core::node::ValueType::Sampler {
+            bindings.set_sampler(name, sampler)?;
+        } else {
+            bindings.set_texture(name, texture)?;
+        }
+    }
+    bindings.upload(device, queue)?;
+    Ok(bindings)
+}
+
+/// A one-line summary of what a material needs bound, for the startup
+/// banner: the shape, never the values.
+fn interface_summary(material: &Material) -> String {
+    let interface = material.interface();
+    if interface.material_group_is_empty() && interface.user.is_none() {
+        return "declares nothing".to_string();
+    }
+    let mut parts: Vec<String> = interface
+        .params
+        .fields()
+        .iter()
+        .map(|field| format!("{}: {}", field.name, field.ty))
+        .collect();
+    parts.extend(
+        interface
+            .resources
+            .iter()
+            .map(|entry| format!("{}: {}", entry.name, entry.ty)),
+    );
+    if let Some(user) = &interface.user {
+        parts.push(format!("{} (application)", user.name));
+    }
+    parts.extend(
+        interface
+            .geometry
+            .instance_attributes()
+            .iter()
+            .map(|field| format!("{}: {} (per instance)", field.name, field.ty)),
+    );
+    parts.extend(
+        interface
+            .geometry
+            .vertex()
+            .iter()
+            .map(|entry| format!("{}: {} (per vertex)", entry.name, entry.ty)),
+    );
+    parts.join(", ")
+}
+
+/// A distinct tint for each copy of the cube, as a hue sweep.
+///
+/// One copy gets white, which is the identity for the multiply the graph
+/// does with it — so the default image is exactly what it was before the
+/// graph read a per-instance attribute, and `--instances 6` is six
+/// different cubes out of one draw list, one material and one bind group.
+fn instance_tints(count: u32) -> Vec<InstanceAttributes> {
+    let count = count.max(1);
+    (0..count)
+        .map(|index| {
+            let tint = if count == 1 {
+                Vec3::ONE
+            } else {
+                let hue = index as f32 / count as f32 * std::f32::consts::TAU;
+                Vec3::new(hue.cos(), (hue + 2.09).cos(), (hue + 4.19).cos()) * 0.4 + 0.6
+            };
+            InstanceAttributes::new().with("instance_tint", Value::Vec3(tint.to_array()))
+        })
+        .collect()
+}
+
+fn cube_transform(time: f32) -> Mat4 {
+    Mat4::from_rotation_y(time * 0.45) * Mat4::from_rotation_x(time * 0.21)
+}
+
+/// The frame's draws: `count` copies of the cube, spread along x.
+///
+/// One by default, which is what every image in the README is. More than
+/// one is the shortest demonstration that the renderer takes a draw *list*:
+/// every copy is a row of the frame's instance storage buffer, and one
+/// upload serves all of them.
+fn cube_draws<'a>(
+    mesh: &'a Mesh,
+    material: &'a Material,
+    bindings: &'a wxsl::render::MaterialBindings,
+    tints: &'a [InstanceAttributes],
+    count: u32,
+    time: f32,
+) -> DrawList<'a> {
+    let spin = cube_transform(time);
+    (0..count.max(1))
+        .map(|index| {
+            let offset = index as f32 - (count.max(1) - 1) as f32 * 0.5;
+            let place = Mat4::from_translation(Vec3::new(offset * 2.4, 0.0, 0.0));
+            // Every copy shares one bind group: the parameters and the
+            // texture are the *material's*. What differs per copy is the
+            // transform and the tint, and both are rows of storage
+            // buffers in the frame group rather than anything rebound.
+            let mut item = DrawItem::new(mesh, material)
+                .with_transform(place * spin)
+                .with_bindings(bindings);
+            if let Some(tint) = tints.get(index as usize) {
+                item = item.with_attributes(tint);
+            }
+            item
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Headless
+// ---------------------------------------------------------------------------
+
+fn run_headless(
+    options: &Options,
+    graph: &Graph,
+    material: &Material,
+    lighting: &wxsl::core::lighting::LightingSet,
+) -> Result<(), Box<dyn Error>> {
+    let (width, height) = options.size.unwrap_or((800, 600));
+    let gpu = pollster::block_on(GpuContext::headless())?;
+    println!("adapter: {}", gpu.adapter.get_info().name);
+    println!(
+        "graph:   {} ({} nodes)\nmacros:  {}\nbinds:   {}",
+        graph.name(),
+        graph.node_count(),
+        material.macros().signature(),
+        interface_summary(material)
+    );
+
+    let target = OffscreenTarget::new(&gpu.device, width, height);
+    let mut renderer = Renderer::new(
+        &gpu.device,
+        wxsl::stdlib_library(),
+        TargetConfig::new(width, height, target.format()),
+    )?;
+    renderer.set_lighting(lighting.clone())?;
+    let mesh = Mesh::cube(&gpu.device, 1.6);
+    let (texture, sampler) = demo_texture(&gpu.device, &gpu.queue);
+    let bindings = demo_bindings(
+        &gpu.device,
+        &gpu.queue,
+        &mut renderer,
+        material,
+        &texture,
+        &sampler,
+    )?;
+    // A fixed time, so two runs produce identical images.
+    let environment = demo_environment(width as f32 / height as f32, 1.0);
+    let tints = instance_tints(options.instances);
+    let draws = cube_draws(&mesh, material, &bindings, &tints, options.instances, 0.6);
+
+    std::fs::create_dir_all(&options.out_dir)?;
+    let mut images = Vec::new();
+    for pipeline in StockPipeline::ALL {
+        renderer.set_pipeline(*pipeline);
+        renderer.render(
+            &gpu.device,
+            &gpu.queue,
+            &RenderRequest {
+                view: target.view(),
+                environment: &environment,
+                draws: &draws,
+            },
+        )?;
+        gpu.wait();
+
+        let pixels = target.read_rgba8(&gpu.device, &gpu.queue);
+        let file = options.out_dir.join(format!("pbr_cube_{pipeline}.png"));
+        image::save_buffer(
+            &file,
+            &pixels,
+            width,
+            height,
+            image::ExtendedColorType::Rgba8,
+        )?;
+        println!(
+            "{pipeline:>8}: {} covered pixels, mean luminance {:.4} -> {}",
+            covered_pixels(&pixels),
+            mean_luminance(&pixels),
+            file.display()
+        );
+        images.push(pixels);
+    }
+
+    // The two paths run the same material graph through the same shading
+    // function, so they should agree to within rounding and the G-buffer's
+    // 8-bit base colour.
+    let difference = mean_difference(&images[0], &images[1]);
+    println!(
+        "\nmean |forward - deferred| = {difference:.4} (0 = identical, 1 = opposite)\n\
+         shader variants compiled: {} ({:?})",
+        renderer.variant_count(),
+        renderer.cache_stats()
+    );
+    Ok(())
+}
+
+/// Pixels that are not the clear colour, i.e. where the cube is.
+fn covered_pixels(pixels: &[u8]) -> usize {
+    pixels
+        .chunks_exact(4)
+        .filter(|texel| texel[0] > 12 || texel[1] > 12 || texel[2] > 12)
+        .count()
+}
+
+fn mean_luminance(pixels: &[u8]) -> f32 {
+    let sum: f32 = pixels
+        .chunks_exact(4)
+        .map(|texel| {
+            (0.2126 * texel[0] as f32 + 0.7152 * texel[1] as f32 + 0.0722 * texel[2] as f32) / 255.0
+        })
+        .sum();
+    sum / (pixels.len() / 4) as f32
+}
+
+fn mean_difference(a: &[u8], b: &[u8]) -> f32 {
+    let sum: f32 = a
+        .iter()
+        .zip(b)
+        .map(|(x, y)| (*x as f32 - *y as f32).abs() / 255.0)
+        .sum();
+    sum / a.len() as f32
+}
+
+// ---------------------------------------------------------------------------
+// Windowed
+// ---------------------------------------------------------------------------
+
+fn run_windowed(
+    options: Options,
+    graph: Graph,
+    registry: NodeRegistry,
+    material: Material,
+    lighting: wxsl::core::lighting::LightingSet,
+) -> Result<(), Box<dyn Error>> {
+    let event_loop = EventLoop::new()?;
+    event_loop.set_control_flow(ControlFlow::Poll);
+    let mut app = App {
+        options,
+        graph,
+        registry,
+        material,
+        lighting,
+        state: None,
+        started: Instant::now(),
+        paused_at: None,
+        error: None,
+    };
+    event_loop.run_app(&mut app)?;
+    match app.error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// Everything that only exists once there is a window.
+struct State {
+    window: Arc<Window>,
+    surface: wgpu::Surface<'static>,
+    gpu: GpuContext,
+    renderer: Renderer,
+    mesh: Mesh,
+    /// What the material's graph declared it needs. Rebuilt whenever the
+    /// material is, because a graph edit can change what it declares.
+    bindings: wxsl::render::MaterialBindings,
+    /// One per copy of the cube: what the *geometry* owes the material,
+    /// as against what the material owns. Fixed for the run, because
+    /// `--instances` is.
+    tints: Vec<InstanceAttributes>,
+    texture: wgpu::TextureView,
+    sampler: wgpu::Sampler,
+    format: wgpu::TextureFormat,
+}
+
+struct App {
+    options: Options,
+    graph: Graph,
+    registry: NodeRegistry,
+    material: Material,
+    lighting: wxsl::core::lighting::LightingSet,
+    state: Option<State>,
+    started: Instant,
+    paused_at: Option<f32>,
+    error: Option<Box<dyn Error>>,
+}
+
+impl App {
+    fn elapsed(&self) -> f32 {
+        self.paused_at
+            .unwrap_or_else(|| self.started.elapsed().as_secs_f32())
+    }
+
+    /// Recompile the material after a macro change and report what happened.
+    fn rebuild_material(&mut self) {
+        match Material::with_lighting(
+            &self.graph,
+            &self.registry,
+            &self.options.material_config(),
+            &self.lighting,
+        ) {
+            Ok(material) => self.material = material,
+            Err(error) => eprintln!("cannot recompile the material: {error}"),
+        }
+        // A macro change cannot alter what the graph declares today, but a
+        // graph edit could, and rebinding from the new interface is the
+        // shape that stays right when it does.
+        if let Some(state) = self.state.as_mut() {
+            match demo_bindings(
+                &state.gpu.device,
+                &state.gpu.queue,
+                &mut state.renderer,
+                &self.material,
+                &state.texture,
+                &state.sampler,
+            ) {
+                Ok(bindings) => state.bindings = bindings,
+                Err(error) => eprintln!("cannot bind the material: {error}"),
+            }
+        }
+        self.report();
+    }
+
+    /// Scale the first `f32` or `vec3f` parameter the material declares.
+    ///
+    /// The point of the key, and of the number it prints: this is a write
+    /// into a uniform buffer, so the compile count beside it does not
+    /// move. The `const.value` node one row up in the same graph would
+    /// cost a new variant for the same visible change.
+    fn adjust_parameter(&mut self, factor: f32) {
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        let Some(field) = self
+            .material
+            .interface()
+            .params
+            .fields()
+            .iter()
+            .find(|field| {
+                matches!(
+                    field.ty,
+                    wxsl::core::node::ValueType::F32 | wxsl::core::node::ValueType::Vec3
+                )
+            })
+            .cloned()
+        else {
+            eprintln!("this graph declares no scalar or colour parameter to change");
+            return;
+        };
+        let name = field.name.as_str();
+        let Some(current) = state.bindings.get(name) else {
+            return;
+        };
+        let scaled = match current {
+            wxsl::core::node::Value::F32(value) => {
+                wxsl::core::node::Value::F32((value * factor).clamp(0.02, 8.0))
+            }
+            wxsl::core::node::Value::Vec3(value) => wxsl::core::node::Value::Vec3(
+                value.map(|channel| (channel * factor).clamp(0.02, 8.0)),
+            ),
+            other => other,
+        };
+        if let Err(error) = state.bindings.set(name, scaled) {
+            eprintln!("cannot set `{name}`: {error}");
+            return;
+        }
+        if let Err(error) = state.bindings.upload(&state.gpu.device, &state.gpu.queue) {
+            eprintln!("cannot upload `{name}`: {error}");
+            return;
+        }
+        let stats = state.renderer.cache_stats();
+        println!(
+            "{name} = {scaled:?}  |  {} variants, {} compiles (unchanged: a parameter is a buffer write)",
+            state.renderer.variant_count(),
+            stats.misses
+        );
+    }
+
+    fn report(&self) {
+        let variants = self
+            .state
+            .as_ref()
+            .map(|state| {
+                let stats = state.renderer.cache_stats();
+                format!(
+                    "{} variants, {} hits, {} compiles",
+                    state.renderer.variant_count(),
+                    stats.hits,
+                    stats.misses
+                )
+            })
+            .unwrap_or_default();
+        println!(
+            "[{}] {}  |  {variants}",
+            self.options.pipeline,
+            self.material.macros().signature()
+        );
+    }
+
+    /// Put the display transform on or off the end of the pass list.
+    ///
+    /// `T` used to flip a macro inside the generated `shade_surface`;
+    /// the tonemap is a pass, so the honest toggle is the
+    /// *pipeline* — and what it demonstrates is better for it: the frame
+    /// without it is the same linear radiance, uncurved and unencoded.
+    fn toggle_tonemap(&mut self) {
+        self.options.tonemap = !self.options.tonemap;
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        let result = if self.options.tonemap {
+            state.renderer.set_pipeline(self.options.pipeline);
+            Ok(())
+        } else {
+            set_document(&mut state.renderer, &without_tonemap(self.options.pipeline))
+        };
+        if let Err(error) = result {
+            eprintln!("cannot switch the display transform: {error}");
+        }
+        self.report();
+    }
+
+    /// Flip a flag macro, or set it if the graph never mentioned it.
+    fn toggle_flag(&mut self, name: &str) {
+        let current = self
+            .options
+            .macros
+            .get(name)
+            .or_else(|| self.material.macros().get(name))
+            .and_then(|value| value.as_flag())
+            .unwrap_or(false);
+        self.options
+            .macros
+            .set(name.to_string(), MacroValue::Flag(!current));
+        self.rebuild_material();
+    }
+
+    fn adjust_octaves(&mut self, delta: i32) {
+        let name = "WXSL_FBM_OCTAVES";
+        let current = match self
+            .options
+            .macros
+            .get(name)
+            .or_else(|| self.material.macros().get(name))
+        {
+            Some(MacroValue::Int(value)) => value,
+            _ => {
+                eprintln!("this graph has no {name} macro");
+                return;
+            }
+        };
+        let next = (current + delta).clamp(1, 8);
+        if next == current {
+            return;
+        }
+        self.options
+            .macros
+            .set(name.to_string(), MacroValue::Int(next));
+        self.rebuild_material();
+    }
+
+    fn render(&mut self) {
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        let frame = match state.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(frame)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+            // Lost or outdated: reconfiguring is the normal response, and the
+            // next frame succeeds.
+            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
+                let size = state.window.inner_size();
+                configure_surface(state, size.width, size.height);
+                return;
+            }
+            // Occluded or timed out: skip this frame and try again.
+            other => {
+                if !matches!(
+                    other,
+                    wgpu::CurrentSurfaceTexture::Occluded | wgpu::CurrentSurfaceTexture::Timeout
+                ) {
+                    eprintln!("dropped a frame: {other:?}");
+                }
+                return;
+            }
+        };
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let size = state.window.inner_size();
+        let time = self
+            .paused_at
+            .unwrap_or_else(|| self.started.elapsed().as_secs_f32());
+        let environment = demo_environment(size.width as f32 / size.height.max(1) as f32, time);
+        let draws = cube_draws(
+            &state.mesh,
+            &self.material,
+            &state.bindings,
+            &state.tints,
+            self.options.instances,
+            time,
+        );
+
+        if let Err(error) = state.renderer.render(
+            &state.gpu.device,
+            &state.gpu.queue,
+            &RenderRequest {
+                view: &view,
+                environment: &environment,
+                draws: &draws,
+            },
+        ) {
+            eprintln!("cannot render: {error}");
+        }
+        state.gpu.queue.present(frame);
+    }
+}
+
+fn configure_surface(state: &mut State, width: u32, height: u32) {
+    let width = width.max(1);
+    let height = height.max(1);
+    state.surface.configure(
+        &state.gpu.device,
+        &wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: state.format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
+            width,
+            height,
+            present_mode: wgpu::PresentMode::AutoVsync,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            view_formats: vec![],
+        },
+    );
+    state.renderer.resize(&state.gpu.device, width, height);
+}
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.state.is_some() {
+            return;
+        }
+        match self.create_state(event_loop) {
+            Ok(state) => {
+                self.state = Some(state);
+                println!("{USAGE}");
+                self.report();
+            }
+            Err(error) => {
+                self.error = Some(error);
+                event_loop.exit();
+            }
+        }
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _window: WindowId,
+        event: WindowEvent,
+    ) {
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Resized(size) => {
+                if let Some(state) = self.state.as_mut() {
+                    configure_surface(state, size.width, size.height);
+                }
+            }
+            WindowEvent::RedrawRequested => self.render(),
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(code),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } => self.on_key(code, event_loop),
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(state) = self.state.as_ref() {
+            state.window.request_redraw();
+        }
+    }
+}
+
+impl App {
+    fn create_state(&mut self, event_loop: &ActiveEventLoop) -> Result<State, Box<dyn Error>> {
+        let (width, height) = self.options.size.unwrap_or((1280, 720));
+        let window = Arc::new(
+            event_loop.create_window(
+                Window::default_attributes()
+                    .with_title("wxsl — PBR cube")
+                    .with_inner_size(winit::dpi::LogicalSize::new(width, height)),
+            )?,
+        );
+
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let surface = instance.create_surface(Arc::clone(&window))?;
+        let gpu = pollster::block_on(GpuContext::new(instance, Some(&surface)))?;
+
+        // A non-sRGB format: the shading function encodes sRGB itself so that
+        // the forward path and the deferred lighting pass agree exactly. With
+        // an `*Srgb` surface the GPU would encode a second time.
+        let capabilities = surface.get_capabilities(&gpu.adapter);
+        let format = capabilities
+            .formats
+            .iter()
+            .copied()
+            .find(|format| !format.is_srgb())
+            .unwrap_or_else(|| {
+                eprintln!("warning: no linear surface format available; colours will be bright");
+                capabilities.formats[0]
+            });
+
+        let size = window.inner_size();
+        let mut renderer = Renderer::new(
+            &gpu.device,
+            wxsl::stdlib_library(),
+            TargetConfig::new(size.width, size.height, format),
+        )?;
+        renderer
+            .set_lighting(self.lighting.clone())
+            .expect("the set was resolved from the shipped models");
+        let mesh = Mesh::cube(&gpu.device, 1.6);
+        let (texture, sampler) = demo_texture(&gpu.device, &gpu.queue);
+        let bindings = demo_bindings(
+            &gpu.device,
+            &gpu.queue,
+            &mut renderer,
+            &self.material,
+            &texture,
+            &sampler,
+        )?;
+
+        let mut state = State {
+            window,
+            surface,
+            gpu,
+            renderer,
+            mesh,
+            bindings,
+            tints: instance_tints(self.options.instances),
+            texture,
+            sampler,
+            format,
+        };
+        state.renderer.set_pipeline(self.options.pipeline);
+        configure_surface(&mut state, size.width, size.height);
+        println!("adapter: {}", state.gpu.adapter.get_info().name);
+        println!("binds:   {}", interface_summary(&self.material));
+        Ok(state)
+    }
+
+    fn on_key(&mut self, code: KeyCode, event_loop: &ActiveEventLoop) {
+        match code {
+            KeyCode::Escape | KeyCode::KeyQ => event_loop.exit(),
+            KeyCode::KeyF | KeyCode::KeyD => {
+                let pipeline = if code == KeyCode::KeyF {
+                    StockPipeline::Forward
+                } else {
+                    StockPipeline::Deferred
+                };
+                self.options.pipeline = pipeline;
+                // Switching path asks for the *stock* pass list, which ends
+                // in the display transform — so the toggle comes back on
+                // with it, and `T` turns it off again for the new path.
+                self.options.tonemap = true;
+                if let Some(state) = self.state.as_mut() {
+                    // Requested, not set: the missing stages compile on a
+                    // worker thread and the swap lands when they are all
+                    // there, so pressing D does not stutter the window.
+                    if let Err(error) = state.renderer.request_pipeline(pipeline, &[&self.material])
+                    {
+                        eprintln!("cannot switch pipeline: {error}");
+                    }
+                }
+                self.report();
+            }
+            KeyCode::KeyN => self.toggle_flag(abi::FEATURE_DEBUG_NORMALS),
+            KeyCode::KeyT => self.toggle_tonemap(),
+            KeyCode::KeyR => self.toggle_flag("wxsl_fbm_ridged"),
+            KeyCode::ArrowUp => self.adjust_octaves(1),
+            KeyCode::ArrowDown => self.adjust_octaves(-1),
+            KeyCode::BracketRight => self.adjust_parameter(1.25),
+            KeyCode::BracketLeft => self.adjust_parameter(0.8),
+            KeyCode::Space => {
+                self.paused_at = match self.paused_at {
+                    // Resuming keeps the phase, so the cube does not jump.
+                    Some(paused) => {
+                        self.started = Instant::now() - std::time::Duration::from_secs_f32(paused);
+                        None
+                    }
+                    None => Some(self.elapsed()),
+                };
+            }
+            _ => {}
+        }
+    }
+}

@@ -1,0 +1,52 @@
+// Ambient environment
+//
+// Analytic hemisphere ambient: sky above, bounce below, with a split-sum
+// specular response.
+//
+// A cheap stand-in for an image-based environment when there is no cubemap
+// to sample. The environment is modelled as two colours, sky above and
+// bounce below, blended by the vertical component of the direction being
+// looked along. The diffuse term looks along the normal; the specular term
+// looks along the mirror direction and blurs towards the diffuse irradiance
+// as roughness rises, which is the qualitative behaviour a prefiltered
+// cubemap has.
+//
+// What makes it image-based lighting rather than a tint is `env_brdf`: the
+// (scale, bias) pair of the split-sum approximation, which the caller reads
+// out of the baked environment-BRDF table for this surface's N.V and
+// roughness (`environment_brdf` in `wxsl/bindings.wxsl`). It is
+// what puts the grazing-angle brightening and the roughness falloff on the
+// same footing as the direct specular, instead of a hand-tuned Fresnel
+// fade. Its default, (1, 0), is a caller with no table: F0 straight
+// through, which is what this function did before the table existed.
+//
+// Original implementation; the split-sum factorization is Karis' and is
+// standard, not copied code.
+
+fn ambient_environment(
+    normal: vec3f,         // @default 0.0, 1.0, 0.0
+    view_direction: vec3f, // @default 0.0, 0.0, 1.0
+    base_color: vec3f,     // @default 0.8
+    metallic: f32,         // @default 0.0
+    roughness: f32,        // @default 0.5
+    sky_color: vec3f,      // @default 0.35, 0.45, 0.6
+    ground_color: vec3f,   // @default 0.12, 0.1, 0.08
+    env_brdf: vec2f,       // @default 1.0, 0.0
+) -> vec3f {
+    let diffuse_irradiance = mix(ground_color, sky_color, normal.y * 0.5 + 0.5);
+    let mirror = reflect(-view_direction, normal);
+    // A rough surface reflects a wide cone rather than a ray, so it sees
+    // more of the environment's average: the mirror lookup blurs towards
+    // the diffuse irradiance as roughness rises, which is what the higher
+    // mips of a prefiltered cubemap are.
+    let mirror_irradiance = mix(
+        mix(ground_color, sky_color, mirror.y * 0.5 + 0.5),
+        diffuse_irradiance,
+        saturate(roughness),
+    );
+
+    let f0 = mix(vec3f(0.04, 0.04, 0.04), base_color, saturate(metallic));
+    let diffuse = base_color * (1.0 - saturate(metallic)) * diffuse_irradiance;
+    let specular = mirror_irradiance * (f0 * env_brdf.x + vec3f(env_brdf.y));
+    return diffuse + specular;
+}

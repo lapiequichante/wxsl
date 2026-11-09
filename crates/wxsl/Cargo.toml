@@ -1,0 +1,208 @@
+[package]
+name = "wxsl"
+description = "WXSL shader node graphs on wgpu, with an optional visual node editor. See README for feature flags."
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[dependencies]
+wxsl-core = { workspace = true }
+wxsl-render = { workspace = true, optional = true }
+wxsl-editor = { workspace = true, optional = true }
+wxsl-stdlib = { workspace = true, optional = true }
+wxsl-gltf = { workspace = true, optional = true }
+wxsl-mcp = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+pollster = { workspace = true }
+winit = { workspace = true }
+image = { workspace = true, features = ["hdr"] }
+wgpu = { workspace = true }
+glam = { workspace = true }
+naga = { workspace = true }
+# The viewer's precomputed radiance transfer.
+wxsl-prt = { workspace = true }
+
+# The browser example's glue; the same versions wgpu's web
+# backends already pull in.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-futures = "0.4"
+web-time = "1"
+web-sys = { version = "0.3", features = ["Window", "Document", "Element", "Location", "console"] }
+
+[features]
+default = ["render", "stdlib"]
+render = ["dep:wxsl-render"]
+editor = ["dep:wxsl-editor", "render"]
+stdlib = ["dep:wxsl-stdlib"]
+# Decode PNG and JPEG images, for scene textures given as files or encoded
+# bytes.
+images = ["render", "wxsl-render/images"]
+# glTF/GLB import: geometry for `file` meshes, and with `stdlib` whole
+# scenes through `wxsl::asset`.
+gltf = ["render", "wxsl-render/gltf", "images", "dep:wxsl-gltf", "wxsl-editor?/gltf"]
+# WebGL2 as the browser fallback behind WebGPU; wasm32 only.
+webgl = ["render", "wxsl-render/webgl"]
+# An MCP server over the editor's commands, for agents.
+mcp = ["editor", "dep:wxsl-mcp"]
+
+[[example]]
+name = "viewer"
+# A glTF file imported as a scene document, lit by an HDR.
+required-features = ["gltf", "stdlib"]
+
+[[example]]
+name = "pbr_cube"
+# The demo needs the renderer and the node library; without them there is
+# nothing to run, so cargo skips it instead of failing to build.
+required-features = ["render", "stdlib"]
+
+[[example]]
+name = "web"
+# The demo cube in a browser, WebGPU or WebGL2; natively, a window.
+required-features = ["render", "stdlib"]
+
+[[example]]
+name = "editor"
+# The editor example needs the editor (and so the renderer) and the node
+# library; without them there is nothing to edit.
+required-features = ["editor", "stdlib"]
+
+[[test]]
+name = "graph_to_wgsl"
+required-features = ["render", "stdlib"]
+
+[[test]]
+name = "downlevel"
+# The fallback profile on a real device; skips with no adapter.
+required-features = ["render", "stdlib"]
+
+[[test]]
+name = "downlevel_corpus"
+# The GLSL ES 3.00 column of the corpus gate: no device.
+required-features = ["render", "stdlib"]
+
+[[test]]
+name = "render_cube"
+required-features = ["render", "stdlib"]
+
+[[test]]
+name = "editor_frame"
+# Drives the editor for a few frames on a real device; skips when there is no
+# adapter, like render_cube.rs.
+required-features = ["editor", "stdlib"]
+
+[[test]]
+name = "mcp"
+# A headless editor driven through the MCP server; the device half skips
+# without an adapter.
+required-features = ["mcp", "stdlib"]
+
+[[test]]
+name = "gltf_import"
+# Imported glTF scenes on a device; skips without an adapter.
+required-features = ["gltf", "stdlib"]
+
+[[test]]
+name = "scene"
+# The scene document and its translation into a draw list; the rendering
+# half skips when there is no adapter, like render_cube.rs.
+required-features = ["render", "stdlib"]
+
+[[test]]
+name = "wgsl_types"
+# Checks `ValueType`'s operator typing rules against wgpu's own validator,
+# so it needs a device; skips when there is no adapter, like render_cube.rs.
+required-features = ["render", "stdlib"]
+
+[[example]]
+name = "gallery"
+# Every demo is the renderer plus the node library through a different
+# pipeline; without them there is nothing to show.
+required-features = ["render", "stdlib"]
+
+# The tests below follow the same rule as the ones above: each needs the
+# features its harness compiles against (`probe` drives the renderer on a
+# real device, so every one of them needs `render`), and the stdlib-consuming
+# ones need `stdlib` too. Declared per target so a `--no-default-features`
+# build skips them instead of failing to compile.
+[[test]]
+name = "ambient_ibl"
+required-features = ["render"]
+
+[[test]]
+name = "frame_of_reference"
+required-features = ["render"]
+
+[[test]]
+name = "screen_graphs"
+required-features = ["render"]
+
+[[test]]
+name = "stage_analysis"
+required-features = ["render"]
+
+[[test]]
+name = "buffer_resources"
+required-features = ["render", "stdlib"]
+
+[[test]]
+name = "effect_params"
+required-features = ["render", "stdlib"]
+
+[[test]]
+name = "execution_policies"
+required-features = ["render", "stdlib"]
+
+[[test]]
+name = "interpolants"
+required-features = ["render", "stdlib"]
+
+[[test]]
+name = "lighting_models"
+required-features = ["render", "stdlib"]
+
+[[test]]
+name = "material_geometry"
+required-features = ["render", "stdlib"]
+
+[[test]]
+name = "material_resources"
+required-features = ["render", "stdlib"]
+
+[[test]]
+name = "semantic_channels"
+required-features = ["render", "stdlib"]
+
+[[test]]
+name = "shadows"
+required-features = ["render", "stdlib"]
+
+[[test]]
+name = "peeling"
+required-features = ["render", "stdlib"]
+
+[[test]]
+name = "sky"
+required-features = ["render", "stdlib"]
+
+[[test]]
+name = "cube_mips"
+required-features = ["render", "stdlib"]
+
+[[test]]
+name = "ibl"
+required-features = ["render", "stdlib"]
+
+[[test]]
+name = "prt"
+required-features = ["render", "stdlib"]
+
+[[test]]
+name = "planar_reflection"
+required-features = ["render", "stdlib"]

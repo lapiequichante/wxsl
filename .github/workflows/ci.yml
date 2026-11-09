@@ -1,0 +1,158 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      gpu:
+        description: Run Dawn/wgpu parity on the labelled GPU runner
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Never execute untrusted pull-request code on a persistent self-hosted GPU.
+  dawn-gpu:
+    if: github.event_name == 'workflow_dispatch' && inputs.gpu
+    runs-on: [self-hosted, wxsl-gpu]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install conan==2.33.0
+      - name: Native and Dawn images, corpus, negative guard and runtime edits
+        run: bash dawn/tests/run_parity.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: backend-parity-images
+          path: |
+            target/dawn-images
+            target/dawn-assets/**/reference_*.png
+
+  dawn-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install conan==2.33.0
+      - name: Build the pinned offline Dawn backend (no adapter required)
+        run: bash dawn/tests/build_renderer.sh
+
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  # Checked separately, not just via --all-features, because the point of the
+  # crate split is that the facade with no features pulls in
+  # neither a GUI toolkit nor wgpu. Note that `--workspace
+  # --no-default-features` would NOT prove that: it still builds
+  # wxsl-render, whose wgpu dependency is not optional. See AGENTS.md.
+  check-headless:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check -p wxsl --no-default-features
+      - run: cargo check -p wxsl-frame --all-targets
+      - run: cargo check -p wxsl-ffi --lib
+      - name: C ABI pulls in no GPU or editor dependency
+        run: |
+          tree=$(cargo tree -p wxsl-ffi -e normal)
+          echo "$tree"
+          if echo "$tree" | grep -Eq 'wgpu|winit|egui|wxsl-render|wxsl-editor'; then
+            echo "::error::unexpected dependency in the C ABI library"
+            exit 1
+          fi
+      - name: Frame descriptions pull in no renderer, compiler or GUI dependency
+        run: |
+          tree=$(cargo tree -p wxsl-frame -e normal)
+          echo "$tree"
+          if echo "$tree" | grep -Eq 'wgpu|winit|egui|wxsl-render|wxsl-editor|wxsl-stdlib|wxsl-lang'; then
+            echo "::error::unexpected dependency in the device-free frame crate"
+            exit 1
+          fi
+      - name: The graph model alone pulls in no renderer or GUI dependency
+        run: |
+          tree=$(cargo tree -p wxsl --no-default-features -e normal)
+          echo "$tree"
+          if echo "$tree" | grep -Eq 'wgpu|winit|egui|wxsl-render'; then
+            echo "::error::unexpected dependency in the headless build"
+            exit 1
+          fi
+      - name: The editor feature implies the renderer
+        run: cargo tree -p wxsl --features editor -e normal | grep -q wxsl-render
+
+  clippy:
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ["--no-default-features", "", "--all-features"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --workspace --all-targets ${{ matrix.features }} -- -D warnings
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo doc --workspace --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # Every public-item change shows up as a diff of api/*.txt.
+  # The nightly and the tool are pinned in scripts/public-api.sh.
+  public-api:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-13
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-public-api --version 0.52.0 --locked
+      - run: bash scripts/public-api.sh
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --workspace --all-features
+      - name: Every stdlib category has a compilable backend sample
+        run: cargo test -p wxsl-ffi --example bake_docs
+      - name: Authoring guide snippets compile and validate without a GPU
+        run: cargo run -p wxsl-ffi --example check_shader_guide -- crates/wxsl-mcp/authoring.md
+      - name: Dynamic C and C++ ABI parity (no GPU or Dawn SDK required)
+        run: bash dawn/tests/run_abi_smoke.sh
+      # `crates/wxsl/tests/render_cube.rs` needs a GPU adapter and skips
+      # itself when there is none, so the job above passing does not prove
+      # the renderer runs. Print whether it skipped, so a runner that quietly
+      # lost its GPU is visible in the log rather than looking like a pass.
+      # `graph_to_wgsl.rs` — every node, both render paths, through the real
+      # WXSL compiler — runs everywhere and is the load-bearing suite.
+      - name: Report whether the GPU tests ran or skipped
+        run: cargo test -p wxsl --test render_cube -- --nocapture 2>&1 | tee out.txt | tail -20

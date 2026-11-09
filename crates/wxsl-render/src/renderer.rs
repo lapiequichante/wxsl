@@ -1,0 +1,2238 @@
+//! [`Renderer`]: the application-facing front end that runs a pass list.
+//!
+//! It owns the shader library, the variant cache, the frame bindings, the
+//! `wgpu` pipeline cache and the resource pool, and exposes one
+//! [`Renderer::render`] that works whichever pipeline is active.
+//!
+//! A pipeline is a [`RenderGraph`] the engine schedules and records,
+//! and which shader variant each of its passes draws with is that pass's
+//! [`MaterialStage`].
+//!
+//! # Two ways to swap
+//!
+//! * [`Renderer::set_pipeline`] switches immediately. Anything not already
+//!   compiled is compiled during the next frame, which is a hitch.
+//! * [`Renderer::request_pipeline`] switches when it is ready: the missing
+//!   variants compile on a worker thread while the current pipeline keeps
+//!   presenting, and the swap lands in one frame.
+//!   [`Renderer::swap_progress`] is what a `compiling 3/7` indicator reads.
+//!
+//! # What a draw carries
+//!
+//! Group 0 is the frame's and the renderer owns it. Groups 1 and 2 are the
+//! material's — the parameters and textures its graph declares, and the
+//! block it expects the application to supply — and both arrive *on the
+//! draw*, because the resources behind them belong to the application.
+//! [`Renderer::material_bindings`] makes the first and
+//! [`Renderer::user_layout`] describes the second.
+//!
+//! Either way the variant cache keeps what it compiled, keyed on the
+//! *stage* rather than the pipeline — so the second swap between two
+//! pipelines is free, and the third costs nothing at all.
+
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
+use std::sync::Arc;
+
+use wxsl_core::abi::{self, MaterialStage};
+use wxsl_core::lighting::LightingSet;
+use wxsl_core::node::Value;
+use wxsl_core::resources::BufferLayout;
+
+use crate::bindings::{BindingLayouts, MaterialBindings};
+use crate::draw::{DrawItem, DrawList};
+use crate::effect::{Effect, EffectKind, EffectRegistry};
+use crate::environment::{Environment, FrameBindings, ShadowMaps};
+use crate::error::RenderError;
+use crate::graph::{PassBinding, PassEncoder, RecordedPass, RenderGraph, ResourcePool, Schedule};
+use crate::library::ShaderLibrary;
+use crate::material::Material;
+use crate::pass::ResourceId;
+use crate::pass::{DrawSource, LayerFilter, PassKind, PassView, Policy, SortOrder};
+use crate::pipeline::{MaterialGroups, PipelineCache, PipelineConfig, StockPipeline, TargetConfig};
+use crate::swap::{PipelineSwap, Request, SwapProgress};
+use crate::timing::PassTimer;
+use crate::variants::{CacheStats, EffectRequest, MaterialRequest, ShaderVariant, ShaderVariants};
+use wxsl_frame::shadow_cache::{ShadowCache, ShadowFrame};
+
+/// What to render, for [`Renderer::render`].
+///
+/// A draw *list*, not one mesh: the renderer is still scene-graph-free —
+/// batching, culling and sorting belong to the application — but "one
+/// object per frame" was never a design decision, only an unfinished one.
+pub struct RenderRequest<'a> {
+    /// Where the final colour goes.
+    pub view: &'a wgpu::TextureView,
+    /// Camera, lights and ambient environment.
+    pub environment: &'a Environment,
+    /// What to draw. A draw's index here is the row of the instance buffer
+    /// its vertices read their transform from.
+    pub draws: &'a DrawList<'a>,
+}
+
+/// Owns the pass list, the pipelines and the shader cache, and renders a
+/// frame.
+pub struct Renderer {
+    library: ShaderLibrary,
+    variants: ShaderVariants,
+    bindings: FrameBindings,
+    brdf_lut: crate::effect::ibl::BrdfLut,
+    baked_brdf_lut: Option<crate::effect::ibl::BrdfLut>,
+    layouts: BindingLayouts,
+    pipelines: PipelineCache,
+    pool: ResourcePool,
+    graph: RenderGraph,
+    schedule: Schedule,
+    /// Which stock pipeline is running, or `None` for one an application
+    /// supplied. A stock one is rebuilt when the target changes; someone
+    /// else's is left alone.
+    stock: Option<StockPipeline>,
+    swap: Option<PipelineSwap>,
+    /// The screen effects this renderer can run, and a pipeline document
+    /// may name. Shipped with the lighting pass and bloom; extended with
+    /// [`Renderer::add_effect`].
+    effects: EffectRegistry,
+    /// Every knob the stock pass list varies by, in one place: size,
+    /// format, clear colour, lighting set. Mutated by `set_lighting`,
+    /// `set_pipeline` and `resize`, read by `rebuild`.
+    config: PipelineConfig,
+    /// The execution policies' run bookkeeping, per pass by
+    /// declaration index: how many times each pass has actually run since
+    /// the current pass list was set.
+    runs: Vec<u32>,
+    /// How many draws each pass issued *last frame*, per pass by
+    /// declaration index — the per-frame half of `runs`: a pass can run
+    /// and draw nothing, which is what a layer filter admitting no draw
+    /// looks like. Reset at the start of every frame.
+    drawn: Vec<u32>,
+    /// How many triangles each pass drew last frame, beside `drawn`.
+    triangles: Vec<u64>,
+    /// How many draw calls each pass issued last frame: `drawn`, with
+    /// each instanced run counted once.
+    calls: Vec<u32>,
+    /// Where the next frame is probed, as a fraction of the target.
+    probe_at: Option<[f32; 2]>,
+    /// What the last probed frame read, until it is taken.
+    probed: Option<Vec<crate::probe::ProbedTexel>>,
+    /// Whether the device can rasterize lines, and whether the camera's
+    /// geometry passes do (the wireframe view).
+    line_mode: bool,
+    wireframe: bool,
+    /// The pool generation and target size at which each pass last ran.
+    /// A pass of policy `once` is due when its generation is not the
+    /// pool's — a reallocation destroyed every slot's contents, so the
+    /// bake must happen again — and `on resize` adds its size to the
+    /// question.
+    last_run: Vec<(u64, (u32, u32))>,
+    /// Marks for `on demand` passes, keyed by pass label — the name a
+    /// document author gave the pass, which is the name an application
+    /// knows.
+    demanded: HashSet<String>,
+    /// One uniform block per pass whose effect declares parameters,
+    /// keyed by pass label — the same name [`mark_pass`] and
+    /// the run counts go by. Values survive a pass-list change under the
+    /// same label, so a document edit does not silently reset a tuned
+    /// knob; a changed layout is what starts a block over.
+    pass_params: HashMap<String, PassParamBlock>,
+    /// Views the *host* owns, keyed by the resource label the current pass
+    /// list declares them under — a bake table most of all:
+    /// the material created it and samples it, and the graph only writes
+    /// it. Unlike the pool's own textures these survive a reallocation,
+    /// because they were never the pool's to lose.
+    imports: Vec<(String, wgpu::TextureView)>,
+    /// Per-pass GPU timings, once asked for with
+    /// [`Renderer::set_pass_timing`] on a device that can write
+    /// timestamps.
+    timer: Option<PassTimer>,
+    /// What each shadow slot holds across frames, for the lights whose
+    /// shadow is static, and the pool generation it was drawn
+    /// under: a reallocation lost the atlas.
+    shadow_cache: ShadowCache,
+    shadow_generation: u64,
+    /// The depth-only pipeline that clears each redrawn tile on a frame
+    /// that keeps one, built the first time a tile is kept.
+    shadow_clear: Option<wgpu::RenderPipeline>,
+}
+
+/// One pass's effect parameters: the layout the descriptor declared, the
+/// host-side values written through it, and the uniform buffer they are
+/// uploaded to. The buffer is created at the next upload, because the
+/// values are synced where the pass list lands and no device is there.
+struct PassParamBlock {
+    layout: BufferLayout,
+    /// The values the pass list authored, which `data` started from.
+    authored: Vec<u8>,
+    data: Vec<u8>,
+    buffer: Option<wgpu::Buffer>,
+    dirty: bool,
+}
+
+impl Renderer {
+    /// Create a renderer for `target`, resolving shader imports against
+    /// `library`.
+    ///
+    /// The library must contain the shader ABI modules; `check_abi` runs
+    /// here so a missing library is reported now rather than as a confusing
+    /// import error on the first material compiled.
+    pub fn new(
+        device: &wgpu::Device,
+        library: ShaderLibrary,
+        target: TargetConfig,
+    ) -> Result<Self, RenderError> {
+        library.check_abi()?;
+        let stock = StockPipeline::default();
+        let mut config = PipelineConfig::new(target);
+        // What the device can run decides the fallbacks, once.
+        config.profile = crate::gpu::device_profile(device);
+        let graph = stock.graph(&config);
+        let schedule = graph.schedule()?;
+        let mut pool = ResourcePool::new();
+        pool.configure(device, &schedule, target);
+        let pass_count = graph.passes().len();
+        let mut renderer = Renderer {
+            bindings: FrameBindings::new(device, config.profile),
+            brdf_lut: Default::default(),
+            baked_brdf_lut: None,
+            layouts: BindingLayouts::new(),
+            library,
+            variants: ShaderVariants::with_pins(config.profile.macros()),
+            pipelines: PipelineCache::new(),
+            pool,
+            graph: graph.into(),
+            schedule,
+            stock: Some(stock),
+            swap: None,
+            effects: EffectRegistry::shipped(),
+            runs: vec![0; pass_count],
+            drawn: vec![0; pass_count],
+            triangles: vec![0; pass_count],
+            calls: vec![0; pass_count],
+            probe_at: None,
+            probed: None,
+            line_mode: device
+                .features()
+                .contains(wgpu::Features::POLYGON_MODE_LINE),
+            wireframe: false,
+            last_run: vec![(u64::MAX, (0, 0)); pass_count],
+            demanded: HashSet::new(),
+            pass_params: HashMap::new(),
+            imports: Vec::new(),
+            timer: None,
+            shadow_cache: ShadowCache::new(),
+            shadow_generation: u64::MAX,
+            shadow_clear: None,
+            config,
+        };
+        // The stock pass list's effects may declare parameters (the
+        // tonemap's `curve`): their blocks exist from the first frame.
+        renderer.sync_pass_params();
+        Ok(renderer)
+    }
+
+    /// Enable a different set of lighting models for the deferred path,
+    /// now.
+    ///
+    /// The set decides the G-buffer's shape, so the deferred pass list is
+    /// rebuilt — and every material must have been compiled against the
+    /// same set ([`crate::material::Material::with_lighting`]); a draw
+    /// whose material disagrees is a named error when the frame is
+    /// compiled, before a pass is opened. Every model's module must be in
+    /// the library, which is checked here rather than left to the first
+    /// shader compilation.
+    pub fn set_lighting(&mut self, set: LightingSet) -> Result<(), RenderError> {
+        for model in set.models() {
+            if !self.library.contains(model.module) {
+                return Err(RenderError::MissingModule {
+                    module: model.module.to_string(),
+                });
+            }
+        }
+        // WebGPU guarantees 32 bytes per sample across a pass's colour
+        // attachments, and the G-buffer is one pass. The base targets spend
+        // 24 of it once alignment is paid; a set whose requests overrun the
+        // rest would only fail at pipeline creation, in a message naming
+        // bytes rather than models. Checked here, where the set is being
+        // named anyway.
+        let bytes = crate::pipeline::gbuffer_bytes_per_sample(&set);
+        if bytes > crate::pipeline::MAX_GBUFFER_BYTES_PER_SAMPLE {
+            return Err(RenderError::Lighting {
+                material: String::new(),
+                error: format!(
+                    "the G-buffer layout for {} needs {bytes} bytes per sample; the \
+                     most a pass may carry is {} — drop a model that requests a target",
+                    set.signature(),
+                    crate::pipeline::MAX_GBUFFER_BYTES_PER_SAMPLE
+                ),
+            });
+        }
+        self.config.lighting = set;
+        self.rebuild();
+        Ok(())
+    }
+
+    /// The lighting models currently enabled.
+    pub fn lighting(&self) -> &LightingSet {
+        &self.config.lighting
+    }
+
+    /// Enable material features for the deferred path, by name.
+    ///
+    /// Each feature asks for a G-buffer channel beside the lighting set's
+    /// own, so the deferred pass list is rebuilt — and every
+    /// material must have been resolved against the same plan (a material
+    /// carrying a different set of channels is a named error when the
+    /// frame is compiled). A material whose graph pins a feature's macro
+    /// while its pipeline does not carry the channel is the same error
+    /// from the other side.
+    ///
+    /// Only a stock pass list is rebuilt. One installed with
+    /// [`Renderer::set_graph`] was compiled against the old plan, so the
+    /// caller recompiles and reinstalls it; a swap still in flight was too,
+    /// so a stock one lands now and any other is dropped.
+    pub fn set_features(&mut self, names: &[&str]) -> Result<(), RenderError> {
+        let features = wxsl_core::lighting::feature_requests(names).map_err(|error| {
+            RenderError::Lighting {
+                material: String::new(),
+                error: error.to_string(),
+            }
+        })?;
+        let plan = self
+            .config
+            .lighting
+            .plan(&features)
+            .map_err(|error| RenderError::Lighting {
+                material: String::new(),
+                error: error.to_string(),
+            })?;
+        let bytes = crate::pipeline::gbuffer_layout_bytes_per_sample(plan.layout());
+        if bytes > crate::pipeline::MAX_GBUFFER_BYTES_PER_SAMPLE {
+            return Err(RenderError::Lighting {
+                material: String::new(),
+                error: format!(
+                    "the G-buffer layout with {names:?} needs {bytes} bytes per sample; the \
+                     most a pass may carry is {} — drop a feature or a model that requests a \
+                     target",
+                    crate::pipeline::MAX_GBUFFER_BYTES_PER_SAMPLE
+                ),
+            });
+        }
+        self.config.features = features;
+        if let Some(swap) = self.swap.take() {
+            if swap.pipeline.is_some() {
+                self.stock = swap.pipeline;
+            }
+        }
+        self.rebuild();
+        Ok(())
+    }
+
+    /// The material features currently enabled, by name.
+    pub fn features(&self) -> Vec<&'static str> {
+        self.config
+            .features
+            .iter()
+            .map(|request| request.source.name())
+            .collect()
+    }
+
+    /// Every knob this renderer's pass lists are built under — target,
+    /// lighting set, features — as one read-only value. A pipeline
+    /// document compiled against this config is the document this
+    /// renderer runs, which is what makes the editor's pipeline canvas a
+    /// preview by construction rather than by promise: it compiles
+    /// against what it sees here and hands the result to
+    /// [`Renderer::set_graph`].
+    pub fn pipeline_config(&self) -> &PipelineConfig {
+        &self.config
+    }
+
+    /// The device profile this renderer runs under, read off
+    /// its device's limits at creation.
+    pub fn profile(&self) -> crate::Profile {
+        self.config.profile
+    }
+
+    /// The screen effects this renderer can run.
+    pub fn effects(&self) -> &EffectRegistry {
+        &self.effects
+    }
+
+    /// Teach the renderer one more screen effect.
+    ///
+    /// An effect registered here can be named by a pipeline document's
+    /// `pass.screen` nodes and run by the next frame — the pass-level
+    /// version of handing the renderer a shader library. Re-registering an id
+    /// replaces the effect under it.
+    pub fn add_effect(&mut self, effect: crate::effect::Effect) {
+        self.effects.add(effect);
+        self.invalidate_bakes();
+    }
+
+    /// Re-run Once bakes after an in-place source upload or an edited source
+    /// parameter. Replacing an imported view or effect calls this automatically.
+    /// Shader variants and pipelines remain cached.
+    pub fn invalidate_bakes(&mut self) {
+        self.last_run.fill((u64::MAX, (0, 0)));
+    }
+
+    /// Ask for the pass labelled `label` to run on the next frame — the
+    /// `on demand` policy's half of the bargain. The name is
+    /// the pass's label, which is what a pipeline document (or a
+    /// hand-built [`PassDesc`](crate::pass::PassDesc)) calls it; several passes sharing a label
+    /// are all marked.
+    ///
+    /// Marks are consumed when the pass runs, so a mark left while the
+    /// pass list is mid-swap still applies to the pass in the *new* list.
+    pub fn mark_pass(&mut self, label: &str) {
+        self.demanded.insert(label.to_string());
+    }
+
+    /// Hand the renderer a view the *host* owns, for the imported resource
+    /// labelled `label` — a bake table most of all:
+    /// the material created the texture and samples it, and the pass list
+    /// only writes through it, so it rides the frame as an import rather
+    /// than living in the pool.
+    ///
+    /// The label is the resource's, which is the name the scene's bake
+    /// declaration and the pipeline's `resource.color` agree on. Replacing
+    /// the view under one label is allowed; supplying one the current pass
+    /// list declares nothing about is an error at the next frame, by name.
+    /// A view survives a pass-list swap, because whatever owns it outlives
+    /// both.
+    pub fn import_resource(&mut self, label: impl Into<String>, view: wgpu::TextureView) {
+        let label = label.into();
+        if self
+            .imports
+            .iter()
+            .any(|(existing, previous)| *existing == label && previous == &view)
+        {
+            return;
+        }
+        self.imports.retain(|(existing, _)| *existing != label);
+        self.imports.push((label, view));
+        // A changed source invalidates downstream Once bakes. Conservatively
+        // invalidate all policies: imports may feed materials outside the graph.
+        self.invalidate_bakes();
+    }
+
+    /// Drop the view supplied for `label`, if there is one — the other
+    /// half of unloading whatever created it.
+    pub fn remove_import(&mut self, label: &str) {
+        self.imports.retain(|(existing, _)| *existing != label);
+    }
+
+    /// How many times the pass labelled `label` has actually run since
+    /// the current pass list was set — the observable answer to "did the
+    /// once-only bake run, and did it run once?" A pass of policy
+    /// `per frame` in an ordinary frame counts up with the frame count.
+    ///
+    /// The count resets only when the pass list itself is replaced; a
+    /// reallocation re-runs a `once` pass and the count climbs past its
+    /// old value, which is how the re-run is observable.
+    pub fn pass_run_count(&self, label: &str) -> Option<u32> {
+        let index = self.graph.passes().iter().position(|p| p.label == label)?;
+        self.runs.get(index).copied()
+    }
+
+    /// How many draws the pass labelled `label` issued last frame — the
+    /// picture-side half of [`Self::pass_run_count`]. A pass whose layer
+    /// filter admitted nothing, or whose light casts no shadow, runs and
+    /// draws nothing; the peel's per-object budget is visible
+    /// here rather than in the run counts, because the peel passes still
+    /// run — they just carry the draws that asked for layers.
+    pub fn pass_draw_count(&self, label: &str) -> Option<u32> {
+        let index = self.graph.passes().iter().position(|p| p.label == label)?;
+        self.drawn.get(index).copied()
+    }
+
+    /// How many triangles the pass labelled `label` drew last frame,
+    /// over every draw it issued.
+    pub fn pass_triangle_count(&self, label: &str) -> Option<u64> {
+        let index = self.graph.passes().iter().position(|p| p.label == label)?;
+        self.triangles.get(index).copied()
+    }
+
+    /// How many draw calls the pass labelled `label` issued last frame:
+    /// [`Self::pass_draw_count`]'s draws, with each instanced run of
+    /// identical draws counted once.
+    pub fn pass_call_count(&self, label: &str) -> Option<u32> {
+        let index = self.graph.passes().iter().position(|p| p.label == label)?;
+        self.calls.get(index).copied()
+    }
+
+    /// Measure every pass's GPU time with timestamp queries, or stop.
+    /// Returns whether timings are on: a device without
+    /// `TIMESTAMP_QUERY` has none to give (WebGPU may withhold it; WebGL2
+    /// has no equivalent), and reports that rather than zeros.
+    pub fn set_pass_timing(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        on: bool,
+    ) -> bool {
+        self.timer = if on {
+            PassTimer::new(device, queue, self.graph.passes().len())
+        } else {
+            None
+        };
+        self.timer.is_some()
+    }
+
+    /// The GPU time, in milliseconds, of the pass labelled `label` in the
+    /// last frame read back — a frame or two behind the picture, because
+    /// the readback never waits. `None` when timing is off, the pass did
+    /// not run in that frame, or nothing has been read back yet. Passes
+    /// sharing a label are summed.
+    pub fn pass_time(&self, label: &str) -> Option<f32> {
+        let timings = self.timer.as_ref()?.timings();
+        self.graph
+            .passes()
+            .iter()
+            .zip(timings)
+            .filter(|(pass, _)| pass.label == label)
+            .filter_map(|(_, time)| *time)
+            .reduce(|sum, time| sum + time)
+    }
+
+    /// The GPU time of every timed pass of the last frame read back, in
+    /// milliseconds, summed — `None` when nothing has been read back.
+    pub fn frame_time(&self) -> Option<f32> {
+        self.timer
+            .as_ref()?
+            .timings()
+            .iter()
+            .flatten()
+            .copied()
+            .reduce(|sum, time| sum + time)
+    }
+
+    /// Fresh run bookkeeping: nothing has run, every `once` and
+    /// `on resize` pass is due. Called on a new pass list, and by the
+    /// editor's policy inspector as its reset — the counterpart of
+    /// [`Self::mark_pass`]'s "run now", and the way a `once` bake is made
+    /// due again without replacing the pass list.
+    pub fn reset_runs(&mut self) {
+        if let Some(timer) = self.timer.as_mut() {
+            timer.clear();
+        }
+        self.runs = vec![0; self.graph.passes().len()];
+        self.last_run = vec![(u64::MAX, (0, 0)); self.graph.passes().len()];
+        self.shadow_cache.clear();
+        self.sync_pass_params();
+    }
+
+    /// Redraw every static shadow next frame: for casters that
+    /// changed shape, which the cache cannot see.
+    pub fn invalidate_static_shadows(&mut self) {
+        self.shadow_cache.clear();
+    }
+
+    /// The pipeline that writes the far plane over one shadow tile.
+    fn shadow_clear_pipeline(
+        &self,
+        device: &wgpu::Device,
+    ) -> Result<wgpu::RenderPipeline, RenderError> {
+        let extra: [(&str, std::borrow::Cow<'_, str>); 0] = [];
+        let wgsl = crate::variants::compile(
+            &self.library,
+            &extra,
+            abi::SHADOW_CLEAR_MODULE,
+            &wxsl_core::macros::MacroSet::new(),
+        )?;
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("wxsl shadow clear"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(wgsl)),
+        });
+        Ok(
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("wxsl shadow clear"),
+                layout: None,
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some(abi::SHADOW_CLEAR_VERTEX_ENTRY),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: None,
+                primitive: Default::default(),
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: crate::types::WgpuType::to_wgpu(crate::pass::DEPTH_FORMAT),
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Always),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                multiview_mask: None,
+                cache: None,
+            }),
+        )
+    }
+
+    /// One parameter block per pass whose effect declares parameters,
+    /// keyed by pass label, with values starting at the descriptor's
+    /// declared defaults — a pipeline renders as authored before the
+    /// application has set anything, which is the material parameters'
+    /// rule again. Re-created only when the declaration's *layout*
+    /// changes or the pass list authors other values for the pass, so a
+    /// re-registered effect that kept its knobs, or a pass list re-applied
+    /// unchanged, keeps the values set since, while one that asks for new
+    /// values gets them; a block whose pass is gone is dropped.
+    ///
+    /// Device-free on purpose: values are host data, and keeping this off
+    /// the device lets it run where the pass list lands rather than where
+    /// a frame does. The uniform buffer itself is created at the next
+    /// upload.
+    fn sync_pass_params(&mut self) {
+        for pass in self.graph.passes() {
+            let effect_id = match &pass.kind {
+                PassKind::Screen { effect } | PassKind::Compute { effect } => effect,
+                PassKind::Geometry { .. } => continue,
+            };
+            let Some(known) = self.effects.get_on(self.config.profile, effect_id) else {
+                // `compile_frame` reports the unknown effect by name; the
+                // parameter blocks are not the place for it.
+                continue;
+            };
+            if known.parameters.is_empty() {
+                continue;
+            }
+            let layout = known.param_layout();
+            // Invalid authored values are reported before recording by
+            // set_graph/compile_frame, also after effect replacement.
+            let authored = known
+                .initial_parameters(&pass.parameters)
+                .unwrap_or_else(|_| known.initial_parameters(&Default::default()).unwrap());
+            let stale = self.pass_params.get(&pass.label).is_none_or(|existing| {
+                existing.layout.signature() != layout.signature() || existing.authored != authored
+            });
+            if stale {
+                self.pass_params.insert(
+                    pass.label.clone(),
+                    PassParamBlock {
+                        layout,
+                        data: authored.clone(),
+                        authored,
+                        buffer: None,
+                        dirty: true,
+                    },
+                );
+            }
+        }
+        self.pass_params
+            .retain(|label, _| self.graph.passes().iter().any(|pass| pass.label == *label));
+    }
+
+    /// Set one of the parameters the effect behind the pass labelled
+    /// `pass` declares. The name is the pass's label — the same name
+    /// [`Self::mark_pass`] and [`Self::pass_run_count`] go by — and the parameter's
+    /// name is the descriptor's.
+    ///
+    /// A buffer write and nothing else: no variant is recompiled, no
+    /// pipeline is rebuilt, and `cache_stats()` does not move, which is
+    /// the whole point of a parameter being a uniform instead of a
+    /// `const`. The GPU sees the new value at the next
+    /// [`Renderer::render`].
+    pub fn set_pass_param(
+        &mut self,
+        pass: &str,
+        name: &str,
+        value: Value,
+    ) -> Result<(), RenderError> {
+        let Some(block) = self.pass_params.get_mut(pass) else {
+            return Err(RenderError::EffectParameter {
+                pass: pass.to_string(),
+                name: name.to_string(),
+                reason: "this pass runs no effect with parameters (or there is no such pass); \
+                         the label is the pass's, spelled as `mark_pass` spells it"
+                    .to_string(),
+            });
+        };
+        block
+            .layout
+            .write(&mut block.data, name, value)
+            .map_err(|reason| RenderError::EffectParameter {
+                pass: pass.to_string(),
+                name: name.to_string(),
+                reason: reason.to_string(),
+            })?;
+        block.dirty = true;
+        Ok(())
+    }
+
+    /// The current value of one pass parameter, read back through the
+    /// same offsets [`Renderer::set_pass_param`] wrote it at — what a
+    /// slider shows.
+    pub fn pass_param(&self, pass: &str, name: &str) -> Option<Value> {
+        let block = self.pass_params.get(pass)?;
+        block.layout.read(&block.data, name)
+    }
+
+    /// The parameters the pass labelled `pass` can be tuned by, laid out,
+    /// or `None` when its effect declares none. A caller enumerating
+    /// sliders wants this beside the defaults on
+    /// [`Renderer::effects`].
+    pub fn pass_parameter_layout(&self, pass: &str) -> Option<&BufferLayout> {
+        Some(&self.pass_params.get(pass)?.layout)
+    }
+
+    /// The stock pipeline in use, or `None` when an application supplied
+    /// its own pass list.
+    pub fn pipeline(&self) -> Option<StockPipeline> {
+        self.stock
+    }
+
+    /// Switch pipeline now.
+    ///
+    /// Whatever the new pass list needs and the cache does not have is
+    /// compiled during the next [`Renderer::render`], which is a hitch on
+    /// the first swap. [`Renderer::request_pipeline`] is the version that
+    /// does not stutter.
+    pub fn set_pipeline(&mut self, pipeline: StockPipeline) {
+        if self.stock == Some(pipeline) {
+            return;
+        }
+        self.stock = Some(pipeline);
+        self.swap = None;
+        self.rebuild();
+    }
+
+    /// The pass list being run.
+    pub fn render_graph(&self) -> &RenderGraph {
+        &self.graph
+    }
+
+    /// Scale the environment's radiance (the ambient, its reflections,
+    /// the background and refraction through it) by `scale` from the next
+    /// frame, without installing the pass list again. Installing one
+    /// brings back its own environment scale.
+    pub fn set_environment_scale(&mut self, scale: f32) {
+        self.graph.set_environment_scale(scale);
+    }
+
+    /// Run `graph` instead of a stock pass list, now.
+    ///
+    /// Validated immediately: a pass list that cannot be ordered is an
+    /// error here rather than a `wgpu` complaint mid-frame.
+    pub fn set_graph(&mut self, graph: impl Into<RenderGraph>) -> Result<(), RenderError> {
+        let graph = graph.into();
+        for pass in graph.passes() {
+            self.check_profile(pass)?;
+            if !pass.parameters.is_empty() {
+                let effect = match &pass.kind {
+                    PassKind::Screen { effect } | PassKind::Compute { effect } => {
+                        self.effects.get_on(self.config.profile, effect)
+                    }
+                    PassKind::Geometry { .. } => None,
+                };
+                let result = effect
+                    .ok_or_else(|| "this pass has no registered effect".to_string())
+                    .and_then(|effect| effect.initial_parameters(&pass.parameters));
+                result.map_err(|reason| RenderError::EffectParameter {
+                    pass: pass.label.clone(),
+                    name: "initial values".into(),
+                    reason,
+                })?;
+            }
+        }
+        self.schedule = graph.schedule()?;
+        self.graph = graph;
+        self.stock = None;
+        self.swap = None;
+        self.reset_runs();
+        Ok(())
+    }
+
+    /// Refuse a pass the device profile cannot run: what the
+    /// document compiler already refuses, checked again here for pass
+    /// lists built by hand or compiled for another profile.
+    fn check_profile(&self, pass: &crate::pass::PassDesc) -> Result<(), RenderError> {
+        let profile = self.config.profile;
+        let (PassKind::Screen { effect } | PassKind::Compute { effect }) = &pass.kind else {
+            return Ok(());
+        };
+        let native_only = self
+            .effects
+            .get(effect.as_str())
+            .is_some_and(|known| known.downlevel == crate::effect::Downlevel::NativeOnly);
+        let unlowered = matches!(pass.kind, PassKind::Compute { .. }) && !profile.compute;
+        if (native_only && !profile.is_full()) || unlowered {
+            return Err(RenderError::NativeOnly {
+                pass: pass.label.clone(),
+                effect: effect.clone(),
+                profile,
+            });
+        }
+        Ok(())
+    }
+
+    fn rebuild(&mut self) {
+        let Some(stock) = self.stock else { return };
+        self.graph = stock.graph(&self.config).into();
+        self.schedule = self
+            .graph
+            .schedule()
+            .expect("the stock pass lists schedule at every size; a test checks it");
+        self.reset_runs();
+    }
+
+    /// Switch to `pipeline` once its shaders are ready, without stuttering.
+    ///
+    /// Compiles whatever `materials` will need and the cache does not have
+    /// on a worker thread; the current pipeline keeps presenting until
+    /// every one has arrived, at which point the swap lands in a single
+    /// frame. Poll it with [`Renderer::render`] (which does it for you) or
+    /// [`Renderer::poll_swap`], and watch it with
+    /// [`Renderer::swap_progress`].
+    ///
+    /// Requesting a swap replaces any swap already in flight, which is
+    /// what a user clicking twice means.
+    pub fn request_pipeline(
+        &mut self,
+        pipeline: StockPipeline,
+        materials: &[&Material],
+    ) -> Result<(), RenderError> {
+        let graph = pipeline.graph(&self.config);
+        self.request_graph_inner(graph.into(), Some(pipeline), materials)
+    }
+
+    /// The same, for a pass list an application built itself.
+    pub fn request_graph(
+        &mut self,
+        graph: impl Into<RenderGraph>,
+        materials: &[&Material],
+    ) -> Result<(), RenderError> {
+        self.request_graph_inner(graph.into(), None, materials)
+    }
+
+    fn request_graph_inner(
+        &mut self,
+        graph: RenderGraph,
+        pipeline: Option<StockPipeline>,
+        materials: &[&Material],
+    ) -> Result<(), RenderError> {
+        let schedule = graph.schedule()?;
+        let requests = self.variant_requests(&graph, materials, true);
+        // Nothing to wait for: adopting it now is not a stutter, it is the
+        // whole swap. This is the second swap between two pipelines, the
+        // one the stage-keyed cache makes free.
+        if requests.is_empty() {
+            self.graph = graph;
+            self.schedule = schedule;
+            self.stock = pipeline;
+            self.swap = None;
+            self.reset_runs();
+            return Ok(());
+        }
+        self.swap = Some(PipelineSwap::start(
+            graph,
+            schedule,
+            pipeline,
+            &self.library,
+            requests,
+        ));
+        Ok(())
+    }
+
+    /// Everything `graph` will ask of `materials`, once each — only what
+    /// is not compiled yet when `missing` is set.
+    fn variant_requests(
+        &self,
+        graph: &RenderGraph,
+        materials: &[&Material],
+        missing: bool,
+    ) -> Vec<Request> {
+        let mut requests: Vec<Request> = Vec::new();
+        let mut seen = Vec::new();
+        let push = |request: Request, seen: &mut Vec<_>, out: &mut Vec<Request>| {
+            let key = request.key();
+            // Two passes wanting the same stage of the same material is
+            // ordinary — a shadow pass and a depth prepass will be exactly
+            // that — and compiling it twice would be a waste and a
+            // progress count that never reaches its total.
+            if (missing && self.variants.contains(&key)) || seen.contains(&key) {
+                return;
+            }
+            seen.push(key);
+            out.push(request);
+        };
+        for pass in graph.passes() {
+            match &pass.kind {
+                PassKind::Geometry { stage, .. } => {
+                    for material in materials {
+                        push(
+                            Request::Material(MaterialRequest::new(material, *stage)),
+                            &mut seen,
+                            &mut requests,
+                        );
+                    }
+                }
+                PassKind::Screen { effect } | PassKind::Compute { effect } => {
+                    // An effect this renderer does not know cannot be
+                    // requested — and cannot be compiled later either, so
+                    // `compile_frame` is where the named error fires. A
+                    // *known* one is requested once per macro set, which
+                    // is what a swap waits on.
+                    if let Some(known) = self.effects.get_on(self.config.profile, effect) {
+                        for material in materials {
+                            push(
+                                Request::Effect(EffectRequest::new(
+                                    known.clone(),
+                                    material.macros(),
+                                    &self.config.lighting,
+                                    &self.config.features,
+                                )),
+                                &mut seen,
+                                &mut requests,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        requests
+    }
+
+    /// How far a requested swap has got, or `None` when none is in flight.
+    pub fn swap_progress(&self) -> Option<SwapProgress> {
+        self.swap.as_ref().map(PipelineSwap::progress)
+    }
+
+    /// Collect whatever the background compile has finished, and land the
+    /// swap if it is all there.
+    ///
+    /// [`Renderer::render`] calls this, so an application that renders
+    /// every frame need not. Call it directly to advance a swap while
+    /// nothing is being drawn.
+    pub fn poll_swap(&mut self, device: &wgpu::Device) -> Result<(), RenderError> {
+        let Some(swap) = self.swap.as_mut() else {
+            return Ok(());
+        };
+        for compiled in swap.drain() {
+            match compiled.wgsl {
+                Ok(wgsl) => {
+                    if let Err(error) =
+                        self.variants
+                            .insert(device, compiled.key, compiled.label, wgsl)
+                    {
+                        self.swap = None;
+                        return Err(error);
+                    }
+                }
+                Err(error) => {
+                    // The new pipeline cannot be built. Keep presenting
+                    // the old one and hand the error up, rather than
+                    // swapping to something that will fail every frame.
+                    self.swap = None;
+                    return Err(error);
+                }
+            }
+        }
+        if swap.is_stalled() {
+            self.swap = None;
+            return Err(RenderError::SwapAbandoned);
+        }
+        if swap.is_complete() {
+            let swap = self.swap.take().expect("checked just above");
+            self.graph = swap.graph;
+            self.schedule = swap.schedule;
+            self.stock = swap.pipeline;
+            self.reset_runs();
+        }
+        Ok(())
+    }
+
+    /// Somewhere to put `material`'s uniform parameters, textures and
+    /// samplers.
+    ///
+    /// Starts at the values the graph's `param` nodes declared; a texture
+    /// or sampler the graph declares has to be bound before the material
+    /// can draw, and [`MaterialBindings::upload`] names any that were
+    /// not. Hand the result to a draw with
+    /// [`DrawItem::with_bindings`].
+    ///
+    /// One per *object*, not one per material, whenever two objects
+    /// sharing a material want different values — that is the whole
+    /// reason these are not owned by the [`Material`].
+    pub fn material_bindings(
+        &mut self,
+        device: &wgpu::Device,
+        material: &Material,
+    ) -> MaterialBindings {
+        let interface = material.interface();
+        let layouts = self.layouts.layouts(device, interface);
+        // A material declaring nothing still gets bindings, with an empty
+        // layout: it keeps the caller from having to ask whether it needs
+        // any, and an empty bind group is never bound.
+        let layout = match layouts.material.as_ref() {
+            Some(layout) => layout.clone(),
+            None => device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("wxsl material (empty)"),
+                entries: &[],
+            }),
+        };
+        MaterialBindings::new(device, interface, &layout)
+    }
+
+    /// The layout of the block `material` expects the application to
+    /// supply, or `None` if it expects none.
+    ///
+    /// The application creates its own buffer and bind group against
+    /// this, and hands the group back on the draw
+    /// ([`DrawItem::with_user`]). What is in it is never this crate's
+    /// business; `wgpu` is what checks the two agree.
+    pub fn user_layout(
+        &mut self,
+        device: &wgpu::Device,
+        material: &Material,
+    ) -> Option<&wgpu::BindGroupLayout> {
+        self.layouts
+            .layouts(device, material.interface())
+            .user
+            .as_ref()
+    }
+
+    /// The current target size and format.
+    pub fn target(&self) -> TargetConfig {
+        self.config.target.into()
+    }
+
+    /// Resize the render targets.
+    pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
+        self.config.target = wxsl_frame::pipeline::TargetDesc {
+            width: width.max(1),
+            height: height.max(1),
+            ..self.config.target
+        };
+        self.rebuild();
+        self.pool
+            .configure(device, &self.schedule, self.config.target.into());
+    }
+
+    /// The shader library imports are resolved against.
+    pub fn library(&self) -> &ShaderLibrary {
+        &self.library
+    }
+
+    /// Compile, with no device, every shader the running pass list asks
+    /// of `materials` against `library` instead of this renderer's own,
+    /// and return each failure as `label: error` — the check a hot reload
+    /// runs before [`Renderer::set_library`], so a broken edit is reported
+    /// while the last working library keeps rendering.
+    pub fn check_library(&self, library: &ShaderLibrary, materials: &[&Material]) -> Vec<String> {
+        if let Err(error) = library.check_abi() {
+            return vec![error.to_string()];
+        }
+        self.variant_requests(&self.graph, materials, false)
+            .iter()
+            .filter_map(|request| {
+                let compiled = request.compile(library);
+                compiled
+                    .wgsl
+                    .err()
+                    .map(|error| format!("{}: {error}", compiled.label))
+            })
+            .collect()
+    }
+
+    /// Replace the shader library, dropping every compiled variant and
+    /// pipeline: a variant's key hashes its root source, not what it
+    /// imports, so an edited module would otherwise keep its stale WGSL.
+    /// Once bakes run again. Check first with [`Renderer::check_library`].
+    pub fn set_library(&mut self, library: ShaderLibrary) -> Result<(), RenderError> {
+        library.check_abi()?;
+        self.library = library;
+        self.variants.clear();
+        self.pipelines.clear();
+        self.invalidate_bakes();
+        Ok(())
+    }
+
+    /// Variant cache hit/miss counts — how often a pipeline or macro switch
+    /// actually cost a compile.
+    pub fn cache_stats(&self) -> CacheStats {
+        self.variants.stats()
+    }
+
+    /// Number of shader variants compiled so far.
+    pub fn variant_count(&self) -> usize {
+        self.variants.len()
+    }
+
+    /// Number of `wgpu` pipelines built so far — one per (variant, pass
+    /// state, target formats).
+    pub fn pipeline_count(&self) -> usize {
+        self.pipelines.len()
+    }
+
+    /// Replace the host-owned spotlight cookie array without recompiling.
+    /// Use a filterable RGBA D2Array view; white is open, black masked,
+    /// RGB tints the emitted light and alpha attenuates it.
+    pub fn set_light_cookies(&mut self, device: &wgpu::Device, view: Option<&wgpu::TextureView>) {
+        self.bindings.set_light_cookies(device, view);
+    }
+
+    /// The frame group's buffers, for a caller that wants to know what a
+    /// frame cost: how many instance row shapes it carried, and how many
+    /// rows fit before the next reallocation.
+    pub fn frame_bindings(&self) -> &FrameBindings {
+        &self.bindings
+    }
+
+    /// Every stage the active pass list draws with, in pass order.
+    pub fn stages(&self) -> Vec<MaterialStage> {
+        let mut stages = Vec::new();
+        for pass in self.graph.passes() {
+            if let PassKind::Geometry { stage, .. } = &pass.kind {
+                if !stages.contains(stage) {
+                    stages.push(*stage);
+                }
+            }
+        }
+        stages
+    }
+
+    /// The stage whose module best answers "what did my graph become on
+    /// this pipeline" — the one that writes colour, if any.
+    ///
+    /// A forward pass list has two geometry passes and only the second is
+    /// interesting to read; a code panel showing the depth-only module
+    /// would be technically accurate and useless.
+    pub fn display_stage(&self) -> MaterialStage {
+        let stages = self.stages();
+        stages
+            .iter()
+            .copied()
+            .find(|stage| stage.color_targets() > 0)
+            .or_else(|| stages.first().copied())
+            .unwrap_or_default()
+    }
+
+    /// Compile `material` for every stage the active pass list needs,
+    /// without rendering.
+    ///
+    /// Worth calling ahead of a pipeline switch if a mid-frame compile
+    /// hitch matters; [`Renderer::render`] does it lazily otherwise, and
+    /// [`Renderer::request_pipeline`] does it in the background.
+    pub fn prepare(
+        &mut self,
+        device: &wgpu::Device,
+        material: &Material,
+    ) -> Result<(), RenderError> {
+        for pass in self.graph.passes() {
+            match &pass.kind {
+                PassKind::Geometry { stage, .. } => {
+                    self.variants
+                        .material(device, &self.library, material, *stage)?;
+                }
+                PassKind::Screen { effect } | PassKind::Compute { effect } => {
+                    let known = self
+                        .effects
+                        .get_on(self.config.profile, effect)
+                        .ok_or_else(|| RenderError::UnknownEffect {
+                            effect: effect.clone(),
+                        })?;
+                    self.variants.effect(
+                        device,
+                        &self.library,
+                        known,
+                        material.macros(),
+                        &self.config.lighting,
+                        &self.config.features,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The WGSL `material` compiles to on this pipeline's display stage.
+    ///
+    /// This is the answer to "what did my graph actually become", which is
+    /// most of shader-graph debugging.
+    pub fn material_wgsl(
+        &mut self,
+        device: &wgpu::Device,
+        material: &Material,
+    ) -> Result<String, RenderError> {
+        self.material_wgsl_for(device, material, self.display_stage())
+    }
+
+    /// The WGSL `material` compiles to for one particular stage.
+    pub fn material_wgsl_for(
+        &mut self,
+        device: &wgpu::Device,
+        material: &Material,
+        stage: MaterialStage,
+    ) -> Result<String, RenderError> {
+        let variant = self
+            .variants
+            .material(device, &self.library, material, stage)?;
+        Ok(variant.wgsl.clone())
+    }
+
+    /// Select the specular environment-BRDF LUT. UE4 is the default.
+    /// A changed choice is baked before the next frame; materials need no
+    /// recompilation. Applications must refresh cached shaded captures.
+    pub fn set_brdf_lut(&mut self, model: crate::effect::ibl::BrdfLut) {
+        self.brdf_lut = model;
+    }
+
+    /// Bake the environment-BRDF table into the frame group for this model.
+    ///
+    /// Run before any pass on the first frame and when the model changes.
+    /// Each variant is a pure function of its coordinates, so its table
+    /// remains valid until another model is selected.
+    ///
+    /// The table belongs to the renderer and must exist for every pipeline —
+    /// including a hand-built one that never heard of it — since every
+    /// material's ambient term reads it.
+    fn bake_environment_lut(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Result<(), RenderError> {
+        if !self.bindings.needs_environment_bake() && self.baked_brdf_lut == Some(self.brdf_lut) {
+            return Ok(());
+        }
+        let effect = crate::effect::BRDF_LUT;
+        if !self.config.profile.compute {
+            return self.bake_environment_lut_in_fragments(device, queue, &effect);
+        }
+        let EffectKind::Compute { entry, workgroups } = effect.kind else {
+            unreachable!("the shipped LUT bake is a compute effect");
+        };
+        let request = EffectRequest::new(
+            effect,
+            &wxsl_core::macros::MacroSet::new(),
+            &self.config.lighting,
+            &self.config.features,
+        )
+        .pinned(&self.brdf_lut.macros());
+        let variant = self
+            .variants
+            .effect_request(device, &self.library, request)?;
+
+        // The shape the bake's one `@group(3) @binding(0)` output wants —
+        // the same `PassBinding` a `pass.compute` would have produced, so
+        // the pipeline cache keys it the same way.
+        let format = wgpu::TextureFormat::Rgba16Float;
+        let shape = [PassBinding::StorageTexture {
+            format,
+            view_dimension: wgpu::TextureViewDimension::D2,
+        }];
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("wxsl environment bake"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                },
+                count: None,
+            }],
+        });
+        let view = self.bindings.environment_lut_view();
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("wxsl environment bake"),
+            layout: &layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            }],
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("wxsl environment bake"),
+        });
+        {
+            let pipeline = self
+                .pipelines
+                .compute(device, Some(&layout), &variant, entry, &shape);
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("wxsl environment bake"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(abi::GROUP_PASS, &group, &[]);
+            pass.dispatch_workgroups(workgroups[0], workgroups[1], workgroups[2]);
+        }
+        queue.submit([encoder.finish()]);
+        self.bindings.mark_environment_baked();
+        self.baked_brdf_lut = Some(self.brdf_lut);
+        Ok(())
+    }
+
+    /// The same bake through the effect's fragment arm, for a device
+    /// without compute: one fullscreen triangle into the
+    /// table, each fragment storing the texel the compute invocation at
+    /// its coordinate would have. The arm binds nothing, so the pipeline's
+    /// layout is the shader's own — empty.
+    fn bake_environment_lut_in_fragments(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        effect: &crate::effect::Effect,
+    ) -> Result<(), RenderError> {
+        let arm = effect.on(&self.config.profile).into_owned();
+        let EffectKind::Screen {
+            vertex_entry,
+            fragment_entry,
+        } = arm.kind
+        else {
+            unreachable!("the shipped LUT bake declares a fragment arm");
+        };
+        let request = EffectRequest::new(
+            arm,
+            &wxsl_core::macros::MacroSet::new(),
+            &self.config.lighting,
+            &self.config.features,
+        )
+        .pinned(&self.brdf_lut.macros());
+        let variant = self
+            .variants
+            .effect_request(device, &self.library, request)?;
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("wxsl environment bake"),
+            layout: None,
+            vertex: wgpu::VertexState {
+                module: &variant.module,
+                entry_point: Some(vertex_entry),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &variant.module,
+                entry_point: Some(fragment_entry),
+                targets: &[Some(wgpu::TextureFormat::Rgba16Float.into())],
+                compilation_options: Default::default(),
+            }),
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let view = self.bindings.environment_lut_view();
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("wxsl environment bake"),
+        });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("wxsl environment bake"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.draw(0..3, 0..1);
+        }
+        queue.submit([encoder.finish()]);
+        self.bindings.mark_environment_baked();
+        self.baked_brdf_lut = Some(self.brdf_lut);
+        Ok(())
+    }
+
+    /// The edge of the installed pass list's shadow atlas, if it has one:
+    /// what `Environment::shadow_atlas_size` must say.
+    pub fn shadow_atlas_size(&self) -> Option<u32> {
+        let desc = self.graph.resource_desc(self.graph.shadow_maps()?)?;
+        match desc.shape {
+            wxsl_frame::pass::ResourceShape::Texture {
+                extent: wxsl_frame::pass::Extent::Fixed { width, .. },
+                ..
+            } => Some(width),
+            _ => None,
+        }
+    }
+
+    /// Render one frame.
+    ///
+    /// Advances any pipeline swap in flight, compiles whatever variants the
+    /// pass list needs, uploads the frame bindings and every instance
+    /// transform in one go, then lets the graph order and record the
+    /// passes. Which pipeline ran is invisible from here — that is the
+    /// point.
+    pub fn render(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        request: &RenderRequest<'_>,
+    ) -> Result<(), RenderError> {
+        self.poll_swap(device)?;
+        if let Some(pipeline) = self.shadow_atlas_size() {
+            if pipeline != request.environment.shadow_atlas_size {
+                return Err(RenderError::ShadowAtlasSize {
+                    pipeline,
+                    environment: request.environment.shadow_atlas_size,
+                });
+            }
+        }
+        self.bake_environment_lut(device, queue)?;
+        // A pass list that outgrew the query set gets a bigger one.
+        let passes = self.graph.passes().len();
+        if self
+            .timer
+            .as_ref()
+            .is_some_and(|timer| timer.capacity() < passes)
+        {
+            self.timer = PassTimer::new(device, queue, passes);
+        }
+        if let Some(timer) = self.timer.as_mut() {
+            timer.collect(device, queue);
+        }
+        // Last frame's draw counts are last frame's; this frame's are
+        // what the compile below selects.
+        self.drawn = vec![0; self.graph.passes().len()];
+        self.triangles = vec![0; self.graph.passes().len()];
+        self.calls = vec![0; self.graph.passes().len()];
+        // Before the plan, because a reallocated pool lost the shadow
+        // atlas, and with it every tile the cache would keep.
+        self.pool
+            .configure(device, &self.schedule, self.config.target.into());
+        if self.shadow_generation != self.pool.generation() {
+            self.shadow_cache.clear();
+            self.shadow_generation = self.pool.generation();
+        }
+        // The static shadows this frame keeps. A library
+        // without the clearing triangle keeps none and redraws them all.
+        let kept = if self.library.contains(abi::SHADOW_CLEAR_MODULE) {
+            self.shadow_cache.plan(request.environment)
+        } else {
+            ShadowFrame::default()
+        };
+        if kept.keeps_any() && self.shadow_clear.is_none() {
+            self.shadow_clear = Some(self.shadow_clear_pipeline(device)?);
+        }
+        let plan = self.compile_frame(device, request.environment, request.draws, &kept)?;
+
+        // One row per draw, in every shape the frame's materials asked
+        // for — and the place a draw that forgot a declared per-instance
+        // attribute is told so, before a pass is opened.
+        let rows = request.draws.instance_rows()?;
+        self.bindings.set_environment_scale(
+            self.graph
+                .environment_maps()
+                .map(|_| self.graph.environment_scale()),
+        );
+        self.bindings.keep_shadow_tiles(kept.clone());
+        self.bindings.update(
+            device,
+            queue,
+            request.environment,
+            &request.draws.transforms(),
+            &request.draws.previous_transforms(),
+            &rows,
+        );
+        // The pass parameters, for the passes whose effects declare any:
+        // a block's buffer exists from its first upload on, and what
+        // changed since last frame is what gets written. Eight slider
+        // moves cost eight buffer writes and no compile — that is the
+        // point of a parameter being a uniform.
+        for block in self.pass_params.values_mut() {
+            if block.buffer.is_none() {
+                block.buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("wxsl effect params"),
+                    size: block.data.len() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+                block.dirty = true;
+            }
+            if let (true, Some(buffer)) = (block.dirty, block.buffer.as_ref()) {
+                queue.write_buffer(buffer, 0, &block.data);
+                block.dirty = false;
+            }
+        }
+        if let Some(maps) = self.graph.environment_maps() {
+            let slots = maps.map(|map| {
+                self.schedule
+                    .slot(map, self.pool.frame(), 0)
+                    .expect("scheduled environment")
+            });
+            let views = slots.map(|slot| self.pool.slot_view(slot).expect("allocated environment"));
+            self.bindings.set_environment_maps(
+                device,
+                Some((self.pool.generation(), slots)),
+                Some(views),
+            );
+        } else {
+            self.bindings.set_environment_maps(device, None, None);
+        }
+        // The cubes some passes bind in place of those.
+        let mut overrides: Vec<[crate::pass::ResourceId; 2]> = Vec::new();
+        for environment in self
+            .graph
+            .passes()
+            .iter()
+            .filter_map(|pass| pass.environment)
+        {
+            if !overrides.contains(&environment) {
+                overrides.push(environment);
+            }
+        }
+        let (schedule, pool) = (&self.schedule, &self.pool);
+        let slots: Vec<[usize; 2]> = overrides
+            .iter()
+            .map(|maps| {
+                maps.map(|map| {
+                    schedule
+                        .slot(map, pool.frame(), 0)
+                        .expect("scheduled environment override")
+                })
+            })
+            .collect();
+        let views = overrides
+            .iter()
+            .zip(&slots)
+            .map(|(maps, slots)| {
+                (
+                    *maps,
+                    slots.map(|slot| {
+                        pool.slot_view(slot)
+                            .expect("allocated environment override")
+                    }),
+                )
+            })
+            .collect();
+        self.bindings
+            .set_environment_overrides(device, (pool.generation(), slots), views);
+        // After the pool, because this is the one resource read from
+        // outside the pass list: the frame group binds it, so the renderer
+        // is what carries the view across (`abi::BINDING_SHADOW_MAPS`).
+        if let Some(maps) = self.graph.shadow_maps() {
+            if let Some(slot) = self.schedule.slot(maps, self.pool.frame(), 0) {
+                if let Some(view) = self.pool.slot_view(slot) {
+                    self.bindings
+                        .set_shadow_maps(device, (self.pool.generation(), slot), view);
+                }
+            }
+        }
+
+        // Which passes run this frame: the execution policies, decided.
+        // `ran` is "ran since the pool last allocated" — a
+        // reallocation destroyed every slot's contents, so a `once` pass
+        // bakes again; `size_changed` is what `on resize` adds.
+        let generation = self.pool.generation();
+        let size = (self.config.target.width, self.config.target.height);
+        let mut run = vec![false; self.graph.passes().len()];
+        for (index, pass) in self.graph.passes().iter().enumerate() {
+            // A kept tile's pass is left out, its last drawing kept.
+            if let PassView::Shadow { tile } = pass.view {
+                if kept.keeps(tile as usize) {
+                    continue;
+                }
+            }
+            let demanded = if pass.policy == Policy::OnDemand {
+                self.demanded.remove(&pass.label)
+            } else {
+                false
+            };
+            let (ran, size_changed) = {
+                let last = self.last_run[index];
+                (last.0 == generation, last.1 != size)
+            };
+            if pass.policy.due(ran, size_changed, demanded) {
+                run[index] = true;
+                self.runs[index] += 1;
+                self.last_run[index] = (generation, size);
+            }
+        }
+
+        // The host-owned imports, resolved against the current pass list
+        // before the field borrows below: a label nothing declares is an
+        // error by name, because the thing that supplied the view and the
+        // thing that writes the resource have to agree that the resource
+        // exists.
+        let mut imports: Vec<(ResourceId, &wgpu::TextureView)> =
+            vec![(RenderGraph::TARGET, request.view)];
+        for (label, view) in &self.imports {
+            let Some(id) = self.graph.resource_by_label(label) else {
+                return Err(RenderError::UnknownResource {
+                    name: label.clone(),
+                });
+            };
+            imports.push((id, view));
+        }
+
+        // Destructured so the recording closure can hold the pipeline
+        // cache mutably while the graph, the pool and the effect registry
+        // are borrowed alongside it. The parameter blocks are borrowed
+        // beside them, by label, for the graph's pass groups.
+        let Renderer {
+            bindings,
+            layouts,
+            pipelines,
+            pool,
+            graph,
+            schedule,
+            effects,
+            timer,
+            ..
+        } = self;
+        let pass_params = &self.pass_params;
+        let profile = self.config.profile;
+        let wireframe = self.wireframe;
+
+        // A pass drawing *into* the shadow maps must not also have them
+        // bound, so which of the two frame groups it gets is decided from
+        // what it writes.
+        let shadow_maps = graph.shadow_maps();
+        let environment_maps = graph.environment_maps();
+        // On a frame that keeps a tile, the atlas is never cleared whole:
+        // its clear becomes a load, and each claimed tile drawn clears its
+        // own rect first.
+        let shadow_clear = self.shadow_clear.as_ref().filter(|_| kept.keeps_any());
+        let claimed = request.environment.shadow_tiles().len();
+        let passes = graph.passes();
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("wxsl frame"),
+        });
+        let timestamps = timer.as_ref().and_then(PassTimer::queries);
+        let timed = timestamps.is_some();
+        let mut probe = self
+            .probe_at
+            .take()
+            .map(|at| crate::probe::TexelProbe::new(device, at, graph.resources()));
+        graph.record(
+            device,
+            &mut encoder,
+            schedule,
+            pool,
+            &imports,
+            &|index| run[index],
+            &|index| {
+                shadow_clear.is_some()
+                    && passes[index]
+                        .depth
+                        .is_some_and(|depth| Some(depth.resource) == shadow_maps)
+            },
+            &|pass| {
+                pass_params.get(&pass.label).and_then(|block| {
+                    block
+                        .buffer
+                        .as_ref()
+                        .map(|buffer| (buffer, block.layout.size()))
+                })
+            },
+            timestamps.map(|queries| (queries, timer.as_ref().map_or(0, PassTimer::capacity))),
+            probe.as_mut(),
+            |pass, encoder| {
+                let shadows = if environment_maps
+                    .is_some_and(|maps| pass.desc.written().any(|id| maps.contains(&id)))
+                {
+                    ShadowMaps::Detached
+                } else {
+                    match shadow_maps {
+                        Some(maps) if pass.desc.written().any(|id| id == maps) => {
+                            ShadowMaps::Detached
+                        }
+                        _ => ShadowMaps::Bound,
+                    }
+                };
+                let clear_tile = shadow_clear.filter(|_| {
+                    matches!(pass.desc.view, PassView::Shadow { tile } if (tile as usize) < claimed)
+                });
+                record_pass(
+                    device,
+                    bindings,
+                    layouts,
+                    pipelines,
+                    effects,
+                    profile,
+                    &plan,
+                    request.draws,
+                    pass,
+                    shadows,
+                    wireframe,
+                    clear_tile,
+                    encoder,
+                )
+            },
+        )?;
+        queue.submit([encoder.finish()]);
+        if let (true, Some(timer)) = (timed, timer.as_mut()) {
+            timer.written(&run);
+        }
+        if let Some(probe) = probe {
+            self.probed = Some(probe.read(device));
+        }
+        Ok(())
+    }
+
+    /// Probe the next frame at `at`, a fraction of the target (0..1, y
+    /// down): every 2D texture a pass writes is read there right after
+    /// the pass. The frame waits for the GPU once.
+    pub fn probe(&mut self, at: [f32; 2]) {
+        self.probe_at = Some(at);
+    }
+
+    /// Whether the device can draw the wireframe view.
+    pub fn supports_wireframe(&self) -> bool {
+        self.line_mode
+    }
+
+    /// Rasterize every geometry pass that renders from the camera as
+    /// lines, shading them as usual, or go back to filled triangles.
+    /// Returns whether wireframe is on: a device without
+    /// `POLYGON_MODE_LINE` stays filled.
+    pub fn set_wireframe(&mut self, on: bool) -> bool {
+        self.wireframe = on && self.line_mode;
+        self.wireframe
+    }
+
+    /// Whether the camera's geometry passes are drawn as lines.
+    pub fn wireframe(&self) -> bool {
+        self.wireframe
+    }
+
+    /// What the probed frame read, once it has rendered, in resource
+    /// order: the textures that frame's passes wrote. The imported target
+    /// is not among them.
+    pub fn take_probed(&mut self) -> Option<Vec<crate::probe::ProbedTexel>> {
+        self.probed.take()
+    }
+
+    /// Compile every shader variant this frame's pass list will ask for.
+    ///
+    /// Up front rather than inside the recording closure, because the
+    /// closure already holds the pipeline cache and the variant cache is
+    /// the one thing that may have to *compile* — which is where a frame
+    /// can fail, and failing before a pass is opened is the difference
+    /// between an error and a half-recorded encoder.
+    fn compile_frame(
+        &mut self,
+        device: &wgpu::Device,
+        environment: &Environment,
+        draws: &DrawList<'_>,
+        kept: &ShadowFrame,
+    ) -> Result<FramePlan, RenderError> {
+        let mut plan = FramePlan::default();
+        let views = environment.views();
+        let tiles = environment.shadow_tiles();
+        let lights = environment.uniform_lights();
+        for (index, pass) in self.graph.passes().iter().enumerate() {
+            if let PassKind::Screen { effect } | PassKind::Compute { effect } = &pass.kind {
+                if let Some(known) = self.effects.get_on(self.config.profile, effect) {
+                    known
+                        .initial_parameters(&pass.parameters)
+                        .map_err(|reason| RenderError::EffectParameter {
+                            pass: pass.label.clone(),
+                            name: "initial values".into(),
+                            reason,
+                        })?;
+                }
+            }
+            match &pass.kind {
+                PassKind::Geometry { source, stage } => {
+                    // A shadow pass built for a tile no light claimed this
+                    // frame draws nothing at all. Its tile is still
+                    // cleared to the far plane, which reads as "lit" —
+                    // the same answer as an empty shadow map, for the cost
+                    // of a clear rather than of a pass list rebuilt every
+                    // time the application moves a light.
+                    // A kept static tile draws nothing either,
+                    // and is not even cleared.
+                    let mut casters = None;
+                    if let PassView::Shadow { tile } = pass.view {
+                        let Some(owner) = tiles.get(tile as usize) else {
+                            plan.geometry.insert(index, Vec::new());
+                            continue;
+                        };
+                        if kept.keeps(tile as usize) {
+                            plan.geometry.insert(index, Vec::new());
+                            continue;
+                        }
+                        casters = Some(&lights[owner.light as usize].shadow_casters);
+                    }
+                    let mut selected: Vec<u32> = match source {
+                        // A shadow pass draws its light's casters only.
+                        DrawSource::Scene(selector) => draws
+                            .select(selector)
+                            .filter(|(_, item)| {
+                                casters.is_none_or(|casters| casters.matches(item.tags))
+                            })
+                            .map(|(index, _)| index)
+                            .collect(),
+                        DrawSource::Indirect { draw, .. } => vec![*draw as u32],
+                    };
+                    // The transparency tier: a pass takes only
+                    // the draws its layer filter admits. The sorted tier
+                    // (max_layers = 0) never enters a peel pass, and a
+                    // peel iteration skips a draw whose budget it has
+                    // spent — the per-object half of `wxsl_peel_layers`,
+                    // clamped by it.
+                    if pass.layers != LayerFilter::All {
+                        selected.retain(|index| {
+                            let material = &draws.items()[*index as usize].material;
+                            pass.layers.admits(material.max_layers())
+                        });
+                    }
+                    // A draw whose box is outside this pass's view, the
+                    // camera's or its shadow tile's.
+                    if let DrawSource::Scene(_) = source {
+                        let view_proj =
+                            glam::Mat4::from_cols_array_2d(&views[pass.view.slot()].view_proj);
+                        selected.retain(|index| {
+                            draws.items()[*index as usize]
+                                .bounds
+                                .is_none_or(|(min, max)| {
+                                    !wxsl_frame::environment::outside_view(view_proj, min, max)
+                                })
+                        });
+                    }
+                    // The pass's draw order (draw sorting): each draw sorts
+                    // by (its material's render order, camera depth). The
+                    // instance rows are untouched — every recorded draw
+                    // carries its own row index below — so the
+                    // previous-frame rows line up however this pass orders
+                    // its draws, which is what keeps velocity
+                    // chain sound under sorting.
+                    if pass.sort != SortOrder::None {
+                        let eye = environment.camera.eye;
+                        let forward = (environment.camera.target - eye).normalize_or_zero();
+                        // Back to front flips the depth term, not the render
+                        // order: groups still draw in ascending order, far
+                        // before near within each group.
+                        let depth_sign = match pass.sort {
+                            SortOrder::BackToFront => -1.0,
+                            _ => 1.0,
+                        };
+                        let key = |index: u32| {
+                            let item = &draws.items()[index as usize];
+                            (
+                                item.material.render_order(),
+                                depth_sign
+                                    * wxsl_frame::environment::view_depth(
+                                        item.transform.w_axis.truncate(),
+                                        eye,
+                                        forward,
+                                    ),
+                            )
+                        };
+                        selected.sort_by(|a, b| {
+                            let (order_a, depth_a) = key(*a);
+                            let (order_b, depth_b) = key(*b);
+                            (order_a, depth_a)
+                                .partial_cmp(&(order_b, depth_b))
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                    }
+                    let mut variants: Vec<Run> = Vec::with_capacity(selected.len());
+                    for instance in selected {
+                        let item = &draws.items()[instance as usize];
+                        // The next instance of the previous run, drawn
+                        // with everything the run's first draw was: the
+                        // same instanced call, already checked.
+                        if let (DrawSource::Scene(_), Some((run, _))) =
+                            (source, variants.last_mut())
+                        {
+                            if run.end == instance
+                                && same_draw(&draws.items()[run.start as usize], item)
+                            {
+                                run.end += 1;
+                                continue;
+                            }
+                        }
+                        // The other half of the shadow story, and the one
+                        // that is a *selection*: a material that casts no
+                        // shadow is simply not drawn into one. Filtered
+                        // here rather than while recording, so it does not
+                        // compile a variant it will never draw.
+                        if *stage == MaterialStage::SHADOW && !item.material.cast_shadow() {
+                            continue;
+                        }
+                        // Before anything is recorded: a mesh that cannot
+                        // supply what the material declares is an error
+                        // naming all three, not a `wgpu` complaint about
+                        // vertex buffer 4 and not a frame that draws
+                        // whatever was left bound at that slot.
+                        // The material's G-buffer module was generated for
+                        // the layout of the set it was compiled against;
+                        // drawing it under a different set would be a
+                        // `wgpu` complaint about a fragment target count
+                        // with no mention of either set. Caught here, by
+                        // name, before anything is recorded.
+                        if item.material.lighting().set() != &self.config.lighting {
+                            return Err(RenderError::Lighting {
+                                material: item.material.name.clone(),
+                                error: format!(
+                                    "compiled against lighting set {}, but the renderer                                      enables {}",
+                                    item.material.lighting().set().signature(),
+                                    self.config.lighting.signature()
+                                ),
+                            });
+                        }
+                        // The same for feature channels: the material's
+                        // G-buffer struct has a field per channel of the
+                        // plan it was resolved against.
+                        if item.material.lighting().features() != self.config.features.as_slice() {
+                            return Err(RenderError::Lighting {
+                                material: item.material.name.clone(),
+                                error: format!(
+                                    "compiled with feature channels {:?}, but the renderer \
+                                     enables {:?}",
+                                    item.material
+                                        .lighting()
+                                        .features()
+                                        .iter()
+                                        .map(|request| request.source.name())
+                                        .collect::<Vec<_>>(),
+                                    self.config
+                                        .features
+                                        .iter()
+                                        .map(|request| request.source.name())
+                                        .collect::<Vec<_>>()
+                                ),
+                            });
+                        }
+                        // The other side of that — a material pinning a
+                        // feature's macro while its plan carries no channel
+                        // for it — is checked where the material is
+                        // *resolved* rather than here: that is
+                        // the earliest point the demand exists, and a
+                        // material resolved against a plan that answers it
+                        // cannot reach this frame carrying a different one
+                        // without failing the comparison above.
+                        item.mesh.check_attributes(
+                            &item.material.name,
+                            item.material.vertex_attributes(),
+                        )?;
+                        let variant =
+                            self.variants
+                                .material(device, &self.library, item.material, *stage)?;
+                        variants.push((instance..instance + 1, variant));
+                    }
+                    self.drawn[index] = variants.iter().map(|(run, _)| run.len() as u32).sum();
+                    // A double-sided run in a blended pass is two calls.
+                    self.calls[index] = variants
+                        .iter()
+                        .map(|(run, _)| {
+                            let material = draws.items()[run.start as usize].material;
+                            pass.state.sides(material.double_sided()).count() as u32
+                        })
+                        .sum();
+                    self.triangles[index] = variants
+                        .iter()
+                        .map(|(run, _)| {
+                            run.len() as u64
+                                * u64::from(
+                                    draws.items()[run.start as usize].mesh.index_count() / 3,
+                                )
+                        })
+                        .sum();
+                    plan.geometry.insert(index, variants);
+                }
+                PassKind::Screen { effect } | PassKind::Compute { effect } => {
+                    // An effect has no material graph, but it does have
+                    // the macro set the materials were built with — the
+                    // lighting pass's shading function has `@if`s of its
+                    // own (the debug-normal view, the shadow lookup), so
+                    // it is compiled under the same set. An effect that
+                    // ships its own source is not (see `effect_macros`).
+                    let known = self
+                        .effects
+                        .get_on(self.config.profile, effect)
+                        .ok_or_else(|| RenderError::UnknownEffect {
+                            effect: effect.clone(),
+                        })?;
+                    let macros = draws
+                        .items()
+                        .first()
+                        .map(|item| item.material.macros().clone())
+                        .unwrap_or_default();
+                    let variant = self.variants.effect(
+                        device,
+                        &self.library,
+                        known.clone(),
+                        &macros,
+                        &self.config.lighting,
+                        &self.config.features,
+                    )?;
+                    if known.is_compute() {
+                        plan.compute.insert(index, (known, variant));
+                    } else {
+                        plan.screen.insert(index, variant);
+                    }
+                }
+            }
+        }
+        Ok(plan)
+    }
+}
+
+/// Instance rows drawn by one call, and the variant they are drawn with.
+type Run = (Range<u32>, Arc<ShaderVariant>);
+
+/// The shader variants one frame's passes need, resolved before recording.
+#[derive(Default)]
+struct FramePlan {
+    /// Per geometry pass: the draws it issues, as runs of instance rows
+    /// drawn by one call, with the variant each run is drawn with.
+    geometry: HashMap<usize, Vec<Run>>,
+    /// Per screen pass: its shader.
+    screen: HashMap<usize, Arc<ShaderVariant>>,
+    /// Per compute pass: its effect and shader — the effect carries the
+    /// entry point and workgroup count the dispatch needs.
+    compute: HashMap<usize, (Effect, Arc<ShaderVariant>)>,
+}
+
+/// Whether `next` can be drawn as one more instance of `first`'s call: the
+/// same mesh, material and bind groups. What differs per instance is in
+/// the instance rows.
+fn same_draw(first: &DrawItem<'_>, next: &DrawItem<'_>) -> bool {
+    fn same<T>(a: Option<&T>, b: Option<&T>) -> bool {
+        match (a, b) {
+            (Some(a), Some(b)) => std::ptr::eq(a, b),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+    std::ptr::eq(first.mesh, next.mesh)
+        && std::ptr::eq(first.material, next.material)
+        && same(first.bindings, next.bindings)
+        && same(first.user, next.user)
+}
+
+/// Issue one pass's work into the encoder the graph opened.
+#[allow(clippy::too_many_arguments)]
+fn record_pass(
+    device: &wgpu::Device,
+    bindings: &FrameBindings,
+    layouts: &mut BindingLayouts,
+    pipelines: &mut PipelineCache,
+    effects: &EffectRegistry,
+    profile: crate::Profile,
+    plan: &FramePlan,
+    draws: &DrawList<'_>,
+    pass: &RecordedPass<'_>,
+    shadows: ShadowMaps,
+    wireframe: bool,
+    clear_tile: Option<&wgpu::RenderPipeline>,
+    encoder: PassEncoder<'_, '_>,
+) -> Result<(), RenderError> {
+    let index = pass.index;
+    match (&pass.desc.kind, encoder) {
+        (PassKind::Geometry { source, stage }, PassEncoder::Render(render)) => {
+            // The far plane over this tile, before its casters, on a frame
+            // whose atlas was loaded rather than cleared.
+            if let Some(pipeline) = clear_tile {
+                render.set_pipeline(pipeline);
+                render.draw(0..3, 0..1);
+            }
+            let Some(entries) = plan.geometry.get(&index) else {
+                return Ok(());
+            };
+            // Every camera pass alike, so a prepass's depth matches the
+            // lines the forward pass draws; shadows stay filled.
+            pipelines.set_lines(wireframe && pass.desc.view == PassView::Camera);
+            // Which point of view this pass renders from, as the dynamic
+            // offset of the frame group's camera binding. Zero for
+            // everything but a shadow pass, so the mechanism is invisible
+            // to a pipeline that has none.
+            let view = &[bindings.view_offset(pass.desc.view)];
+            let environment = pass.desc.environment;
+            render.set_bind_group(
+                abi::GROUP_FRAME,
+                bindings.bind_group_in(shadows, environment),
+                view,
+            );
+            if let Some(group) = pass.pass_bind_group.as_ref() {
+                render.set_bind_group(abi::GROUP_PASS, group, &[]);
+            }
+            // Group 0 is bound once above and rebound only when the
+            // instance row *shape* changes, which for a frame whose
+            // materials declare the same per-instance attributes — the
+            // usual frame, and every frame with none — is never.
+            let mut bound_shape: Option<&str> = None;
+            for (run, variant) in entries {
+                let item = &draws.items()[run.start as usize];
+                let shape = item.material.instance_signature();
+                if bound_shape != Some(shape) {
+                    render.set_bind_group(
+                        abi::GROUP_FRAME,
+                        bindings.instance_group_in(shape, shadows, environment),
+                        view,
+                    );
+                    bound_shape = Some(shape);
+                }
+                let groups = layouts.layouts(device, item.material.interface());
+                // Once per side the material draws in this pass, with the
+                // state for that side: one call for nearly
+                // every draw, two for a double-sided one that blends.
+                for state in pass.desc.state.sides(item.material.double_sided()) {
+                    let pipeline = pipelines.geometry(
+                        device,
+                        bindings.layout(),
+                        &MaterialGroups {
+                            vertex: item.material.vertex_attributes(),
+                            material: groups.material.as_ref(),
+                            user: groups.user.as_ref(),
+                            signature: item.material.signature(),
+                        },
+                        pass.pass_layout.as_ref(),
+                        variant,
+                        item.material.shader(*stage).fragment_entry.as_deref(),
+                        state,
+                        &pass.color_formats,
+                        &pass.pass_bindings,
+                    );
+                    render.set_pipeline(pipeline);
+                    // Groups 1 and 2 are the material's — one it fills and one
+                    // it only describes — and both are per draw, because the
+                    // resources behind them are the application's.
+                    if groups.material.is_some() {
+                        let group = item
+                            .bindings
+                            .and_then(MaterialBindings::bind_group)
+                            .ok_or_else(|| RenderError::MissingDrawBindings {
+                                material: item.material.name.clone(),
+                                group: "material",
+                            })?;
+                        render.set_bind_group(abi::GROUP_MATERIAL, group, &[]);
+                    }
+                    if groups.user.is_some() {
+                        let group = item.user.ok_or_else(|| RenderError::MissingDrawBindings {
+                            material: item.material.name.clone(),
+                            group: "user",
+                        })?;
+                        render.set_bind_group(abi::GROUP_USER, group, &[]);
+                    }
+                    item.mesh
+                        .bind_attributes(render, item.material.vertex_attributes());
+                    match source {
+                        DrawSource::Scene(_) => {
+                            item.mesh.draw_instances(render, run.clone());
+                        }
+                        DrawSource::Indirect {
+                            buffer: _,
+                            offset,
+                            count,
+                            ..
+                        } => {
+                            // One call per record rather than
+                            // `multi_draw_indexed_indirect`, which is a native
+                            // extension: the point here is that the draw path
+                            // is the same, not that it is already optimal.
+                            item.mesh.bind(render);
+                            for record in 0..u64::from(*count) {
+                                render.draw_indexed_indirect(
+                                    pass.indirect_buffer
+                                        .as_ref()
+                                        .expect("record resolved the indirect buffer"),
+                                    offset + record * 20,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        (PassKind::Screen { effect }, PassEncoder::Render(render)) => {
+            let variant = plan
+                .screen
+                .get(&index)
+                .ok_or_else(|| RenderError::UnknownEffect {
+                    effect: effect.clone(),
+                })?;
+            // The entry points are the effect's, not the ABI's: the
+            // pipeline is built from whichever module the effect mounted.
+            let known =
+                effects
+                    .get_on(profile, effect)
+                    .ok_or_else(|| RenderError::UnknownEffect {
+                        effect: effect.clone(),
+                    })?;
+            // A fullscreen triangle, from the vertex index, or the
+            // sprites' budget.
+            let (vertex_entry, fragment_entry, vertices, instances) = match known.kind {
+                EffectKind::Screen {
+                    vertex_entry,
+                    fragment_entry,
+                } => (vertex_entry, fragment_entry, 3, 1),
+                EffectKind::Sprites {
+                    vertex_entry,
+                    fragment_entry,
+                    vertices,
+                    instances,
+                } => (vertex_entry, fragment_entry, vertices, instances),
+                EffectKind::Compute { .. } => {
+                    return Err(RenderError::UnknownEffect {
+                        effect: effect.clone(),
+                    })
+                }
+            };
+            let pipeline = pipelines.screen(
+                device,
+                bindings.layout(),
+                pass.pass_layout.as_ref(),
+                variant,
+                vertex_entry,
+                fragment_entry,
+                pass.desc.state,
+                &pass.color_formats,
+                &pass.pass_bindings,
+            );
+            render.set_pipeline(pipeline);
+            render.set_bind_group(
+                abi::GROUP_FRAME,
+                bindings.bind_group_in(shadows, pass.desc.environment),
+                &[bindings.view_offset(pass.desc.view)],
+            );
+            if let Some(group) = pass.pass_bind_group.as_ref() {
+                render.set_bind_group(abi::GROUP_PASS, group, &[]);
+            }
+            render.draw(0..vertices, 0..instances);
+        }
+        (PassKind::Compute { effect }, PassEncoder::Compute(compute)) => {
+            let (known, variant) =
+                plan.compute
+                    .get(&index)
+                    .ok_or_else(|| RenderError::UnknownEffect {
+                        effect: effect.clone(),
+                    })?;
+            let EffectKind::Compute { entry, workgroups } = known.kind else {
+                return Err(RenderError::UnknownEffect {
+                    effect: effect.clone(),
+                });
+            };
+            // No frame group: a compute effect declares only `@group(3)`,
+            // and the pipeline layout was built to say so.
+            let pipeline = pipelines.compute(
+                device,
+                pass.pass_layout.as_ref(),
+                variant,
+                entry,
+                &pass.pass_bindings,
+            );
+            compute.set_pipeline(pipeline);
+            if let Some(group) = pass.pass_bind_group.as_ref() {
+                compute.set_bind_group(abi::GROUP_PASS, group, &[]);
+            }
+            compute.dispatch_workgroups(workgroups[0], workgroups[1], workgroups[2]);
+        }
+        _ => unreachable!("the graph opens the encoder its pass kind calls for"),
+    }
+    Ok(())
+}
+
+/// A draw list holding one object, for the common single-mesh case.
+///
+/// The editor's material preview and the `pbr_cube` demo both draw exactly
+/// one thing, and making them each build a list by hand would be ceremony
+/// for its own sake.
+pub fn single_draw<'a>(item: DrawItem<'a>) -> DrawList<'a> {
+    core::iter::once(item).collect()
+}

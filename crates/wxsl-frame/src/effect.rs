@@ -1,0 +1,2324 @@
+//! Shared effects as first-class units: the pass-level twin of what a node is to
+//! a material.
+//!
+//! Before this module, a screen pass ran one of an enum's variants — and
+//! the enum had one variant, `ScreenShader::DeferredLighting`, reachable
+//! only by editing `wxsl-render`. An effect is now *data*, like everything
+//! else a pipeline is made of: what it reads, the shader it runs, the
+//! entry points to build a pipeline from.
+//! The pipeline compiler validates a
+//! `pass.screen` node against the registry's declarations; the renderer
+//! compiles and runs the shader they name. An application adds an effect
+//! with `wxsl_render::Renderer::add_effect` and a document names it by `effect` id —
+//! passes, like shaders before them, are addable without touching
+//! `wxsl-render` (the rule, extended).
+//!
+//! # What an effect declares, and who reads it
+//!
+//! [`Effect::inputs`] is the contract both sides compile against, in
+//! binding order: the compiler turns each wired socket into that many
+//! pass-group reads, and the shader declares a `@group(3) @binding(n)`
+//! per input in the same order. The lighting effect shades a G-buffer —
+//! one texture per layout target, then depth; bloom takes one image.
+//!
+//! [`Effect::parameters`] is the tunable half of the same contract:
+//! name and default per knob, laid out by `wxsl-core`'s uniform-layout
+//! computer into one block the pass group binds after the inputs and the
+//! outputs. The struct the shader reads is *generated* from the
+//! declaration and appended to the module when it compiles — the
+//! material parameters' one-spelling rule, pass-level — and the variant
+//! key folds the layout, never the values, so a slider is a buffer write.
+//!
+//! # The shipped effects
+//!
+//! [`EffectRegistry::shipped`] carries the migrated deferred lighting
+//! pass — the first effect, generated from the enabled lighting set
+//! exactly as it always was — [`TONEMAP`], the display transform every
+//! stock chain now ends in, and bloom, the proof that the mechanism is
+//! real: a post effect over an image input, wired into a pipeline as a
+//! document edit, which is what makes an effect *chain* expressible for
+//! the first time (shading into a `resource.color`, bloom over it, the
+//! tonemap's `into` left unconnected so *it* writes the frame's target).
+//! Two further effects ship as descriptors but stay out of the registry:
+//! [`BRDF_LUT`] and [`LUT_VIEW`], the execution-policy proof
+//! — an application registers them with `Renderer::add_effect` exactly as
+//! it would its own.
+
+use std::borrow::Cow;
+use std::sync::Arc;
+
+use wxsl_core::abi;
+use wxsl_core::codegen::{self, GeneratedShader, ScreenOptions};
+use wxsl_core::error::CodegenError;
+use wxsl_core::graph::Graph;
+use wxsl_core::identity;
+use wxsl_core::lighting::{ChannelRequest, LightingSet};
+use wxsl_core::macros::MacroSet;
+use wxsl_core::node::{NodeDefinition, NodeRegistry, SettingDef, Socket, Value, ValueType};
+use wxsl_core::pipeline::{self as doc, SETTING_POLICY};
+use wxsl_core::resources::BufferLayout;
+use wxsl_core::wxsl::WxslIdent;
+
+/// Environment conversion and convolution recipes.
+pub mod glare;
+pub mod ibl;
+pub mod particles;
+pub mod planar;
+pub mod refraction;
+pub mod ssr;
+pub mod sun;
+
+/// Module path the shipped bloom effect's shader is mounted under.
+pub const BLOOM_MODULE: &str = "package::wxsl::bloom";
+/// Module path the horizontal half of the separable bloom is mounted under.
+pub const BLOOM_X_MODULE: &str = "package::wxsl::bloom_x";
+/// Module path the vertical half of the separable bloom is mounted under.
+pub const BLOOM_Y_MODULE: &str = "package::wxsl::bloom_y";
+/// Module path the bloom pyramid's thresholding extract is mounted under.
+pub const BLOOM_EXTRACT_MODULE: &str = "package::wxsl::bloom_extract";
+/// Module path one level of the bloom pyramid's descent is mounted under.
+pub const BLOOM_DOWN_MODULE: &str = "package::wxsl::bloom_down";
+/// Module path one level of the bloom pyramid's ascent is mounted under.
+pub const BLOOM_UP_MODULE: &str = "package::wxsl::bloom_up";
+/// Module path the bloom pyramid's composite is mounted under.
+pub const BLOOM_COMBINE_MODULE: &str = "package::wxsl::bloom_combine";
+/// Module path the depth-of-field circle-of-confusion pass is mounted under.
+pub const DOF_COC_MODULE: &str = "package::wxsl::dof_coc";
+/// Module path the depth-of-field far-field blur is mounted under.
+pub const DOF_FAR_MODULE: &str = "package::wxsl::dof_far";
+/// Module path the depth-of-field near-field composite is mounted under.
+pub const DOF_NEAR_MODULE: &str = "package::wxsl::dof_near";
+/// Module path the shipped tonemap effect's shader is mounted under.
+pub const TONEMAP_MODULE: &str = "package::wxsl::tonemap";
+/// Module path the BRDF-LUT bake's shader is mounted under.
+pub const BRDF_LUT_MODULE: &str = "package::wxsl::brdf_lut";
+/// Module path the LUT bake's fragment arm is mounted under.
+pub const BRDF_LUT_FRAGMENT_MODULE: &str = "package::wxsl::brdf_lut_fragment";
+/// Module path the LUT viewer's shader is mounted under.
+pub const LUT_VIEW_MODULE: &str = "package::wxsl::lut_view";
+/// Module path the baseline peel-window update is mounted under.
+pub const PEEL_BOUNDS_MODULE: &str = "package::wxsl::peel_bounds";
+/// Module path the native peel-window update is mounted under.
+pub const PEEL_DEPTH_BOUNDS_MODULE: &str = "package::wxsl::peel_depth_bounds";
+/// Module path the peel composite is mounted under.
+pub const PEEL_COMPOSITE_MODULE: &str = "package::wxsl::peel_composite";
+/// Module path the front-to-back peel fold is mounted under.
+pub const PEEL_UNDER_MODULE: &str = "package::wxsl::peel_under";
+/// Module path the back-to-front peel fold is mounted under.
+pub const PEEL_OVER_MODULE: &str = "package::wxsl::peel_over";
+
+/// One input an effect consumes.
+///
+/// The `name` is the `pass.screen` socket the document wires — and for a
+/// derived `pass.screen.<effect>` node, the socket's own name — and the
+/// `kind` is what the compiler does with it — the spellings exist
+/// because a G-buffer input expands to one texture per layout target plus
+/// depth, an image is exactly one read, and a buffer one more.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct EffectInput {
+    /// The socket this input is wired through (the `pass.screen` socket in
+    /// a document).
+    pub name: &'static str,
+    /// What the compiler turns the wire into.
+    pub kind: EffectInputKind,
+    /// One line for the palette and for error messages.
+    pub description: &'static str,
+    /// How many frames back this input reads. `0` is this frame's
+    /// contents, which orders the pass after whoever wrote them; anything
+    /// else reads a persistent resource's *history*, and creates no
+    /// ordering edge — the property that makes a temporal technique
+    /// schedulable at all. A resource whose ring is too shallow is the
+    /// scheduler's named error, exactly as a hand-built pass list's would
+    /// be.
+    pub history: u32,
+}
+
+/// The shape of an effect input, and therefore how many pass-group
+/// bindings it becomes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectInputKind {
+    /// The G-buffer: one texture per layout target, then depth — the order
+    /// the generated lighting pass declares its bindings in.
+    GBuffer,
+    /// One colour image, one binding.
+    Image,
+    /// One standard-depth image, typed as a depth target in documents.
+    DepthImage,
+    /// One storage buffer, read as storage — one binding. The reader
+    /// declares `var<storage>` in its shader, so it sees the data the
+    /// writer's compute left there without a copy through a texture.
+    Buffer,
+}
+
+/// What shape a non-attachment output writes: the socket type a document
+/// wires it through.
+///
+/// The *binding* still comes from the wired resource's shape, in the
+/// pass's `writes`, after every input — the shape here types the socket and
+/// is what the pipeline compiler checks the wiring against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectOutputShape {
+    /// A storage buffer — wired from a `resource.buffer`.
+    Buffer,
+    /// A storage texture, written write-only — wired from a
+    /// `resource.color`, whose format is the storage format.
+    StorageTexture,
+}
+
+/// One output an effect writes that is not an attachment: a compute
+/// effect's storage target.
+///
+/// A screen effect writes its attachment and declares no outputs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct EffectOutput {
+    /// The name the output goes by — the `pass.compute.<effect>` output
+    /// socket a document wires.
+    pub name: &'static str,
+    /// What shape of thing the output writes.
+    pub shape: EffectOutputShape,
+    /// One line for the palette and for error messages.
+    pub description: &'static str,
+}
+
+/// One parameter an effect declares: a uniform the host can change without
+/// a recompile — the material parameter's story, pass-level.
+///
+/// The `name` is the struct field the shader reads and how the host
+/// addresses the value; the `default` is both the starting value a fresh
+/// buffer is filled with and the parameter's *type* — `Value` carries one
+/// and implies the other, which is one less way for a descriptor row to
+/// disagree with itself. Bloom's `THRESHOLD` was the `const` this exists to
+/// retire: a re-tune used to be a new descriptor row.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
+pub struct EffectParameter {
+    /// The field name in the generated struct, and how the host sets it.
+    /// A WGSL identifier — it becomes one.
+    pub name: &'static str,
+    /// The starting value, and the type by implication.
+    pub default: Value,
+}
+
+impl EffectParameter {
+    /// The parameter's type.
+    pub fn ty(&self) -> ValueType {
+        self.default.ty()
+    }
+}
+
+/// What work an effect does, and therefore which entry points a `wgpu`
+/// pipeline is built from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectKind {
+    /// One fullscreen triangle, with a vertex and a fragment entry. The
+    /// fragment writes the pass's colour attachment.
+    Screen {
+        /// Vertex entry point (a fullscreen triangle, no vertex buffer).
+        vertex_entry: &'static str,
+        /// Fragment entry point.
+        fragment_entry: &'static str,
+    },
+    /// Sprites: `instances` instances of `vertices` vertices each, with no
+    /// vertex buffer, into the pass's colour attachment like a screen
+    /// effect. The vertex entry places each from `@builtin(instance_index)`
+    /// and `@builtin(vertex_index)` and what it reads of the pass's inputs
+    /// (one per texel of a grid image, say), and moves the ones it has no
+    /// use for off screen; the count is a budget, fixed with the effect,
+    /// so the host needs to know nothing about what it draws.
+    Sprites {
+        /// Vertex entry point.
+        vertex_entry: &'static str,
+        /// Fragment entry point.
+        fragment_entry: &'static str,
+        /// Vertices per instance: 6 for a quad of two triangles.
+        vertices: u32,
+        /// How many instances are drawn.
+        instances: u32,
+    },
+    /// One compute dispatch. The entry is the module's; the workgroup
+    /// count is the effect's own business — it knows its shader's
+    /// `@workgroup_size`, which is why it lives here and not on the pass.
+    /// Indirect dispatch waits for a consumer that needs it.
+    Compute {
+        /// Entry point in the module.
+        entry: &'static str,
+        /// Workgroups in x, y, z.
+        workgroups: [u32; 3],
+    },
+}
+
+/// The shader an effect runs.
+///
+/// Every effect's shader is a WXSL module; the variants are *where the
+/// text comes from*.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EffectShader {
+    /// Generated from the enabled lighting set — the migrated deferred
+    /// lighting pass, mounted under [`abi::LIGHTING_PASS_MODULE`] exactly
+    /// as before. The one effect whose text is not fixed, because a pass
+    /// that dispatches over models has to name them.
+    Lighting,
+    /// A fixed WXSL source owned by the effect, mounted under `path` when
+    /// the variant is compiled. The effect travels with its shader: an
+    /// application's `include_str!` of its own file is the same data.
+    Source {
+        /// Module path to mount the source under.
+        path: &'static str,
+        /// The WXSL text.
+        wxsl: &'static str,
+    },
+    /// Generated from a **graph**: a screen graph or a material subgraph
+    /// used for a bake. Compiled through
+    /// [`wxsl_core::codegen::generate_screen`] or
+    /// [`wxsl_core::codegen::generate_bake`].
+    ///
+    /// The WXSL is generated once, when the effect is built
+    /// ([`Effect::from_graph`]), rather than per compile: generation needs
+    /// a node registry, and an effect descriptor that carried one would be
+    /// a descriptor the renderer had to keep a registry for. What the
+    /// renderer sees afterwards is a module path and some text — which is
+    /// exactly what [`EffectShader::Source`] is, and why nothing
+    /// downstream of the seam had to learn a third case.
+    Graph {
+        /// The authored graph, kept so an editor can open what it shows
+        /// and a document can round-trip it.
+        graph: Arc<Graph>,
+        /// The WXSL generated from it, mounted at `module`.
+        wxsl: Arc<str>,
+        /// The module path the text is mounted under —
+        /// [`wxsl_core::codegen::SCREEN_MODULE`] or
+        /// [`wxsl_core::codegen::BAKE_MODULE`], by what generated it.
+        module: &'static str,
+    },
+}
+
+impl EffectShader {
+    /// Where the text is mounted and what it is, for the compiler.
+    pub fn source(&self) -> Option<(&'static str, std::borrow::Cow<'static, str>)> {
+        match self {
+            EffectShader::Lighting => None,
+            EffectShader::Source { path, wxsl } => Some((path, std::borrow::Cow::Borrowed(*wxsl))),
+            EffectShader::Graph { wxsl, module, .. } => {
+                Some((*module, std::borrow::Cow::Owned(wxsl.to_string())))
+            }
+        }
+    }
+}
+
+/// How an effect runs on a device without compute or storage buffers.
+/// Every effect states it — compute is allowed, but each
+/// compute effect says at landing time what WebGL2 and GL get instead.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Downlevel {
+    /// Runs as declared on every profile: a screen effect over textures,
+    /// checked by the GLSL ES column of the corpus gate.
+    Portable,
+    /// Needs what a downlevel device lacks — compute, storage, a depth
+    /// `textureLoad` — and is refused by name when a pipeline that names
+    /// it is compiled for one.
+    NativeOnly,
+    /// A compute effect's fragment arm: the same inputs and parameters,
+    /// its one storage-texture output written instead as the colour
+    /// attachment of a fullscreen pass. The pipeline compiler lowers the
+    /// compute pass into that screen pass under the same label.
+    Fragment {
+        /// Vertex entry point (a fullscreen triangle).
+        vertex_entry: &'static str,
+        /// Fragment entry point, writing what the compute entry stored.
+        fragment_entry: &'static str,
+        /// The arm's shader, mounted like any effect's.
+        shader: EffectShader,
+    },
+}
+
+/// An effect, as data: what it reads and writes, the shader it runs, the
+/// entry points a `wgpu` pipeline is built from.
+///
+/// `Clone` rather than `Copy`: a descriptor effect is a handful of
+/// `&'static` fields, but a graph-authored one owns its graph and its
+/// generated text behind an [`Arc`], so cloning is a refcount bump rather
+/// than a copy of either.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Effect {
+    /// The id a document's `effect` setting names.
+    pub id: &'static str,
+    /// Display name, for palettes and labels.
+    pub label: &'static str,
+    /// One line for the palette.
+    pub description: &'static str,
+    /// What work the effect does, and its entry points.
+    pub kind: EffectKind,
+    /// The inputs, in pass-group binding order — the contract the
+    /// pipeline compiler validates wiring against and the shader declares
+    /// its `@group(3)` bindings by.
+    pub inputs: &'static [EffectInput],
+    /// The non-attachment writes, in pass-group binding order after the
+    /// inputs — a compute effect's storage targets.
+    pub outputs: &'static [EffectOutput],
+    /// The uniform parameters the host can tune at runtime, laid out by
+    /// [`Effect::param_layout`] into one uniform block at the pass group's
+    /// next binding after the inputs and the outputs.
+    /// Empty for every effect that has no knobs.
+    pub parameters: &'static [EffectParameter],
+    /// Where the shader text comes from.
+    pub shader: EffectShader,
+    /// What a device without compute or storage runs instead.
+    pub downlevel: Downlevel,
+}
+
+impl Effect {
+    /// Pack authored initial values over descriptor defaults, validating names/types.
+    pub fn initial_parameters(
+        &self,
+        values: &std::collections::BTreeMap<String, Value>,
+    ) -> Result<Vec<u8>, String> {
+        let layout = self.param_layout();
+        let defaults = self
+            .parameters
+            .iter()
+            .map(|p| (p.name.to_string(), p.default))
+            .collect();
+        let mut bytes = layout.filled(&defaults);
+        for (name, value) in values {
+            layout
+                .write(&mut bytes, name, *value)
+                .map_err(|e| format!("{name}: {e}"))?;
+        }
+        Ok(bytes)
+    }
+    /// The mounted shader with its computed parameter declarations, shared by backends.
+    pub fn module_source(
+        &self,
+        set: &LightingSet,
+        features: &[ChannelRequest],
+    ) -> (&'static str, Cow<'static, str>) {
+        let (path, source) = self.shader.source().unwrap_or_else(|| {
+            (
+                abi::LIGHTING_PASS_MODULE,
+                Cow::Owned(wxsl_core::lighting::lighting_pass_source(set, features)),
+            )
+        });
+        let header = self.params_header();
+        if header.is_empty() {
+            (path, source)
+        } else {
+            // Imports must precede declarations in WXSL. Module-scope forward
+            // references allow the generated block to follow the owned source.
+            (path, Cow::Owned(format!("{source}\n{header}")))
+        }
+    }
+
+    /// Only generated lighting inherits the material macro set.
+    pub fn shader_macros(&self, macros: &MacroSet) -> MacroSet {
+        match self.shader {
+            EffectShader::Lighting => macros.clone(),
+            EffectShader::Source { .. } | EffectShader::Graph { .. } => MacroSet::new(),
+        }
+    }
+
+    /// Build a screen effect from a screen graph.
+    ///
+    /// The graph is compiled to WXSL here and now, so that a graph that
+    /// does not generate is a failure at registration rather than at the
+    /// first frame that wanted the pass. What comes back is an ordinary
+    /// effect: one image input, the generated module's entry points, and a
+    /// shader the renderer compiles exactly as it compiles a file's.
+    ///
+    /// The one input is fixed because the screen ABI's is
+    /// ([`abi::SCREEN_IMAGE_VAR`]): a graph cannot yet declare what the
+    /// pipeline must wire into it, so it reads the one image every shipped
+    /// screen effect already reads.
+    pub fn from_graph(
+        id: &'static str,
+        label: &'static str,
+        description: &'static str,
+        graph: Graph,
+        registry: &NodeRegistry,
+    ) -> Result<Effect, CodegenError> {
+        let generated: GeneratedShader =
+            codegen::generate_screen(&graph, registry, &ScreenOptions::default())?;
+        Ok(Effect {
+            id,
+            label,
+            description,
+            kind: EffectKind::Screen {
+                vertex_entry: abi::SCREEN_VERTEX_ENTRY,
+                fragment_entry: abi::SCREEN_FRAGMENT_ENTRY,
+            },
+            inputs: SCREEN_GRAPH_INPUTS,
+            outputs: &[],
+            parameters: &[],
+            shader: EffectShader::Graph {
+                graph: Arc::new(graph),
+                wxsl: Arc::from(generated.source),
+                // The nominal mount, not the ABI's own path: the generated
+                // module *imports* `abi::SCREEN_MODULE`, and mounting it
+                // there would be a module importing itself.
+                module: codegen::SCREEN_MODULE,
+            },
+            downlevel: Downlevel::Portable,
+        })
+    }
+
+    /// Build a *bake* effect from a material graph's bake declaration:
+    /// the descriptor's shader is generated from the subgraph the
+    /// declaration names, the way a material module is generated from the
+    /// graph, and the effect is an ordinary compute effect from there on —
+    /// one declared output (the table, wired from a `resource.color` the
+    /// document labels with the declaration's texture name), one dispatch
+    /// whose shape is the table's.
+    ///
+    /// `texture` is the declaration's name — how an application addresses
+    /// a bake without knowing node ids, and the same string the pipeline's
+    /// `resource.color` must be labelled and the host must bind the
+    /// created table under. `macros` are what the module is generated at;
+    /// keep them equal to what the *material* compiles the same subgraph
+    /// under, or the two arms of the toggle disagree.
+    ///
+    /// A graph that does not generate fails here, at registration, rather
+    /// than at the first frame — the cone's purity among the rest.
+    ///
+    /// The graph is borrowed, not taken: the caller almost always keeps it
+    /// — the material is compiled from the same document — and an `Arc`
+    /// behind the descriptor makes sharing free.
+    pub fn from_bake(
+        id: &'static str,
+        label: &'static str,
+        description: &'static str,
+        graph: &Graph,
+        texture: &str,
+        macros: &MacroSet,
+        registry: &NodeRegistry,
+    ) -> Result<Effect, CodegenError> {
+        let decl = graph.bake(texture).ok_or_else(|| {
+            CodegenError::Invalid(wxsl_core::error::GraphErrors(vec![
+                wxsl_core::error::GraphError::InvalidBake {
+                    texture: texture.to_string(),
+                    reason: "no bake declaration names this texture".to_string(),
+                },
+            ]))
+        })?;
+        let generated = codegen::generate_bake(
+            graph,
+            decl,
+            registry,
+            &wxsl_core::codegen::BakeOptions {
+                macros: macros.clone(),
+                ..wxsl_core::codegen::BakeOptions::default()
+            },
+        )?;
+        Ok(Effect {
+            id,
+            label,
+            description,
+            kind: EffectKind::Compute {
+                entry: generated.entry,
+                workgroups: generated.workgroups,
+            },
+            inputs: &[],
+            outputs: &[EffectOutput {
+                name: "bake",
+                shape: EffectOutputShape::StorageTexture,
+                description: "The bake table this effect fills, one value per texel.",
+            }],
+            parameters: &[],
+            shader: EffectShader::Graph {
+                graph: Arc::new(graph.clone()),
+                wxsl: Arc::from(generated.source),
+                module: abi::BAKE_MODULE,
+            },
+            // Generated beside the compute arm from the same value function.
+            downlevel: Downlevel::Fragment {
+                vertex_entry: abi::BAKE_VERTEX_ENTRY,
+                fragment_entry: abi::BAKE_FRAGMENT_ENTRY,
+                shader: EffectShader::Graph {
+                    graph: Arc::new(graph.clone()),
+                    wxsl: Arc::from(generated.fragment_source),
+                    module: abi::BAKE_MODULE,
+                },
+            },
+        })
+    }
+
+    /// The screen graph behind this effect, if it has one.
+    pub fn graph(&self) -> Option<&Graph> {
+        match &self.shader {
+            EffectShader::Graph { graph, .. } => Some(graph),
+            _ => None,
+        }
+    }
+
+    /// Whether this effect declares an input wired through the named
+    /// socket.
+    pub fn declares(&self, socket: &str) -> bool {
+        self.inputs.iter().any(|input| input.name == socket)
+    }
+
+    /// The effect as a device with `profile` runs it: itself, or — on a
+    /// profile without compute — its fragment arm, a screen effect under
+    /// the same id with the same inputs and parameters and no storage
+    /// outputs. Backends call this wherever they turn a pass's
+    /// effect id into a pipeline, so the two arms are never both live.
+    pub fn on(&self, profile: &crate::profile::Profile) -> std::borrow::Cow<'_, Effect> {
+        match &self.downlevel {
+            Downlevel::Fragment {
+                vertex_entry,
+                fragment_entry,
+                shader,
+            } if !profile.compute => std::borrow::Cow::Owned(Effect {
+                kind: EffectKind::Screen {
+                    vertex_entry,
+                    fragment_entry,
+                },
+                outputs: &[],
+                shader: shader.clone(),
+                ..self.clone()
+            }),
+            _ => std::borrow::Cow::Borrowed(self),
+        }
+    }
+
+    /// Whether this is a compute effect — and so whether the pass running
+    /// it dispatches rather than draws.
+    pub fn is_compute(&self) -> bool {
+        matches!(self.kind, EffectKind::Compute { .. })
+    }
+
+    /// Whether this screen effect's wiring fits the fixed `pass.screen`
+    /// socket set: at most one image and at most one buffer, which is all
+    /// that node can name. Effects that do not — TAA's three images, the
+    /// blur's two — are placed as their derived `pass.screen.<id>` row
+    /// instead, whose sockets *are* the declaration, exactly as a compute
+    /// pass's are.
+    pub fn fits_pass_screen(&self) -> bool {
+        let images = self
+            .inputs
+            .iter()
+            .filter(|input| input.kind == EffectInputKind::Image)
+            .count();
+        let buffers = self
+            .inputs
+            .iter()
+            .filter(|input| input.kind == EffectInputKind::Buffer)
+            .count();
+        images <= 1
+            && buffers <= 1
+            && !self
+                .inputs
+                .iter()
+                .any(|input| input.kind == EffectInputKind::DepthImage)
+    }
+
+    /// The parameters, laid out for the uniform block the pass group
+    /// binds: one field per declared parameter, under the same WGSL
+    /// uniform rules every host-shared buffer here follows.
+    ///
+    /// This is the layout computer with its second customer: the
+    /// offsets are computed here and nowhere else — the shader's struct is
+    /// *generated from it* ([`Effect::params_header`]) and the host writes
+    /// *through it*, so there are not two spellings to drift apart. The
+    /// signature of the result is what a variant key folds, and it holds
+    /// names, types and offsets — never values, or every slider would be
+    /// a recompile again.
+    ///
+    /// A parameter's name has to be a WGSL identifier, because it becomes
+    /// a struct field; the descriptor rows are static, reviewed data, so a
+    /// name that is not one is a bug at rest and said so where it sits.
+    pub fn param_layout(&self) -> BufferLayout {
+        let fields = self.parameters.iter().map(|parameter| {
+            (
+                WxslIdent::new(parameter.name).unwrap_or_else(|| {
+                    panic!(
+                        "effect `{}` declares parameter `{}`, which is not a WGSL identifier",
+                        self.id, parameter.name
+                    )
+                }),
+                parameter.ty(),
+            )
+        });
+        BufferLayout::uniform(fields)
+    }
+
+    /// The WGSL declaring the parameter block — struct and `var<uniform>`
+    /// at the pass group's next binding after the inputs and the outputs —
+    /// or an empty string for an effect with no parameters.
+    ///
+    /// Prepended to the module when the variant compiles, so the effect's
+    /// file reads `params.threshold` and never states the struct itself:
+    /// the descriptor is the one declaration, and this text is its shadow.
+    pub fn params_header(&self) -> String {
+        if self.parameters.is_empty() {
+            return String::new();
+        }
+        // The id carries a package segment (`wxsl.bloom`) the shader
+        // cannot spell; the struct names the package with an underscore.
+        let name = self.id.replace('.', "_");
+        let layout = self.param_layout();
+        let mut header = layout.wgsl_struct(&format!("{name}_params"));
+        let _ = std::fmt::Write::write_fmt(
+            &mut header,
+            format_args!(
+                "@group(3) @binding({}) var<uniform> params: {name}_params;\n",
+                self.inputs.len() + self.outputs.len(),
+            ),
+        );
+        header
+    }
+}
+
+/// The inputs every graph-authored screen effect declares: the one image
+/// the screen ABI binds.
+const SCREEN_GRAPH_INPUTS: &[EffectInput] = &[EffectInput {
+    name: "image",
+    kind: EffectInputKind::Image,
+    description: "The image this effect reads, as linear radiance.",
+    history: 0,
+}];
+
+/// The deferred lighting pass, as an effect: the first one, migrated out
+/// of the hardcoded enum it was reachable only through. Its generated
+/// module and its bindings are byte-for-byte what they were.
+pub const DEFERRED_LIGHTING: Effect = Effect {
+    id: "wxsl.deferred_lighting",
+    label: "deferred lighting",
+    description: "Shade the G-buffer with the enabled lighting models.",
+    kind: EffectKind::Screen {
+        vertex_entry: abi::LIGHTING_PASS_VERTEX_ENTRY,
+        fragment_entry: abi::LIGHTING_PASS_FRAGMENT_ENTRY,
+    },
+    inputs: &[EffectInput {
+        name: "gbuffer",
+        kind: EffectInputKind::GBuffer,
+        description: "The G-buffer to shade: every target, then depth.",
+        history: 0,
+    }],
+    outputs: &[],
+    parameters: &[],
+    shader: EffectShader::Lighting,
+    downlevel: Downlevel::Portable,
+};
+
+/// Bloom: glow for the bright parts of an image, the proof that effects
+/// are real units — one descriptor row, one shader file, and any pipeline
+/// document can wire it into a chain. The first effect with parameters:
+/// the three knobs its shader used to `const` into itself are
+/// the descriptor's declaration now, at the same values, so a re-tune is
+/// a buffer write instead of a new row.
+pub const BLOOM: Effect = Effect {
+    id: "wxsl.bloom",
+    label: "bloom",
+    description: "Blur the bright parts of an image and add them back: glow.",
+    kind: EffectKind::Screen {
+        vertex_entry: "bloom_vs",
+        fragment_entry: "bloom_fs",
+    },
+    inputs: &[EffectInput {
+        name: "image",
+        kind: EffectInputKind::Image,
+        description: "The image to glow from, as linear radiance.",
+        history: 0,
+    }],
+    outputs: &[],
+    parameters: &[
+        EffectParameter {
+            name: "threshold",
+            // In linear radiance: diffuse white is the line, and what glows
+            // is what is brighter than a white surface fully lit — which is
+            // what "highlight" means.
+            default: Value::F32(1.0),
+        },
+        EffectParameter {
+            name: "knee",
+            // How far above `threshold` the ramp to "fully kept" runs.
+            default: Value::F32(0.6),
+        },
+        EffectParameter {
+            name: "strength",
+            // How much of the blurred bright signal is added back.
+            default: Value::F32(0.85),
+        },
+    ],
+    shader: EffectShader::Source {
+        path: BLOOM_MODULE,
+        wxsl: include_str!("../shaders/bloom.wxsl"),
+    },
+    downlevel: Downlevel::Portable,
+};
+
+/// The horizontal half of a separable bloom. Thresholds linear radiance and
+/// blurs the bright signal along x. The vertical pass ([`BLOOM_Y`]) finishes
+/// the Gaussian and adds it back; this pass writes the glow alone, so a
+/// document chains the two through a `resource.color`.
+///
+/// The one-pass [`BLOOM`] samples thirteen taps four texels apart, which
+/// stamps rings. This pair samples every texel of a Gaussian, which is the
+/// same halo without the bands.
+pub const BLOOM_X: Effect = Effect {
+    id: "wxsl.bloom_x",
+    label: "bloom horizontal",
+    description: "Threshold an image and blur the bright part horizontally. \
+                  Pair with bloom vertical.",
+    kind: EffectKind::Screen {
+        vertex_entry: "bloom_x_vs",
+        fragment_entry: "bloom_x_fs",
+    },
+    inputs: &[EffectInput {
+        name: "image",
+        kind: EffectInputKind::Image,
+        description: "The image to extract highlights from, as linear radiance.",
+        history: 0,
+    }],
+    outputs: &[],
+    parameters: &[
+        EffectParameter {
+            name: "threshold",
+            default: Value::F32(1.0),
+        },
+        EffectParameter {
+            name: "knee",
+            default: Value::F32(0.6),
+        },
+    ],
+    shader: EffectShader::Source {
+        path: BLOOM_X_MODULE,
+        wxsl: include_str!("../shaders/bloom_x.wxsl"),
+    },
+    downlevel: Downlevel::Portable,
+};
+
+/// The vertical half of a separable bloom, and the composite. Two images —
+/// the unblurred frame and the horizontal pass's glow — so it does not fit
+/// the fixed `pass.screen` socket set; a document places
+/// `pass.screen.wxsl.bloom_y`.
+pub const BLOOM_Y: Effect = Effect {
+    id: "wxsl.bloom_y",
+    label: "bloom vertical",
+    description: "Blur a horizontal bloom along y and add it back onto the image.",
+    kind: EffectKind::Screen {
+        vertex_entry: "bloom_y_vs",
+        fragment_entry: "bloom_y_fs",
+    },
+    inputs: &[
+        EffectInput {
+            name: "color",
+            kind: EffectInputKind::Image,
+            description: "The unblurred image, as linear radiance.",
+            history: 0,
+        },
+        EffectInput {
+            name: "glow",
+            kind: EffectInputKind::Image,
+            description: "The horizontal pass's bright signal.",
+            history: 0,
+        },
+    ],
+    outputs: &[],
+    parameters: &[EffectParameter {
+        name: "strength",
+        default: Value::F32(0.85),
+    }],
+    shader: EffectShader::Source {
+        path: BLOOM_Y_MODULE,
+        wxsl: include_str!("../shaders/bloom_y.wxsl"),
+    },
+    downlevel: Downlevel::Portable,
+};
+
+// The bloom pyramid's four passes. They are the *shape* a `pass.bloom`
+// document node expands to; a document can also wire them by
+// hand, the way BLOOM_X and BLOOM_Y are wired, but the pyramid's
+// level resources and folds are exactly the repetition the node exists
+// to synthesize.
+//
+// The extract thresholds once, at the pyramid's half-resolution head;
+// the down levels are a 13-tap tent (Jimenez 2014); each up level folds the gathered
+// energy of everything below back onto its own level's signal; and the
+// combine adds the assembled glow onto the image. Between the ends the
+// chain carries no knobs — a pyramid is tuned at its extract and its
+// combine, where the glow is cut and where it is weighted.
+
+/// The head of a bloom pyramid: threshold linear radiance and downsample
+/// the bright part 2×2 into the pyramid's half-resolution first level.
+/// The same knee [`BLOOM_X`] uses; the deeper levels take over with
+/// [`BLOOM_DOWN`], which is this pass without the threshold.
+pub const BLOOM_EXTRACT: Effect = Effect {
+    id: "wxsl.bloom_extract",
+    label: "bloom extract",
+    description: "Threshold an image and downsample the bright part 2x — \
+                  the head of a bloom pyramid.",
+    kind: EffectKind::Screen {
+        vertex_entry: "bloom_extract_vs",
+        fragment_entry: "bloom_extract_fs",
+    },
+    inputs: &[EffectInput {
+        name: "image",
+        kind: EffectInputKind::Image,
+        description: "The image to extract highlights from, as linear radiance.",
+        history: 0,
+    }],
+    outputs: &[],
+    parameters: &[
+        EffectParameter {
+            name: "threshold",
+            default: Value::F32(1.0),
+        },
+        EffectParameter {
+            name: "knee",
+            default: Value::F32(0.6),
+        },
+    ],
+    shader: EffectShader::Source {
+        path: BLOOM_EXTRACT_MODULE,
+        wxsl: include_str!("../shaders/bloom_extract.wxsl"),
+    },
+    downlevel: Downlevel::Portable,
+};
+
+/// One level of a bloom pyramid's descent: the 13-tap filter that
+/// takes level *k* down to level *k + 1*. No threshold — the bright
+/// signal was cut once at the extract, and cutting again would discard
+/// the glow the deeper levels exist to widen.
+pub const BLOOM_DOWN: Effect = Effect {
+    id: "wxsl.bloom_down",
+    label: "bloom down",
+    description: "Box-downsample an image 2x — one level of a bloom pyramid.",
+    kind: EffectKind::Screen {
+        vertex_entry: "bloom_down_vs",
+        fragment_entry: "bloom_down_fs",
+    },
+    inputs: &[EffectInput {
+        name: "image",
+        kind: EffectInputKind::Image,
+        description: "The level above, as linear radiance.",
+        history: 0,
+    }],
+    outputs: &[],
+    parameters: &[],
+    shader: EffectShader::Source {
+        path: BLOOM_DOWN_MODULE,
+        wxsl: include_str!("../shaders/bloom_down.wxsl"),
+    },
+    downlevel: Downlevel::Portable,
+};
+
+/// One level of a bloom pyramid's ascent: bilinear the level below back
+/// up and add this level's own signal onto it. Two images — the level
+/// below and this level — so it does not fit the fixed `pass.screen`
+/// socket set; the expansion places `pass.screen.wxsl.bloom_up`.
+pub const BLOOM_UP: Effect = Effect {
+    id: "wxsl.bloom_up",
+    label: "bloom up",
+    description: "Bilinear-upsample the level below and add this level onto it.",
+    kind: EffectKind::Screen {
+        vertex_entry: "bloom_up_vs",
+        fragment_entry: "bloom_up_fs",
+    },
+    inputs: &[
+        EffectInput {
+            name: "low",
+            kind: EffectInputKind::Image,
+            description: "The level below, at half this pass's resolution.",
+            history: 0,
+        },
+        EffectInput {
+            name: "high",
+            kind: EffectInputKind::Image,
+            description: "This level's own signal, from the descent.",
+            history: 0,
+        },
+    ],
+    outputs: &[],
+    parameters: &[],
+    shader: EffectShader::Source {
+        path: BLOOM_UP_MODULE,
+        wxsl: include_str!("../shaders/bloom_up.wxsl"),
+    },
+    downlevel: Downlevel::Portable,
+};
+
+/// The foot of a bloom pyramid, and the composite: add the assembled glow
+/// back onto the image. The input is linear radiance — the glow is light,
+/// and the display transform is somebody else's pass.
+pub const BLOOM_COMBINE: Effect = Effect {
+    id: "wxsl.bloom_combine",
+    label: "bloom combine",
+    description: "Add a bloom pyramid's assembled glow back onto the image.",
+    kind: EffectKind::Screen {
+        vertex_entry: "bloom_combine_vs",
+        fragment_entry: "bloom_combine_fs",
+    },
+    inputs: &[
+        EffectInput {
+            name: "color",
+            kind: EffectInputKind::Image,
+            description: "The unblurred image, as linear radiance.",
+            history: 0,
+        },
+        EffectInput {
+            name: "glow",
+            kind: EffectInputKind::Image,
+            description: "The pyramid's assembled glow, at half this pass's resolution.",
+            history: 0,
+        },
+    ],
+    outputs: &[],
+    parameters: &[EffectParameter {
+        name: "strength",
+        default: Value::F32(0.85),
+    }],
+    shader: EffectShader::Source {
+        path: BLOOM_COMBINE_MODULE,
+        wxsl: include_str!("../shaders/bloom_combine.wxsl"),
+    },
+    downlevel: Downlevel::Portable,
+};
+
+// The depth-of-field chain's three passes — a `pass.dof` document node
+// expands to them (the pattern, the pyramid's second consumer):
+// one pass writes the signed circle of confusion from opaque depth, one
+// blurs the far field by it with the occlusion fade, one dilates the
+// near field and composites it over. Each is wireable by hand, as the
+// bloom pyramid's are.
+
+/// The depth-of-field circle-of-confusion pass: opaque depth in, the
+/// signed blur disc out, in pixels — negative in front of the focus
+/// plane, positive behind. Linearization and the thin-lens algebra live
+/// here, driven by the descriptor's parameters; the palette nodes
+/// `filter.linearize_depth` and `filter.circle_of_confusion` package the
+/// same steps for graphs.
+pub const DOF_COC: Effect = Effect {
+    id: "wxsl.dof_coc",
+    label: "dof circles of confusion",
+    description: "Write the signed blur disc each pixel's depth asks for, in pixels.",
+    kind: EffectKind::Screen {
+        vertex_entry: "dof_coc_vs",
+        fragment_entry: "dof_coc_fs",
+    },
+    inputs: &[EffectInput {
+        name: "depth",
+        kind: EffectInputKind::DepthImage,
+        description: "The opaque depth the discs measure against.",
+        history: 0,
+    }],
+    outputs: &[],
+    parameters: &[
+        EffectParameter {
+            name: "near",
+            default: Value::F32(0.1),
+        },
+        EffectParameter {
+            name: "far",
+            default: Value::F32(400.0),
+        },
+        EffectParameter {
+            name: "focus",
+            default: Value::F32(10.0),
+        },
+        EffectParameter {
+            name: "f_number",
+            default: Value::F32(2.8),
+        },
+        EffectParameter {
+            name: "focal",
+            default: Value::F32(0.05),
+        },
+        EffectParameter {
+            name: "sensor",
+            default: Value::F32(0.035),
+        },
+    ],
+    shader: EffectShader::Source {
+        path: DOF_COC_MODULE,
+        wxsl: include_str!("../shaders/dof_coc.wxsl"),
+    },
+    downlevel: Downlevel::Portable,
+};
+
+/// The depth-of-field far-field blur: behind the focus plane, blur by the
+/// pixel's own circle of confusion, fading out samples that belong to the
+/// near field — the occlusion half that keeps a sharp foreground from
+/// smearing into the background it overlaps.
+pub const DOF_FAR: Effect = Effect {
+    id: "wxsl.dof_far",
+    label: "dof far field",
+    description: "Blur the far field by its circle of confusion, occlusion-faded.",
+    kind: EffectKind::Screen {
+        vertex_entry: "dof_far_vs",
+        fragment_entry: "dof_far_fs",
+    },
+    inputs: &[
+        EffectInput {
+            name: "color",
+            kind: EffectInputKind::Image,
+            description: "The image, as linear radiance.",
+            history: 0,
+        },
+        EffectInput {
+            name: "coc",
+            kind: EffectInputKind::Image,
+            description: "The signed circles of confusion, from the CoC pass.",
+            history: 0,
+        },
+    ],
+    outputs: &[],
+    parameters: &[EffectParameter {
+        name: "max_coc",
+        default: Value::F32(16.0),
+    }],
+    shader: EffectShader::Source {
+        path: DOF_FAR_MODULE,
+        wxsl: include_str!("../shaders/dof_far.wxsl"),
+    },
+    downlevel: Downlevel::Portable,
+};
+
+/// The depth-of-field near-field composite: dilate the near field's discs
+/// over the gather neighbourhood, gather the foreground, and composite it
+/// over the far pass's result — the half that lets a foreground's blur
+/// spill over the background without a seam.
+pub const DOF_NEAR: Effect = Effect {
+    id: "wxsl.dof_near",
+    label: "dof near field",
+    description: "Composite the dilated, blurred foreground over the far result.",
+    kind: EffectKind::Screen {
+        vertex_entry: "dof_near_vs",
+        fragment_entry: "dof_near_fs",
+    },
+    inputs: &[
+        EffectInput {
+            name: "color",
+            kind: EffectInputKind::Image,
+            description: "The image, as linear radiance.",
+            history: 0,
+        },
+        EffectInput {
+            name: "coc",
+            kind: EffectInputKind::Image,
+            description: "The signed circles of confusion, from the CoC pass.",
+            history: 0,
+        },
+        EffectInput {
+            name: "far",
+            kind: EffectInputKind::Image,
+            description: "The far pass's blurred background.",
+            history: 0,
+        },
+    ],
+    outputs: &[],
+    parameters: &[EffectParameter {
+        name: "max_coc",
+        default: Value::F32(16.0),
+    }],
+    shader: EffectShader::Source {
+        path: DOF_NEAR_MODULE,
+        wxsl: include_str!("../shaders/dof_near.wxsl"),
+    },
+    downlevel: Downlevel::Portable,
+};
+
+/// Tonemap: the display transform, as the last pass of every stock
+/// chain — the filmic curve and the sRGB encode that used to sit inside
+/// the generated `shade_surface` under a macro.
+///
+/// Shipped, and in the stock pipelines, because a pipeline that does not
+/// end in one presents linear radiance — correct for a chain that goes on
+/// to another effect, wrong on a screen.
+pub const TONEMAP: Effect = Effect {
+    id: "wxsl.tonemap",
+    label: "tonemap",
+    description: "Curve linear radiance for the display, and encode it.",
+    kind: EffectKind::Screen {
+        vertex_entry: "tonemap_vs",
+        fragment_entry: "tonemap_fs",
+    },
+    inputs: &[EffectInput {
+        name: "image",
+        kind: EffectInputKind::Image,
+        description: "The linear image to tonemap.",
+        history: 0,
+    }],
+    outputs: &[],
+    parameters: &[
+        EffectParameter {
+            name: "curve",
+            // 1 applies the filmic curve; 0 only clamps and encodes, which is
+            // what a debug view needs to show stored data unbent.
+            default: Value::F32(1.0),
+        },
+        EffectParameter {
+            name: "exposure",
+            // Scales the radiance into the curve; a debug view (curve 0)
+            // ignores it.
+            default: Value::F32(1.0),
+        },
+    ],
+    shader: EffectShader::Source {
+        path: TONEMAP_MODULE,
+        wxsl: include_str!("../shaders/tonemap.wxsl"),
+    },
+    downlevel: Downlevel::Portable,
+};
+
+/// The split-sum environment-BRDF LUT, baked once per selected model.
+/// The renderer owns its frame texture; applications may also register
+/// this descriptor as a `once`-policy pass. Explicit shader pins from
+/// [`ibl::BrdfLut::macros`] select either bake arm’s integration model.
+pub const BRDF_LUT: Effect = Effect {
+    id: "wxsl.brdf_lut",
+    label: "BRDF LUT",
+    description: "Bake the split-sum environment-BRDF LUT, once.",
+    kind: EffectKind::Compute {
+        entry: "bake_lut",
+        workgroups: [16, 16, 1],
+    },
+    inputs: &[],
+    outputs: &[EffectOutput {
+        name: "lut",
+        shape: EffectOutputShape::StorageTexture,
+        description: "The LUT: a 128x128 storage texture of (scale, bias) and the LTC table.",
+    }],
+    parameters: &[],
+    shader: EffectShader::Source {
+        path: BRDF_LUT_MODULE,
+        wxsl: concat!(
+            include_str!("../shaders/ltc_table.wxsl"),
+            include_str!("../shaders/brdf_integrate.wxsl"),
+            include_str!("../shaders/brdf_lut.wxsl")
+        ),
+    },
+    // The same integral as a fullscreen pass into the LUT, for WebGL2 and
+    // GL; `the_lut_bakes_the_same_through_either_arm` holds them equal.
+    downlevel: Downlevel::Fragment {
+        vertex_entry: "bake_lut_vs",
+        fragment_entry: "bake_lut_fs",
+        shader: EffectShader::Source {
+            path: BRDF_LUT_FRAGMENT_MODULE,
+            wxsl: concat!(
+                include_str!("../shaders/ltc_table.wxsl"),
+                include_str!("../shaders/brdf_integrate.wxsl"),
+                include_str!("../shaders/brdf_lut_fragment.wxsl")
+            ),
+        },
+    },
+};
+
+/// The LUT viewer: one image, stretched over the frame's target — the
+/// screen half of the [`BRDF_LUT`] proof, and how a demo or a test looks
+/// at what a once-only bake left behind.
+pub const LUT_VIEW: Effect = Effect {
+    id: "wxsl.lut_view",
+    label: "LUT view",
+    description: "Draw one image across the frame's target.",
+    kind: EffectKind::Screen {
+        vertex_entry: "view_vs",
+        fragment_entry: "view_fs",
+    },
+    inputs: &[EffectInput {
+        name: "image",
+        kind: EffectInputKind::Image,
+        description: "The image to display.",
+        history: 0,
+    }],
+    outputs: &[],
+    parameters: &[],
+    shader: EffectShader::Source {
+        path: LUT_VIEW_MODULE,
+        wxsl: include_str!("../shaders/lut_view.wxsl"),
+    },
+    downlevel: Downlevel::Portable,
+};
+
+/// Module path the ramp fill's shader is mounted under.
+pub const RAMP_MODULE: &str = "package::wxsl::ramp";
+/// Module path the ramp viewer's shader is mounted under.
+pub const RAMP_VIEW_MODULE: &str = "package::wxsl::ramp_view";
+
+/// The buffer proof: a compute effect whose one output is a
+/// 256-entry storage buffer of eased values. Like [`BRDF_LUT`], a
+/// descriptor an application registers rather than a shipped pass — and
+/// the smallest complete example of a buffer-writing effect.
+pub const RAMP_FILL: Effect = Effect {
+    id: "wxsl.ramp_fill",
+    label: "ramp fill",
+    description: "Fill a storage buffer with an eased ramp, one f32 per entry.",
+    kind: EffectKind::Compute {
+        entry: "fill_ramp",
+        workgroups: [4, 1, 1],
+    },
+    inputs: &[],
+    outputs: &[EffectOutput {
+        name: "ramp",
+        shape: EffectOutputShape::Buffer,
+        description: "The buffer: 256 f32 values, a smoothstep ease of the index.",
+    }],
+    parameters: &[],
+    shader: EffectShader::Source {
+        path: RAMP_MODULE,
+        wxsl: include_str!("../shaders/ramp.wxsl"),
+    },
+    // Fills a storage buffer: compute and storage, by definition.
+    downlevel: Downlevel::NativeOnly,
+};
+
+/// The buffer reader: a screen effect that draws a storage buffer as one
+/// value per screen column — the half that proves a fragment stage can
+/// consume what a compute pass wrote, with no texture in between.
+pub const RAMP_VIEW: Effect = Effect {
+    id: "wxsl.ramp_view",
+    label: "ramp view",
+    description: "Draw a storage buffer as one value per screen column.",
+    kind: EffectKind::Screen {
+        vertex_entry: "view_vs",
+        fragment_entry: "view_fs",
+    },
+    inputs: &[EffectInput {
+        name: "ramp",
+        kind: EffectInputKind::Buffer,
+        description: "The buffer to draw, read as storage.",
+        history: 0,
+    }],
+    outputs: &[],
+    parameters: &[],
+    shader: EffectShader::Source {
+        path: RAMP_VIEW_MODULE,
+        wxsl: include_str!("../shaders/ramp_view.wxsl"),
+    },
+    // Reads a storage buffer in the fragment stage.
+    downlevel: Downlevel::NativeOnly,
+};
+
+/// Module path the TAA resolve's shader is mounted under.
+pub const TAA_MODULE: &str = "package::wxsl::taa";
+/// Module path the motion blur's shader is mounted under.
+pub const MOTION_BLUR_MODULE: &str = "package::wxsl::motion_blur";
+
+/// TAA: the temporal resolve at the end of a policy'd chain — the
+/// velocity stage's reason to exist. Three inputs, which is
+/// exactly why the fixed `pass.screen` socket set cannot carry it: the
+/// colour, the velocity, and *last frame's own output*, read a frame
+/// back through a persistent resource's history so the pass orders
+/// against the scene but never against itself. Writing the history and
+/// reading it is the shape `reading_history_is_not_an_ordering_edge` is
+/// about.
+pub const TAA: Effect = Effect {
+    id: "wxsl.taa",
+    label: "TAA",
+    description: "Blend the frame with its reprojected history: antialias, \
+                  at the cost of one ring.",
+    kind: EffectKind::Screen {
+        vertex_entry: "taa_vs",
+        fragment_entry: "taa_fs",
+    },
+    inputs: &[
+        EffectInput {
+            name: "color",
+            kind: EffectInputKind::Image,
+            description: "The frame, as linear radiance.",
+            history: 0,
+        },
+        EffectInput {
+            name: "velocity",
+            kind: EffectInputKind::Image,
+            description: "The velocity stage's screen motion, uv per frame.",
+            history: 0,
+        },
+        EffectInput {
+            name: "history",
+            kind: EffectInputKind::Image,
+            description: "Last frame's resolve — the same resource `into` names.",
+            history: 1,
+        },
+    ],
+    outputs: &[],
+    parameters: &[EffectParameter {
+        name: "blend",
+        // How much of the clamped history survives. 1 would never accept
+        // new light; 0 is no history at all.
+        default: Value::F32(0.9),
+    }],
+    shader: EffectShader::Source {
+        path: TAA_MODULE,
+        wxsl: include_str!("../shaders/taa.wxsl"),
+    },
+    downlevel: Downlevel::Portable,
+};
+
+/// Module path the motion blur's tiles pass is mounted under.
+pub const MOTION_TILES_MODULE: &str = "package::wxsl::motion_tiles";
+/// Module path the motion blur's neighbourhood pass is mounted under.
+pub const MOTION_NEIGHBORS_MODULE: &str = "package::wxsl::motion_neighbors";
+/// The scale of the targets [`MOTION_TILES`] and [`MOTION_NEIGHBORS`]
+/// write, as a `resource.color`'s `scale`: one texel a tile of 32 pixels.
+pub const MOTION_TILES_SCALE: &str = "0.03125";
+
+/// The motion blur's first reconstruction pass: the longest motion in each
+/// tile, into a `pair` target at [`MOTION_TILES_SCALE`].
+pub const MOTION_TILES: Effect = Effect {
+    id: "wxsl.motion_tiles",
+    label: "motion tiles",
+    description: "Write the longest screen motion in each tile of 32 pixels.",
+    kind: EffectKind::Screen {
+        vertex_entry: "motion_tiles_vs",
+        fragment_entry: "motion_tiles_fs",
+    },
+    inputs: &[EffectInput {
+        name: "image",
+        kind: EffectInputKind::Image,
+        description: "The velocity stage's screen motion, uv per frame.",
+        history: 0,
+    }],
+    outputs: &[],
+    parameters: &[],
+    shader: EffectShader::Source {
+        path: MOTION_TILES_MODULE,
+        wxsl: include_str!("../shaders/motion_tiles.wxsl"),
+    },
+    downlevel: Downlevel::Portable,
+};
+
+/// The motion blur's second reconstruction pass: the longest of the tiles'
+/// motions whose smear reaches each tile, at the tiles' size. Its
+/// `strength` is the blur's.
+pub const MOTION_NEIGHBORS: Effect = Effect {
+    id: "wxsl.motion_neighbors",
+    label: "motion neighbours",
+    description: "Write the longest tile motion within the longest smear of each tile.",
+    kind: EffectKind::Screen {
+        vertex_entry: "motion_neighbors_vs",
+        fragment_entry: "motion_neighbors_fs",
+    },
+    inputs: &[EffectInput {
+        name: "image",
+        kind: EffectInputKind::Image,
+        description: "The motion tiles' longest motions.",
+        history: 0,
+    }],
+    outputs: &[],
+    parameters: &[EffectParameter {
+        name: "strength",
+        // The blur's own, which scales how far each tile's smear reaches.
+        default: Value::F32(1.0),
+    }],
+    shader: EffectShader::Source {
+        path: MOTION_NEIGHBORS_MODULE,
+        wxsl: include_str!("../shaders/motion_neighbors.wxsl"),
+    },
+    downlevel: Downlevel::Portable,
+};
+
+/// Motion blur: a reconstruction filter over the velocity buffer (McGuire
+/// et al. 2012) — the first consumer of the velocity buffer that is not
+/// TAA. Each fragment samples along the longest motion around it, from
+/// [`MOTION_NEIGHBORS`], so a fast foreground smears over a still
+/// background, and the depth decides what could have crossed what. Reads
+/// linear radiance, before the display transform, which is the only
+/// place averaging brightness means anything.
+pub const MOTION_BLUR: Effect = Effect {
+    id: "wxsl.motion_blur",
+    label: "motion blur",
+    description: "Smear the frame along its velocity buffer, foreground over background.",
+    kind: EffectKind::Screen {
+        vertex_entry: "motion_blur_vs",
+        fragment_entry: "motion_blur_fs",
+    },
+    inputs: &[
+        EffectInput {
+            name: "color",
+            kind: EffectInputKind::Image,
+            description: "The frame, as linear radiance.",
+            history: 0,
+        },
+        EffectInput {
+            name: "velocity",
+            kind: EffectInputKind::Image,
+            description: "The velocity stage's screen motion, uv per frame.",
+            history: 0,
+        },
+        EffectInput {
+            name: "depth",
+            kind: EffectInputKind::DepthImage,
+            description: "The opaque depth that says what is in front.",
+            history: 0,
+        },
+        EffectInput {
+            name: "neighbors",
+            kind: EffectInputKind::Image,
+            description: "The motion neighbours' longest motions around each tile.",
+            history: 0,
+        },
+    ],
+    outputs: &[],
+    parameters: &[EffectParameter {
+        name: "strength",
+        // 1 is a full frame's motion smeared across the exposure; 0 is
+        // the image exactly as it was.
+        default: Value::F32(1.0),
+    }],
+    shader: EffectShader::Source {
+        path: MOTION_BLUR_MODULE,
+        wxsl: include_str!("../shaders/motion_blur.wxsl"),
+    },
+    downlevel: Downlevel::Portable,
+};
+
+/// The baseline peel's window update. `pass.peel` expands into it; it is
+/// not a palette row.
+pub const PEEL_BOUNDS: Effect = Effect {
+    id: "wxsl.peel_bounds",
+    label: "peel bounds",
+    description: "Write the next peel window from the two depth buffers.",
+    kind: EffectKind::Screen {
+        vertex_entry: "peel_bounds_vs",
+        fragment_entry: "peel_bounds_fs",
+    },
+    inputs: &[
+        EffectInput {
+            name: "front_depth",
+            kind: EffectInputKind::Image,
+            description: "The front peel's depth buffer.",
+            history: 0,
+        },
+        EffectInput {
+            name: "back_depth",
+            kind: EffectInputKind::Image,
+            description: "The back peel's depth buffer.",
+            history: 0,
+        },
+        EffectInput {
+            name: "prev",
+            kind: EffectInputKind::Image,
+            description: "The previous window.",
+            history: 0,
+        },
+    ],
+    outputs: &[],
+    parameters: &[],
+    shader: EffectShader::Source {
+        path: PEEL_BOUNDS_MODULE,
+        wxsl: include_str!("../shaders/peel_bounds.wxsl"),
+    },
+    downlevel: Downlevel::Portable,
+};
+
+/// The native peel's window update, from the MAX-blended depth pair.
+pub const PEEL_DEPTH_BOUNDS: Effect = Effect {
+    id: "wxsl.peel_depth_bounds",
+    label: "peel depth bounds",
+    description: "Write the next peel window from the native depth pair.",
+    kind: EffectKind::Screen {
+        vertex_entry: "peel_depth_bounds_vs",
+        fragment_entry: "peel_depth_bounds_fs",
+    },
+    inputs: &[
+        EffectInput {
+            name: "pair",
+            kind: EffectInputKind::Image,
+            description: "The MAX-blended `(1 - z, z)` pair.",
+            history: 0,
+        },
+        EffectInput {
+            name: "prev",
+            kind: EffectInputKind::Image,
+            description: "The previous window.",
+            history: 0,
+        },
+    ],
+    outputs: &[],
+    parameters: &[],
+    shader: EffectShader::Source {
+        path: PEEL_DEPTH_BOUNDS_MODULE,
+        wxsl: include_str!("../shaders/peel_depth_bounds.wxsl"),
+    },
+    downlevel: Downlevel::Portable,
+};
+
+/// Front and back accumulators over the opaque colour.
+pub const PEEL_COMPOSITE: Effect = Effect {
+    id: "wxsl.peel_composite",
+    label: "peel composite",
+    description: "Composite the two peel accumulators over the opaque colour.",
+    kind: EffectKind::Screen {
+        vertex_entry: "peel_composite_vs",
+        fragment_entry: "peel_composite_fs",
+    },
+    inputs: &[
+        EffectInput {
+            name: "front",
+            kind: EffectInputKind::Image,
+            description: "The front accumulator, premultiplied, nearest first.",
+            history: 0,
+        },
+        EffectInput {
+            name: "back",
+            kind: EffectInputKind::Image,
+            description: "The back accumulator, premultiplied, farthest first.",
+            history: 0,
+        },
+        EffectInput {
+            name: "scene",
+            kind: EffectInputKind::Image,
+            description: "The opaque colour.",
+            history: 0,
+        },
+    ],
+    outputs: &[],
+    parameters: &[],
+    shader: EffectShader::Source {
+        path: PEEL_COMPOSITE_MODULE,
+        wxsl: include_str!("../shaders/peel_composite.wxsl"),
+    },
+    downlevel: Downlevel::Portable,
+};
+
+/// Fold one front layer under the front accumulator. Not a palette node.
+pub const PEEL_UNDER: Effect = Effect {
+    id: "wxsl.peel_under",
+    label: "peel under",
+    description: "Front-to-back fold of one peeled layer under the accumulator.",
+    kind: EffectKind::Screen {
+        vertex_entry: "peel_under_vs",
+        fragment_entry: "peel_under_fs",
+    },
+    inputs: &[
+        EffectInput {
+            name: "accum",
+            kind: EffectInputKind::Image,
+            description: "The front accumulator so far.",
+            history: 0,
+        },
+        EffectInput {
+            name: "layer",
+            kind: EffectInputKind::Image,
+            description: "The layer just peeled, premultiplied.",
+            history: 0,
+        },
+    ],
+    outputs: &[],
+    parameters: &[],
+    shader: EffectShader::Source {
+        path: PEEL_UNDER_MODULE,
+        wxsl: include_str!("../shaders/peel_under.wxsl"),
+    },
+    downlevel: Downlevel::Portable,
+};
+
+/// Fold one back layer over the back accumulator. Not a palette node.
+pub const PEEL_OVER: Effect = Effect {
+    id: "wxsl.peel_over",
+    label: "peel over",
+    description: "Back-to-front fold of one peeled layer over the accumulator.",
+    kind: EffectKind::Screen {
+        vertex_entry: "peel_over_vs",
+        fragment_entry: "peel_over_fs",
+    },
+    inputs: &[
+        EffectInput {
+            name: "accum",
+            kind: EffectInputKind::Image,
+            description: "The back accumulator so far.",
+            history: 0,
+        },
+        EffectInput {
+            name: "layer",
+            kind: EffectInputKind::Image,
+            description: "The layer just peeled, premultiplied.",
+            history: 0,
+        },
+    ],
+    outputs: &[],
+    parameters: &[],
+    shader: EffectShader::Source {
+        path: PEEL_OVER_MODULE,
+        wxsl: include_str!("../shaders/peel_over.wxsl"),
+    },
+    downlevel: Downlevel::Portable,
+};
+
+/// The effects a renderer knows how to run, and a pipeline document may
+/// name.
+///
+/// Shipped with the two above; extended with [`EffectRegistry::add`] —
+/// that is the whole of "add a post effect" now.
+#[derive(Clone, Debug, Default)]
+pub struct EffectRegistry {
+    effects: Vec<Effect>,
+}
+
+impl EffectRegistry {
+    /// The effects this crate ships: the migrated lighting pass, the
+    /// display transform every stock chain ends in, bloom (the one-pass
+    /// row and the separable pair), the TAA resolve, and the motion blur
+    /// with its two tile passes.
+    pub fn shipped() -> Self {
+        EffectRegistry {
+            effects: vec![
+                DEFERRED_LIGHTING,
+                TONEMAP,
+                BLOOM,
+                BLOOM_X,
+                BLOOM_Y,
+                BLOOM_EXTRACT,
+                BLOOM_DOWN,
+                BLOOM_UP,
+                BLOOM_COMBINE,
+                DOF_COC,
+                DOF_FAR,
+                DOF_NEAR,
+                TAA,
+                MOTION_TILES,
+                MOTION_NEIGHBORS,
+                MOTION_BLUR,
+                PEEL_BOUNDS,
+                PEEL_DEPTH_BOUNDS,
+                PEEL_COMPOSITE,
+                PEEL_UNDER,
+                PEEL_OVER,
+                ibl::EQUIRECT_TO_CUBE,
+                ibl::DIFFUSE,
+                ibl::SPECULAR,
+                ibl::RESAMPLE,
+                ibl::BACKGROUND,
+                ibl::PROBE_FACE,
+                planar::COMPOSITE,
+                planar::COMPOSITE_MAPPED,
+                refraction::BOUNDS,
+                refraction::RESOLVE,
+                refraction::SCENE_DEPTH,
+                refraction::COMPOSE,
+                refraction::COMPOSE_DEPTH,
+                ssr::SSR,
+                ssr::GLASS,
+                glare::EXTRACT,
+                glare::CELLS,
+                glare::STARBURST,
+                glare::STREAK,
+                glare::GHOSTS,
+                glare::FLARE,
+                glare::ADD,
+                sun::SUN,
+                particles::SIMULATE,
+                particles::DRAW,
+            ],
+        }
+    }
+
+    /// An empty registry — for an application that wants exactly its own
+    /// effects and not this crate's.
+    pub fn empty() -> Self {
+        EffectRegistry {
+            effects: Vec::new(),
+        }
+    }
+
+    /// Register `effect`, replacing any effect already registered under
+    /// the same id — an application overriding a shipped effect is the
+    /// same gesture as adding a new one.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the id carries no package segment: effect ids are
+    /// `package.name` (`wxsl.bloom`), and an un-namespaced registration is
+    /// how two libraries' effects end up unable to share a registry.
+    /// Documents may still spell shipped ids bare — [`Self::get`] resolves
+    /// `bloom` to `wxsl.bloom` — but a registration says who owns the
+    /// name. See [`wxsl_core::identity`].
+    pub fn add(&mut self, effect: Effect) {
+        assert!(
+            identity::is_namespaced(effect.id),
+            "effect `{}` has no package segment — ids are `package.name` \
+             (the shipped effects live under `wxsl.`); put it in a package of its own",
+            effect.id,
+        );
+        // the rule, at registration: compute is allowed, but a
+        // compute effect says what a device without it runs instead.
+        assert!(
+            !(effect.is_compute() && effect.downlevel == Downlevel::Portable),
+            "compute effect `{}` declares `Downlevel::Portable`; give it a \
+             `Downlevel::Fragment` arm or name it `Downlevel::NativeOnly`",
+            effect.id,
+        );
+        match self.effects.iter().position(|known| known.id == effect.id) {
+            Some(at) => self.effects[at] = effect,
+            None => self.effects.push(effect),
+        }
+    }
+
+    /// The effect `id` names, as a device with `profile` runs it
+    /// ([`Effect::on`]) — what a backend asks when it builds the pass.
+    pub fn get_on(&self, profile: crate::profile::Profile, id: &str) -> Option<Effect> {
+        self.get(id).map(|effect| effect.on(&profile).into_owned())
+    }
+
+    /// A builder form of [`EffectRegistry::add`].
+    pub fn with(mut self, effect: Effect) -> Self {
+        self.add(effect);
+        self
+    }
+
+    /// The effect named by `id`, as documents name them: an id with a
+    /// package is taken as written, a bare one resolves against the
+    /// shipped package — `bloom` means `wxsl.bloom`, which is what every
+    /// document written before namespacing meant.
+    pub fn get(&self, id: &str) -> Option<Effect> {
+        let resolved = identity::resolve(id);
+        self.effects
+            .iter()
+            .find(|effect| effect.id == resolved.as_ref())
+            .cloned()
+    }
+
+    /// Every registered effect, in registration order — what a palette
+    /// lists.
+    pub fn iter(&self) -> impl Iterator<Item = &Effect> {
+        self.effects.iter()
+    }
+
+    /// The ids, for an error message that says what *would* have matched.
+    pub fn ids(&self) -> Vec<String> {
+        self.effects
+            .iter()
+            .map(|effect| effect.id.to_string())
+            .collect()
+    }
+
+    /// How many effects are registered.
+    pub fn len(&self) -> usize {
+        self.effects.len()
+    }
+
+    /// Whether no effect is registered — a registry a pipeline document
+    /// naming any `pass.screen` cannot compile against.
+    pub fn is_empty(&self) -> bool {
+        self.effects.is_empty()
+    }
+
+    /// The document-vocabulary rows the compute effects add: one
+    /// `pass.compute.<effect>` definition per registered compute effect,
+    /// its sockets the effect's declared inputs and outputs.
+    ///
+    /// `pass.screen`'s socket set is fixed and maps a declaration onto it
+    /// by kind — that works because a *screen* effect's wiring is the
+    /// frame: one G-buffer, one image, one write. A compute effect's
+    /// wiring is whatever its work needs, so its sockets are derived from
+    /// its own declaration rather than mapped onto a fixed set — the
+    /// mechanism, one level up, that lets an effect want two writes and
+    /// still be a node. Screen effects keep the fixed pass; every shipped
+    /// compute effect joins the vocabulary through this method, and an
+    /// application's join the same way.
+    ///
+    /// A declared *output* is an input socket on the node, as `into` is on
+    /// a screen pass: the wire names the storage being written, and the
+    /// storage — a `resource.color` or `resource.buffer` — is what any
+    /// later reader wires from.
+    pub fn node_defs(&self) -> Vec<NodeDefinition> {
+        self.effects
+            .iter()
+            .filter(|effect| effect.is_compute())
+            .map(|effect| {
+                let mut def = NodeDefinition::builder(
+                    format!("{}{}", doc::PASS_COMPUTE_PREFIX, effect.id),
+                    effect.label,
+                )
+                .doc(format!(
+                    "{} Reads: {}. Writes: {}.",
+                    effect.description,
+                    declarations(
+                        effect
+                            .inputs
+                            .iter()
+                            .map(|input| (input.name, input.description))
+                    ),
+                    declarations(
+                        effect
+                            .outputs
+                            .iter()
+                            .map(|output| (output.name, output.description))
+                    ),
+                ))
+                .setting(policy_setting());
+                for input in effect.inputs {
+                    def = def.input(
+                        Socket::new(input.name, input_socket_type(input.kind))
+                            .with_doc(input.description),
+                    );
+                }
+                for output in effect.outputs {
+                    def = def.input(
+                        Socket::new(output.name, output_socket_type(output.shape))
+                            .with_doc(format!("written: {}", output.description)),
+                    );
+                }
+                def.document()
+            })
+            .chain(
+                // The screen pass's own derived rows, for the effects whose
+                // wiring the fixed socket set cannot name: one image socket
+                // per declared image input, under the input's own name,
+                // beside `into` and the colour hand-off. The TAA resolve's
+                // `history` socket is where a document says "last frame's"
+                // — the history lives on the *input*, and the resource it
+                // names is the one `into` writes.
+                self.effects
+                    .iter()
+                    // The peel's fullscreen passes are expanded by `pass.peel`.
+                    // A derived `pass.screen.wxsl.peel_*` row would invite an
+                    // author to wire depth textures into colour sockets.
+                    .filter(|effect| {
+                        !effect.is_compute()
+                            && !effect.fits_pass_screen()
+                            && !effect.id.starts_with("wxsl.peel_")
+                    })
+                    .map(|effect| {
+                        let mut def = NodeDefinition::builder(
+                            format!("{}{}", doc::PASS_SCREEN_PREFIX, effect.id),
+                            effect.label,
+                        )
+                        .doc(format!(
+                            "{} Reads: {}.",
+                            effect.description,
+                            declarations(
+                                effect
+                                    .inputs
+                                    .iter()
+                                    .map(|input| (input.name, input.description))
+                            ),
+                        ))
+                        .input(
+                            Socket::new("into", ValueType::ColorTarget)
+                                .optional()
+                                .with_doc(
+                                    "Where to write. Unconnected means the frame's own target.",
+                                ),
+                        )
+                        .output(Socket::new("color", ValueType::ColorTarget).with_doc(
+                            "What the effect wrote — the frame's target when \
+                                 `into` is unconnected.",
+                        ))
+                        .setting(policy_setting());
+                        for input in effect.inputs {
+                            def = def.input(
+                                Socket::new(input.name, input_socket_type(input.kind))
+                                    .with_doc(input.description),
+                            );
+                        }
+                        def.document()
+                    }),
+            )
+            .collect()
+    }
+}
+
+/// The socket type a declared input wires through.
+fn input_socket_type(kind: EffectInputKind) -> ValueType {
+    match kind {
+        EffectInputKind::GBuffer => ValueType::GBuffer,
+        EffectInputKind::Image => ValueType::ColorTarget,
+        EffectInputKind::DepthImage => ValueType::DepthTarget,
+        EffectInputKind::Buffer => ValueType::StorageBuffer,
+    }
+}
+
+/// The socket type a declared output wires through.
+fn output_socket_type(shape: EffectOutputShape) -> ValueType {
+    match shape {
+        EffectOutputShape::Buffer => ValueType::StorageBuffer,
+        EffectOutputShape::StorageTexture => ValueType::ColorTarget,
+    }
+}
+
+/// `` `name` (description)`` — `` `ramp` (the buffer, 256 f32 values)`` —
+/// for a compute definition's doc line.
+fn declarations<'a>(declared: impl Iterator<Item = (&'a str, &'a str)>) -> String {
+    let parts: Vec<String> = declared
+        .map(|(name, description)| format!("`{name}` ({description})"))
+        .collect();
+    if parts.is_empty() {
+        "none".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+/// The `policy` setting every pass node carries.
+fn policy_setting() -> SettingDef {
+    SettingDef::new(
+        SETTING_POLICY,
+        "Policy",
+        "How often the pass runs: per frame, once, on resize or on demand. Only a \
+         pass whose target survives frames may skip.",
+    )
+    .with_default("per frame")
+}
+
+impl std::fmt::Display for EffectRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (index, effect) in self.effects.iter().enumerate() {
+            if index > 0 {
+                f.write_str(", ")?;
+            }
+            let _ = write!(f, "{}", effect.id);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_shipped_registry_holds_the_migrated_lighting_pass_and_bloom() {
+        let registry = EffectRegistry::shipped();
+        assert_eq!(
+            registry.len(),
+            46,
+            "lighting, tonemap, bloom, the separable bloom pair, the bloom \
+             pyramid's four passes, the depth-of-field chain's three, the \
+             TAA resolve, the motion blur and its two tile passes, and the \
+             five peel passes `pass.peel` expands into, plus the four \
+             environment bake effects and background, plus the five optical \
+             effects, plus \
+             the screen-space reflections, opaque and on glass, plus the \
+             glare's extract, cells, starburst, streak, ghosts, flare and \
+             add, plus the sun's disc and the planar reflection, plain and mapped, \
+             plus the particles' simulation and sprites"
+        );
+
+        let lighting = registry
+            .get("deferred_lighting")
+            .expect("the lighting pass");
+        assert!(matches!(lighting.shader, EffectShader::Lighting));
+        let EffectKind::Screen {
+            vertex_entry,
+            fragment_entry,
+        } = lighting.kind
+        else {
+            panic!("the lighting pass is a screen effect");
+        };
+        assert_eq!(vertex_entry, abi::LIGHTING_PASS_VERTEX_ENTRY);
+        assert_eq!(fragment_entry, abi::LIGHTING_PASS_FRAGMENT_ENTRY);
+        assert_eq!(
+            lighting.inputs.len(),
+            1,
+            "the lighting effect takes exactly a G-buffer"
+        );
+        assert_eq!(lighting.inputs[0].kind, EffectInputKind::GBuffer);
+
+        let bloom = registry.get("bloom").expect("bloom");
+        assert!(matches!(bloom.shader, EffectShader::Source { .. }));
+        assert_eq!(bloom.inputs[0].kind, EffectInputKind::Image);
+    }
+
+    #[test]
+    fn an_added_effect_can_replace_a_shipped_one_under_the_same_id() {
+        let replacement = Effect {
+            description: "a re-tuned lighting pass",
+            ..DEFERRED_LIGHTING
+        };
+        let registry = EffectRegistry::shipped().with(replacement);
+        assert_eq!(
+            registry.len(),
+            EffectRegistry::shipped().len(),
+            "replacing, not appending"
+        );
+        assert_eq!(
+            registry
+                .get("deferred_lighting")
+                .expect("replaced")
+                .description,
+            "a re-tuned lighting pass"
+        );
+    }
+
+    #[test]
+    fn the_bloom_shader_declares_one_binding_for_its_one_input() {
+        // The contract between descriptor and shader, checked where a
+        // change to either side fails in seconds rather than as a `wgpu`
+        // bind-group complaint minutes later: one image input means one
+        // `@group(3)` binding, and the entry points the descriptor names
+        // are the ones the file declares.
+        let EffectShader::Source { path: _, wxsl } = BLOOM.shader else {
+            panic!("bloom ships its source");
+        };
+        assert!(
+            wxsl.contains("@group(3) @binding(0) var image:"),
+            "bloom.wxsl binds its one image input"
+        );
+        for entry in ["fn bloom_vs(", "fn bloom_fs("] {
+            assert!(wxsl.contains(entry), "bloom.wxsl declares no `{entry}`");
+        }
+        assert!(
+            !wxsl.contains("@binding(1)"),
+            "one input, one binding — a second is a drift from the descriptor"
+        );
+    }
+
+    #[test]
+    fn the_separable_bloom_is_two_passes_sharing_one_kernel() {
+        // The banding fix: a horizontal extract and a vertical composite,
+        // and the two files name the same Gaussian. A radius that drifts
+        // between them is an oval halo, which is the same class of bug as
+        // a binding that drifts from its descriptor.
+        assert!(BLOOM_X.fits_pass_screen(), "one image fits pass.screen");
+        assert!(
+            !BLOOM_Y.fits_pass_screen(),
+            "two images need the derived row"
+        );
+        assert_eq!(
+            BLOOM_X
+                .parameters
+                .iter()
+                .map(|parameter| parameter.name)
+                .collect::<Vec<_>>(),
+            ["threshold", "knee"]
+        );
+        assert_eq!(BLOOM_Y.parameters[0].name, "strength");
+
+        let EffectShader::Source {
+            wxsl: horizontal, ..
+        } = BLOOM_X.shader
+        else {
+            panic!("bloom_x ships its source");
+        };
+        let EffectShader::Source { wxsl: vertical, .. } = BLOOM_Y.shader else {
+            panic!("bloom_y ships its source");
+        };
+        assert!(horizontal.contains("@group(3) @binding(0) var image:"));
+        assert!(!horizontal.contains("@binding(1)"));
+        assert!(vertical.contains("@group(3) @binding(0) var color_image:"));
+        assert!(vertical.contains("@group(3) @binding(1) var glow_image:"));
+        assert!(!vertical.contains("@binding(2)"));
+        for (wxsl, entry) in [(horizontal, "fn bloom_x_fs("), (vertical, "fn bloom_y_fs(")] {
+            assert!(wxsl.contains(entry), "missing `{entry}`");
+            assert!(wxsl.contains("const RADIUS: i32 = 12;"), "{entry}");
+            assert!(wxsl.contains("const SIGMA: f32 = 4.0;"), "{entry}");
+        }
+        assert!(horizontal.contains("params.threshold"));
+        assert!(vertical.contains("params.strength"));
+        // The uniform address space rounds a struct up to 16 bytes, so one
+        // f32 and two f32s are the same size.
+        assert_eq!(BLOOM_X.param_layout().size(), 16);
+        assert_eq!(BLOOM_Y.param_layout().size(), 16);
+        let header = BLOOM_Y.params_header();
+        assert!(
+            header.contains("@group(3) @binding(2) var<uniform> params:"),
+            "{header}"
+        );
+    }
+
+    #[test]
+    fn the_tonemap_shader_applies_the_librarys_curve_to_its_one_input() {
+        let EffectShader::Source { path: _, wxsl } = TONEMAP.shader else {
+            panic!("the tonemap ships its source");
+        };
+        assert!(
+            wxsl.contains("@group(3) @binding(0) var image:"),
+            "the tonemap binds its one image input"
+        );
+        assert!(!wxsl.contains("@binding(1)"), "one input, one binding");
+        for entry in ["fn tonemap_vs(", "fn tonemap_fs("] {
+            assert!(wxsl.contains(entry), "tonemap.wxsl declares no `{entry}`");
+        }
+        // The curve is the library's, not a second copy of it: there is one
+        // filmic curve in this repo and the effect imports it.
+        for import in [
+            "package::color::tonemap_filmic",
+            "package::color::linear_to_srgb",
+        ] {
+            assert!(
+                wxsl.contains(import),
+                "the tonemap applies the library's `{import}`"
+            );
+        }
+    }
+
+    #[test]
+    fn the_brdf_lut_shader_writes_its_one_output_and_reads_nothing() {
+        // A compute effect with no inputs and one storage write: the
+        // write is binding 0 (outputs come after inputs, of which there
+        // are none), and the descriptor's entry and workgroup count are
+        // the shader's.
+        let EffectShader::Source { path: _, wxsl } = BRDF_LUT.shader else {
+            panic!("the LUT bake ships its source");
+        };
+        assert!(
+            wxsl.contains("@group(3) @binding(0) var lut: texture_storage_2d"),
+            "the bake writes its one output"
+        );
+        assert!(wxsl.contains("fn bake_lut("), "the declared entry exists");
+        assert!(
+            wxsl.contains("@workgroup_size(8, 8)"),
+            "the workgroup size divides the declared 16x16x1 dispatch of the 128² LUT"
+        );
+        assert!(!wxsl.contains("@binding(1)"), "one output, one binding");
+        let EffectKind::Compute { workgroups, .. } = BRDF_LUT.kind else {
+            panic!("the LUT bake is a compute effect");
+        };
+        assert_eq!(workgroups, [16, 16, 1]);
+    }
+
+    #[test]
+    fn bloom_declares_its_knobs_and_the_shader_reads_them_without_stating_them() {
+        // The parameter half of the descriptor-vs-shader contract, checked
+        // where a change to either side fails in seconds: the descriptor
+        // names three f32 knobs with the values the shader's `const`s used
+        // to carry, and the file reads them through the generated `params`
+        // struct without declaring it — the struct is the declaration's
+        // shadow, and a second copy of it in the file is drift.
+        assert_eq!(
+            BLOOM
+                .parameters
+                .iter()
+                .map(|parameter| (parameter.name, parameter.ty()))
+                .collect::<Vec<_>>(),
+            [
+                ("threshold", ValueType::F32),
+                ("knee", ValueType::F32),
+                ("strength", ValueType::F32),
+            ]
+        );
+        let EffectShader::Source { path: _, wxsl } = BLOOM.shader else {
+            panic!("bloom ships its source");
+        };
+        for knob in ["params.threshold", "params.knee", "params.strength"] {
+            assert!(wxsl.contains(knob), "bloom.wxsl reads `{knob}`");
+        }
+        assert!(
+            !wxsl.contains("var<uniform>"),
+            "the file must not state the block the descriptor declares"
+        );
+        assert!(
+            !wxsl.contains("const THRESHOLD"),
+            "the const this retired stays retired"
+        );
+        // The tonemap's knobs: its debug-view switch, then the
+        // exposure into the curve.
+        let names: Vec<&str> = TONEMAP.parameters.iter().map(|p| p.name).collect();
+        assert_eq!(names, ["curve", "exposure"]);
+        // Every other shipped effect declares no knobs, so nothing about
+        // them moves.
+        for effect in [DEFERRED_LIGHTING, BRDF_LUT, LUT_VIEW, RAMP_FILL, RAMP_VIEW] {
+            assert!(
+                effect.parameters.is_empty(),
+                "`{}` grew knobs silently",
+                effect.id
+            );
+        }
+    }
+
+    #[test]
+    fn the_parameter_header_declares_the_struct_at_the_next_binding() {
+        // One f32 input, no outputs — so the uniform block lands at
+        // binding 1, after the inputs and the outputs, and the struct name
+        // is the effect's to own.
+        let header = BLOOM.params_header();
+        assert!(header.contains("struct wxsl_bloom_params {"), "{header}");
+        assert!(
+            header.contains("@group(3) @binding(1) var<uniform> params: wxsl_bloom_params;"),
+            "{header}"
+        );
+        // Laid out by the same computer every host-shared buffer follows,
+        // so the size is the uniform address space's answer for three
+        // f32s.
+        assert_eq!(BLOOM.param_layout().size(), 16);
+        // And an effect with no parameters generates nothing at all, so
+        // its module compiles byte-for-byte as it did.
+        assert!(LUT_VIEW.params_header().is_empty());
+        assert!(LUT_VIEW.param_layout().is_empty());
+    }
+
+    #[test]
+    fn the_parameter_layout_folds_names_and_types_never_values() {
+        // The material parameters' precedent, pass-level: two descriptors
+        // that differ only in a default are one layout and therefore one
+        // variant — the default is what a fresh *buffer* starts at, not
+        // what the shader was compiled with — while a different type is a
+        // different shader.
+        let retuned = Effect {
+            parameters: &[
+                EffectParameter {
+                    name: "threshold",
+                    default: Value::F32(0.5),
+                },
+                EffectParameter {
+                    name: "knee",
+                    default: Value::F32(0.6),
+                },
+                EffectParameter {
+                    name: "strength",
+                    default: Value::F32(0.85),
+                },
+            ],
+            ..BLOOM
+        };
+        assert_eq!(BLOOM.param_layout(), retuned.param_layout());
+        let widened = Effect {
+            parameters: &[
+                EffectParameter {
+                    name: "threshold",
+                    default: Value::Vec2([1.0, 1.0]),
+                },
+                EffectParameter {
+                    name: "knee",
+                    default: Value::F32(0.6),
+                },
+                EffectParameter {
+                    name: "strength",
+                    default: Value::F32(0.85),
+                },
+            ],
+            ..BLOOM
+        };
+        assert_ne!(BLOOM.param_layout(), widened.param_layout());
+    }
+
+    #[test]
+    fn every_compute_effect_grows_a_node_from_its_declaration() {
+        // The document vocabulary is open: a compute effect joins it as a
+        // `pass.compute.<id>` node whose sockets are the declaration. The
+        // LUT bake writes a storage texture through a colour-target
+        // socket; the ramp fill writes a buffer through a storage-buffer
+        // socket; both carry the policy setting every pass node has.
+        let registry = EffectRegistry::empty()
+            .with(BRDF_LUT)
+            .with(RAMP_FILL)
+            .with(TONEMAP);
+        let defs = registry.node_defs();
+        assert_eq!(
+            defs.len(),
+            2,
+            "the compute effects get nodes; the screen effect does not"
+        );
+
+        let bake = defs
+            .iter()
+            .find(|def| def.id == "pass.compute.wxsl.brdf_lut")
+            .expect("the bake's node");
+        assert_eq!(bake.category, "pass", "grouped with the other passes");
+        let lut_socket = bake.input("lut").expect("the bake's declared output");
+        assert_eq!(lut_socket.ty, ValueType::ColorTarget);
+        assert!(bake.output("lut").is_none(), "a write is wired in, not out");
+        assert!(
+            bake.setting(SETTING_POLICY).is_some(),
+            "the node carries the policy setting"
+        );
+
+        let fill = defs
+            .iter()
+            .find(|def| def.id == "pass.compute.wxsl.ramp_fill")
+            .expect("the ramp fill's node");
+        let ramp_socket = fill.input("ramp").expect("the buffer socket");
+        assert_eq!(ramp_socket.ty, ValueType::StorageBuffer);
+        assert!(
+            !ramp_socket.optional,
+            "a write declaration is mandatory — the pass must know what it writes"
+        );
+        assert_eq!(
+            fill.inputs.len(),
+            1,
+            "an effect with no declared inputs declares nothing else"
+        );
+    }
+}

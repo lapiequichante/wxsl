@@ -1,0 +1,158 @@
+// The vertex stage, shared by every material stage, and the bridge from
+// interpolated vertex output to the material function's input.
+//
+// `VertexIn`'s locations are the vertex buffer layout `wxsl-render`'s
+// `mesh` module declares; the two must be edited together.
+
+import package::wxsl::bindings::{
+    camera,
+    eye_position,
+    frame_time,
+    instance_normal_matrix,
+    instance_row,
+    world_origin,
+};
+import package::wxsl::surface::SurfaceContext;
+
+${HOST_LAYOUTS}
+
+// Invariant: the depth prepass and the colour pass are separate
+// pipelines that must agree on depth to the bit, or `LessEqual` drops
+// fragments. A skinned vertex's longer arithmetic is otherwise fused
+// differently per pipeline (Metal), and its triangles flicker black.
+struct VertexOut {
+    @invariant @builtin(position) clip_position: vec4f,
+    @location(0) world_position: vec3f,
+    @location(1) world_normal: vec3f,
+    @location(2) world_tangent: vec3f,
+    @location(3) world_bitangent: vec3f,
+    @location(4) uv: vec2f,
+}
+
+// What a material graph reads when it is compiled into the vertex stage.
+//
+// A superset of `SurfaceContext`: every field a fragment-side node reads
+// is here too, under the same name and type, which is what lets one
+// `input.uv` node serve both stages instead of forking the input
+// vocabulary in half. The two extra fields are object space, which the
+// fragment stage neither has nor wants.
+//
+// Everything here describes the vertex *before* any displacement the
+// graph computes — it is the input to that computation, not its result.
+struct VertexContext {
+    object_position: vec3f,
+    object_normal: vec3f,
+    object_tangent: vec3f,
+    normal_matrix: mat3x3f,
+    world_position: vec3f,
+    world_normal: vec3f,
+    world_tangent: vec3f,
+    world_bitangent: vec3f,
+    view_direction: vec3f,
+    uv: vec2f,
+    time: f32,
+}
+
+// Build the vertex-stage context. `wxsl_core::abi::CONTEXT_FIELDS` plus
+// `VERTEX_ONLY_FIELDS` is the Rust half of the struct above.
+fn vertex_context(input: VertexIn) -> VertexContext {
+    let world = instance_row(input.instance).model * vec4f(input.position, 1.0);
+    let normal_matrix = instance_normal_matrix(input.instance);
+    let normal = normalize(normal_matrix * input.normal);
+    let tangent = normalize(normal_matrix * input.tangent.xyz);
+
+    var out: VertexContext;
+    out.object_position = input.position;
+    out.object_normal = input.normal;
+    out.object_tangent = input.tangent.xyz;
+    out.normal_matrix = normal_matrix;
+    out.world_position = world.xyz - world_origin();
+    out.world_normal = normal;
+    out.world_tangent = tangent;
+    out.world_bitangent = cross(normal, tangent) * input.tangent.w;
+    out.view_direction = normalize(eye_position() - out.world_position);
+    out.uv = input.uv;
+    out.time = frame_time();
+    return out;
+}
+
+// Object space to clip space, carrying a world-space shading basis along,
+// with `offset` added to the vertex in object space first.
+//
+// Object space, so a displaced object still follows its own transform and
+// a displacement along the mesh's own normal means what it says. The
+// shading basis is *not* recomputed from the displaced surface: doing
+// that needs the derivative of the displacement, which a graph does not
+// hand over, and a wrong normal is worse than the undisplaced one.
+fn transform_vertex_offset(input: VertexIn, offset: vec3f) -> VertexOut {
+    let world = instance_row(input.instance).model * vec4f(input.position + offset, 1.0);
+    let normal_matrix = instance_normal_matrix(input.instance);
+    let normal = normalize(normal_matrix * input.normal);
+    let tangent = normalize(normal_matrix * input.tangent.xyz);
+
+    var out: VertexOut;
+    out.clip_position = camera.view_proj * world;
+    out.world_position = world.xyz - world_origin();
+    out.world_normal = normal;
+    out.world_tangent = tangent;
+    out.world_bitangent = cross(normal, tangent) * input.tangent.w;
+    out.uv = input.uv;
+    return out;
+}
+
+// What a graph's vertex output computes, in object space: an offset added
+// to the position, and the normal and tangent that replace the mesh's (a
+// skinned mesh's deformed frame; the mesh's own when unconnected).
+struct VertexDisplacement {
+    offset: vec3f,
+    normal: vec3f,
+    tangent: vec3f,
+}
+
+// `transform_vertex_offset` over a displaced vertex: the frame the graph
+// computed replaces the mesh's before the model transform.
+fn transform_vertex_displaced(input: VertexIn, displacement: VertexDisplacement) -> VertexOut {
+    var displaced = input;
+    displaced.normal = displacement.normal;
+    displaced.tangent = vec4f(displacement.tangent, input.tangent.w);
+    return transform_vertex_offset(displaced, displacement.offset);
+}
+
+// Object space to clip space, undisplaced.
+//
+// Every material stage uses this unchanged unless the graph has a vertex
+// output — a depth-only pass is this and nothing else. Stages differ in
+// what the fragment stage does with the surface, never in how geometry is
+// transformed.
+fn transform_vertex(input: VertexIn) -> VertexOut {
+    return transform_vertex_offset(input, vec3f(0.0, 0.0, 0.0));
+}
+
+// Interpolated vertex output to material input.
+//
+// Interpolation denormalizes the basis vectors, so they are renormalized
+// here rather than in every node that reads them.
+fn surface_context(vertex: VertexOut) -> SurfaceContext {
+    var ctx: SurfaceContext;
+    ctx.world_position = vertex.world_position;
+    ctx.world_normal = normalize(vertex.world_normal);
+    ctx.world_tangent = normalize(vertex.world_tangent);
+    ctx.world_bitangent = normalize(vertex.world_bitangent);
+    ctx.view_direction = normalize(eye_position() - vertex.world_position);
+    ctx.uv = vertex.uv;
+    ctx.time = frame_time();
+    return ctx;
+}
+
+// A double-sided material's context on the face being drawn.
+//
+// A back face turns its whole frame toward the viewer, so lighting sees
+// the side being looked at and a normal map's bumps stay on that side.
+fn facing_context(ctx: SurfaceContext, front: bool) -> SurfaceContext {
+    var out = ctx;
+    let side = select(-1.0, 1.0, front);
+    out.world_normal = ctx.world_normal * side;
+    out.world_tangent = ctx.world_tangent * side;
+    out.world_bitangent = ctx.world_bitangent * side;
+    return out;
+}

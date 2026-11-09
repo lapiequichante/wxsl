@@ -1,0 +1,106 @@
+//! particles_draw — a particle system's live particles as sprites
+//! (`effect::particles`).
+//!
+//! One instance per slot of the buffer, six vertices each; a dead slot
+//! (its age past its lifetime) moves its quad off screen. A live one is a
+//! quad facing the camera, `params.start_size` metres in radius at birth
+//! growing to `params.end_size`, and stretched along its velocity as seen
+//! from the camera by the distance it covers in `params.stretch` seconds.
+//! Its radiance (linear rgb) moves from `params.start` to `params.end`
+//! over the first `params.turn` of its life, eases in over its first
+//! twentieth and fades out with the square of what is left, and falls off
+//! from the centre as a gaussian. It is pre-exposed as a surface's is and
+//! added onto the target (an additive pass); within `params.softness`
+//! metres in front of the opaque depth it fades, so a sprite meeting a
+//! surface shows no seam.
+
+import package::wxsl::bindings::{camera, scene, point_sampler};
+
+/// Keep in sync with `particles_simulate.wxsl`.
+struct Particle {
+    position: vec4f,
+    velocity: vec4f,
+}
+
+@group(3) @binding(0) var<storage, read> particles: array<Particle>;
+@group(3) @binding(1) var depth_image: texture_2d<f32>;
+
+struct Sprite {
+    @builtin(position) position: vec4f,
+    /// Across and along the quad, -1..1.
+    @location(0) local: vec2f,
+    /// Where on the quad, in the frame's space.
+    @location(1) world: vec3f,
+    /// The radiance at the centre, pre-exposed.
+    @location(2) radiance: vec3f,
+}
+
+/// The world point at `ndc`.
+fn unproject(ndc: vec3f) -> vec3f {
+    let point = camera.inverse_view_proj * vec4f(ndc, 1.0);
+    return point.xyz / point.w;
+}
+
+@vertex
+fn vertex(@builtin(vertex_index) corner_index: u32, @builtin(instance_index) slot: u32) -> Sprite {
+    var out: Sprite;
+    // Off screen: a quad with nothing to draw.
+    out.position = vec4f(2.0, 2.0, 0.0, 1.0);
+    out.local = vec2f(0.0);
+    out.world = vec3f(0.0);
+    out.radiance = vec3f(0.0);
+    let particle = particles[slot];
+    let age = particle.position.w;
+    let lifetime = particle.velocity.w;
+    if !(age < lifetime) {
+        return out;
+    }
+    let t = age / lifetime;
+    let centre = particle.position.xyz;
+    // The camera's axes, from its inverse.
+    let middle = unproject(vec3f(0.0, 0.0, 0.5));
+    let right = normalize(unproject(vec3f(1.0, 0.0, 0.5)) - middle);
+    let up = normalize(unproject(vec3f(0.0, 1.0, 0.5)) - middle);
+    let towards = normalize(centre - camera.position);
+    // The velocity across the line of sight, the quad's long axis.
+    let velocity = particle.velocity.xyz;
+    let across_sight = velocity - towards * dot(velocity, towards);
+    let moving = length(across_sight);
+    var along = right;
+    var across = up;
+    if moving > 1e-4 {
+        along = across_sight / moving;
+        across = normalize(cross(towards, along));
+    }
+    let size = mix(params.start_size, params.end_size, t);
+    let half_length = size + moving * params.stretch * 0.5;
+    var corners = array<vec2f, 6>(
+        vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(1.0, 1.0),
+        vec2f(-1.0, -1.0), vec2f(1.0, 1.0), vec2f(-1.0, 1.0),
+    );
+    let corner = corners[corner_index % 6u];
+    let world = centre + along * (corner.x * half_length) + across * (corner.y * size);
+    let fade_in = smoothstep(0.0, 0.05, t);
+    let fade_out = (1.0 - t) * (1.0 - t);
+    let colour = mix(params.start.rgb, params.end.rgb, saturate(t / max(params.turn, 1e-4)));
+    // The light a sprite adds spreads over its area: a longer one is
+    // dimmer per pixel, so the stretch does not brighten the system.
+    let spread = size / half_length;
+    out.position = camera.view_proj * vec4f(world, 1.0);
+    out.local = corner;
+    out.world = world;
+    out.radiance = colour * (fade_in * fade_out * spread * scene.exposure);
+    return out;
+}
+
+@fragment
+fn fragment(sprite: Sprite) -> @location(0) vec4f {
+    let falloff = exp(-3.0 * dot(sprite.local, sprite.local));
+    let size = vec2f(textureDimensions(depth_image));
+    let uv = sprite.position.xy / size;
+    let depth = textureSampleLevel(depth_image, point_sampler, uv, 0.0).x;
+    let surface = unproject(vec3f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth));
+    let gap = distance(surface, camera.position) - distance(sprite.world, camera.position);
+    let soft = saturate(gap / max(params.softness, 1e-4));
+    return vec4f(sprite.radiance * (falloff * soft), 0.0);
+}

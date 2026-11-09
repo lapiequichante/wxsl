@@ -1,0 +1,19 @@
+// Tonemap (Reinhard)
+//
+// Compress high dynamic range on luminance, preserving hue.
+//
+// Compressing on luminance rather than per channel is what keeps a bright
+// saturated colour from desaturating the way the naive `c / (1 + c)` form
+// makes it.
+import package::color::luminance::luminance;
+
+fn tonemap_reinhard(
+    color: vec3f, // @default 1.0
+    exposure: f32, // Multiplies the radiance before the curve; 2.0 is one stop brighter. @default 1.0
+) -> vec3f {
+    let exposed = color * exposure;
+    let level = luminance(exposed);
+    let compressed = level / (1.0 + level);
+    // Rescale the original hue to the compressed luminance.
+    return exposed * (compressed / max(level, 1e-5));
+}

@@ -1,0 +1,15 @@
+
+// The mirror on its receivers' pixels only, each by its mapped normal from their
+// G-buffer pass: xy the octahedral normal, z below zero off the receivers.
+@group(3) @binding(5) var receiver_normal: texture_2d<f32>;
+
+@fragment
+fn fragment_mapped(@builtin(position) position: vec4f) -> @location(0) vec4f {
+    let packed = textureLoad(receiver_normal, vec2i(position.xy), 0);
+    if packed.z < 0.0 {
+        return textureLoad(color_image, vec2i(position.xy), 0);
+    }
+    var bumped = gbuffer_decode_normal(packed.xy);
+    if dot(bumped, params.plane.xyz) < 0.0 { bumped = -bumped; }
+    return compose(position, bumped);
+}

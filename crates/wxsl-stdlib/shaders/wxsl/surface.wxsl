@@ -1,0 +1,78 @@
+// The two structs a material graph is written against.
+//
+// `SurfaceContext` is what the renderer hands the material function;
+// `Surface` is what the material function returns. Both mirror the tables in
+// `wxsl_core::abi` field for field, in order — that module is the single
+// place the Rust and WXSL halves of the ABI agree, so a change here is a
+// change there.
+
+struct SurfaceContext {
+    world_position: vec3f,
+    world_normal: vec3f,
+    world_tangent: vec3f,
+    world_bitangent: vec3f,
+    view_direction: vec3f,
+    uv: vec2f,
+    time: f32,
+}
+
+struct Surface {
+    ior: f32,
+    attenuation_distance: f32,
+    base_color: vec3f,
+    metallic: f32,
+    roughness: f32,
+    normal: vec3f,
+    emissive: vec3f,
+    occlusion: f32,
+    alpha: f32,
+    iridescence_strength: f32,
+    iridescence_thickness: f32,
+    iridescence_ior: f32,
+    sheen_color: vec3f,
+    sheen_roughness: f32,
+    clearcoat: f32,
+    clearcoat_roughness: f32,
+    clearcoat_normal: vec3f,
+    diffuse_occlusion: vec3f,
+    specular_occlusion: f32,
+    transmission: f32,
+    thickness: f32,
+}
+
+// A neutral dielectric surface using the geometric normal.
+//
+// The generated material function starts from this and overwrites only the
+// fields the graph drives, which is how an unconnected `normal` input keeps
+// the interpolated geometric normal. The literal values here are mirrored by
+// `SURFACE_FIELDS`' editable defaults in `wxsl_core::abi`, so what the
+// editor shows on an unconnected input is what the shader would have used.
+fn default_surface(ctx: SurfaceContext) -> Surface {
+    var out: Surface;
+    out.ior = 1.5;
+    out.attenuation_distance = 1.0;
+    out.base_color = vec3f(0.8, 0.8, 0.8);
+    out.metallic = 0.0;
+    out.roughness = 0.5;
+    out.normal = normalize(ctx.world_normal);
+    out.emissive = vec3f(0.0, 0.0, 0.0);
+    out.occlusion = 1.0;
+    out.alpha = 1.0;
+    out.iridescence_strength = 0.0;
+    out.iridescence_thickness = 300.0;
+    out.iridescence_ior = 1.3;
+    out.sheen_color = vec3f(0.0);
+    out.sheen_roughness = 0.5;
+    out.clearcoat = 0.0;
+    out.clearcoat_roughness = 0.0;
+    // glTF's coat without a normal texture is unmapped: the geometric
+    // normal, not the base layer's.
+    out.clearcoat_normal = normalize(ctx.world_normal);
+    // Environment-map visibility, from a bake such as PRT.
+    out.diffuse_occlusion = vec3f(1.0);
+    out.specular_occlusion = 1.0;
+    // Clear solid glass for pass.refraction.
+    out.transmission = 1.0;
+    out.thickness = 1.0;
+    return out;
+}

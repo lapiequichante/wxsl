@@ -1,0 +1,33 @@
+[package]
+name = "wxsl-editor"
+description = "Visual node editor for wxsl graphs. Draws itself with wxsl-render; never a dependency of wxsl-core or wxsl-render."
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[dependencies]
+wxsl-core = { workspace = true }
+# The editor draws itself with the renderer's UI layer rather than with a
+# third-party GUI toolkit, and renders the material preview with its
+# pipelines.
+wxsl-render = { workspace = true }
+# The code panels show WXSL and its compiled WGSL, and colour both with
+# wxsl-lang's own lexer (see `highlight.rs`) rather than a second, ad hoc
+# tokenizer that could drift from what the compiler actually accepts.
+wxsl-lang = { workspace = true }
+wgpu = { workspace = true }
+glam = { workspace = true }
+# Commands and queries serialize, for transcripts and the MCP server.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The scene mode's `import_gltf` command; without it the command
+# is refused by name.
+wxsl-gltf = { workspace = true, optional = true }
+
+[features]
+default = []
+gltf = ["dep:wxsl-gltf", "wxsl-render/gltf", "wxsl-render/images"]

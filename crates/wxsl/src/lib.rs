@@ -1,0 +1,130 @@
+//! `wxsl`: WXSL shader node graphs on wgpu, with an optional visual node
+//! editor.
+//!
+//! This is the facade most consumers should depend on directly; it
+//! re-exports the workspace's other crates behind feature flags so a given
+//! build only pays for what it uses:
+//!
+//! | Feature | Default | Pulls in | Use when |
+//! |---|---|---|---|
+//! | `render` | yes | [`wxsl_render`] | you need wgpu pipelines (forward/deferred) driven by a graph |
+//! | `stdlib` | yes | [`wxsl_stdlib`] | you want the built-in library of base nodes (math, color, lighting, SDFs, …) |
+//! | `editor` | no | [`wxsl_editor`] (implies `render`) | you're building a UI that lets users edit graphs visually |
+//! | `images` | no | PNG and JPEG decoding (implies `render`) | a scene's textures come from image files |
+//! | `gltf` | no | the glTF importer (implies `images`) | you load `.gltf`/`.glb` files: geometry, or with `stdlib` whole scenes (`wxsl::asset`) |
+//! | `mcp` | no | [`wxsl_mcp`] (implies `editor`) | agents drive the editor through the Model Context Protocol |
+//!
+//! [`wxsl_core`] (the graph model) is always available; it has no wgpu
+//! or GUI dependency regardless of which features are enabled. See
+//! `docs/architecture.md` for the full crate graph and its boundaries.
+//!
+//! # Putting the halves together
+//!
+//! The renderer deliberately does not depend on the node library (the
+//! dependency arrow only points into `wxsl-core`), so an application has
+//! to hand the library's WXSL modules to the renderer itself. With both
+//! features on, [`stdlib_library`] is that one line:
+//!
+//! ```no_run
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! use wxsl::render::{Renderer, TargetConfig};
+//!
+//! let registry = wxsl::stdlib::registry();
+//! let graph = wxsl::core::graph::Graph::new("empty");
+//! # let device: wgpu::Device = unimplemented!();
+//!
+//! let mut renderer = Renderer::new(
+//!     &device,
+//!     wxsl::stdlib_library(),
+//!     TargetConfig::new(1280, 720, wgpu::TextureFormat::Rgba8Unorm),
+//! )?;
+//! let material = wxsl::render::Material::from_graph(&graph, &registry)?;
+//! renderer.prepare(&device, &material)?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Then, once per frame: a camera and lights, what to draw, and where.
+//!
+//! ```no_run
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! use wxsl::render::{single_draw, DrawItem, Environment, Mesh, MeshKind, RenderRequest};
+//! # let (device, queue): (wgpu::Device, wgpu::Queue) = unimplemented!();
+//! # let view: wgpu::TextureView = unimplemented!();
+//! # let mut renderer: wxsl::render::Renderer = unimplemented!();
+//! # let material: wxsl::render::Material = unimplemented!();
+//!
+//! let cube = Mesh::from_kind(&device, MeshKind::Cube);
+//! let environment = Environment::default();
+//! let draws = single_draw(DrawItem::new(&cube, &material));
+//! renderer.render(
+//!     &device,
+//!     &queue,
+//!     &RenderRequest { view: &view, environment: &environment, draws: &draws },
+//! )?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! See `crates/wxsl/examples/pbr_cube.rs` for a complete program: a PBR
+//! cube, authored as a node graph, rendered through either path, and
+//! `docs/rust.md` for a tour of the main types.
+//!
+//! # Stability
+//!
+//! The workspace is pre-`0.1`. The stable surface it is converging on
+//!
+//! is what each crate exports at its root, plus the document formats and the
+//! C ABI. Anything reached only through a module path, such as
+//! `wxsl::core::codegen::generate`, is unstable: documented and usable, but
+//! free to change in any minor version.
+
+#![warn(missing_docs)]
+
+pub use wxsl_core as core;
+
+#[cfg(all(feature = "render", feature = "stdlib"))]
+pub mod effects;
+
+#[cfg(all(feature = "render", feature = "stdlib"))]
+pub mod scene;
+
+#[cfg(all(feature = "gltf", feature = "stdlib"))]
+pub mod asset;
+
+#[cfg(feature = "render")]
+pub use wxsl_render as render;
+
+#[cfg(feature = "editor")]
+pub use wxsl_editor as editor;
+
+#[cfg(feature = "mcp")]
+pub use wxsl_mcp as mcp;
+
+#[cfg(feature = "stdlib")]
+pub use wxsl_stdlib as stdlib;
+
+/// A [`ShaderLibrary`](wxsl_render::ShaderLibrary) preloaded with every
+/// WXSL module `wxsl-stdlib` ships, including the shader ABI a generated
+/// material module is written against.
+///
+/// Available only with both `render` and `stdlib`, because it is precisely
+/// the bridge between them that neither crate may build itself.
+#[cfg(all(feature = "render", feature = "stdlib"))]
+pub fn stdlib_library() -> wxsl_render::ShaderLibrary {
+    let mut library = wxsl_render::ShaderLibrary::new();
+    library.insert_all(wxsl_stdlib::MODULES.iter().copied());
+    library
+}
+
+#[cfg(all(test, feature = "render", feature = "stdlib"))]
+mod tests {
+    #[test]
+    fn the_stdlib_library_satisfies_the_shader_abi() {
+        let library = super::stdlib_library();
+        library
+            .check_abi()
+            .expect("the stdlib ships every ABI module");
+        assert_eq!(library.len(), wxsl_stdlib::MODULES.len());
+    }
+}

@@ -1,0 +1,478 @@
+// Shadow maps, and the one filtered lookup both render paths use.
+//
+// The two bindings below are part of the frame group (`abi::GROUP_FRAME`),
+// beside the camera and the lights: a shadow map is frame-global in exactly
+// the way the light it comes from. Putting them here rather than in the
+// pass group is what lets the forward stage and the deferred lighting pass
+// share `shadow_factor` instead of each growing a lookup of its own.
+//
+// One depth atlas for every shadow tile (`abi::SHADOW_ATLAS_SIZE`), one
+// tile per atlas slot (`abi::shadow_tile`) — the low slots get the most
+// texels, which is the per-slice resolution: a light claims a run of tiles
+// (`Light.tile_first` + `Light.tile_count`, one per cascade, six per point
+// light) and this module picks the run member that owns the fragment. A
+// light with a zero count is skipped before anything is sampled.
+
+import package::wxsl::bindings::{scene, camera, world_origin, LIGHT_KIND_DIRECTIONAL, LIGHT_KIND_RECTANGLE, light_sample_position};
+
+// How many texels either side of the centre the PCF kernel reaches. 1 is a
+// 3x3 kernel of hardware-filtered comparisons, which is nine fetches and
+// looks like a 4x4 box because each fetch is already bilinear.
+const WXSL_SHADOW_PCF_RADIUS: i32 = 1;
+
+// Contact-hardening shadows, for a light with a source radius:
+// blocker-search taps, filter taps, the widest penumbra in atlas texels,
+// and how many halvings place each blocker's penumbra.
+const WXSL_SHADOW_SEARCH_TAPS: i32 = 12;
+const WXSL_SHADOW_SOFT_TAPS: i32 = 24;
+const WXSL_SHADOW_SOFT_MAX_TEXELS: f32 = 32.0;
+const WXSL_SHADOW_BISECTIONS: i32 = 4;
+// The most times the base taps a light can ask for (`Light.shadow_taps`).
+const WXSL_SHADOW_MAX_TAP_SCALE: i32 = 4;
+// How many times the narrowest penumbra the search finds its widest must
+// be for the blockers to be two kinds under an outside penumbra, each
+// filtered at its own width: a contact shadow inside a far caster's
+// penumbra.
+const WXSL_SHADOW_MIXED: f32 = 4.0;
+// How much wider an outside penumbra's filter is: stretched outward, it is
+// then as wide as a centred one.
+const WXSL_SHADOW_OUTSIDE_SCALE: f32 = 2.0;
+
+// Whether the surface reads every light's penumbra as inside, whatever
+// side the light puts it on (`abi::FEATURE_INSIDE_PENUMBRA`): a body that
+// shadows itself along its folds, which an outside penumbra blackens.
+@macro const wxsl_inside_penumbra: bool = false;
+
+// Keep in sync with SHADOW_CASCADE_BLEND in environment.rs.
+const WXSL_SHADOW_CASCADE_BLEND: f32 = 0.1;
+
+@group(0) @binding(4) var shadow_maps: texture_depth_2d;
+@group(0) @binding(5) var shadow_sampler: sampler_comparison;
+
+// Which of a point light's six tiles the fragment belongs to: the
+// dominant axis of the surface-to-light direction, in the same order the
+// host's `CUBE_FACE_DIRECTIONS` renders them.
+fn cube_face(to_light: vec3f) -> u32 {
+    let a = abs(to_light);
+    if a.x >= a.y && a.x >= a.z {
+        return select(1u, 0u, to_light.x > 0.0);
+    }
+    if a.y >= a.z {
+        return select(3u, 2u, to_light.y > 0.0);
+    }
+    return select(5u, 4u, to_light.z > 0.0);
+}
+
+// How much of light `index` reaches `world_position`: 1.0 fully lit, 0.0
+// fully shadowed.
+//
+// `n_dot_l` is the cosine the caller already computed for its lighting
+// term, passed in rather than recomputed because the bias needs it: a
+// surface the light grazes is the one whose depth samples straddle a texel,
+// so it needs the most offset.
+//
+// # Why normal offset and not depth bias
+//
+// A constant depth bias moves the comparison, so it must be large enough
+// for the worst slope in the scene and then peels every contact shadow away
+// from its object. Offsetting the *sample point* along the surface normal
+// instead moves it sideways in the shadow map, which is where the error
+// actually is, and it costs nothing on a flat-on surface. It is also the
+// only one of the two that behaves on the two things a graph can do to
+// geometry: a displaced vertex has a normal that no longer matches its
+// position, and a perforated one has depth discontinuities everywhere.
+fn shadow_factor(
+    index: u32,
+    world_position: vec3f,
+    world_normal: vec3f,
+    n_dot_l: f32,
+) -> f32 {
+    return shadow_factor_at(index, 0u, world_position, world_normal, n_dot_l);
+}
+
+fn shadow_factor_at(
+    index: u32, sample: u32, world_position: vec3f, world_normal: vec3f, n_dot_l: f32,
+) -> f32 {
+    let light = scene.lights[index];
+    // No tile: nothing casts this light's shadows.
+    if light.tile_count == 0u {
+        return 1.0;
+    }
+    // A surface facing away from the light is behind its own geometry. Its
+    // normal map can still turn the shading normal towards the light, so it
+    // is shadowed here rather than left lit.
+    if n_dot_l <= 0.0 {
+        return 0.0;
+    }
+
+    // `world_position` may be relative to the eye; every matrix and light
+    // position here is absolute, so the origin goes back on first (see
+    // `world_origin`).
+    let absolute = world_position + world_origin();
+    var tile_index = light.tile_first;
+    var blend = 0.0;
+    // How far past the last cascade's reach a point is, over the same
+    // share of its slice the cascades blend over: the shadow fades out
+    // there rather than ending on a line.
+    var fade = 0.0;
+    if light.tile_count > 1u {
+        if light.kind != LIGHT_KIND_DIRECTIONAL {
+            // Select the face after normal offset, just as the projection
+            // below does. The offset can cross an edge; selecting from the
+            // original point would leave the chosen face and return lit.
+            let offset = shadow_normal_offset(world_normal, light.shadow_normal_bias, n_dot_l);
+            tile_index = tile_index + sample * 6u + cube_face(absolute + offset - light_sample_position(index, sample));
+        } else {
+            // Perspective clip.w is camera view depth, exactly the metric
+            // used to fit the slices (also independent of TAA jitter).
+            let reach = (camera.view_proj * vec4f(absolute, 1.0)).w;
+            tile_index = light.tile_first + light.tile_count - 1u;
+            var previous_split = 0.0;
+            for (var t = 0u; t < light.tile_count - 1u; t = t + 1u) {
+                let candidate = light.tile_first + t;
+                let split = scene.shadow_tiles[candidate].split;
+                if reach < split {
+                    tile_index = candidate;
+                    let start = split - (split - previous_split) * WXSL_SHADOW_CASCADE_BLEND;
+                    blend = smoothstep(start, split, reach);
+                    break;
+                }
+                previous_split = split;
+            }
+            if tile_index == light.tile_first + light.tile_count - 1u {
+                let split = scene.shadow_tiles[tile_index].split;
+                let start = split - (split - previous_split) * WXSL_SHADOW_CASCADE_BLEND;
+                fade = smoothstep(start, split, reach);
+                if fade >= 1.0 {
+                    return 1.0;
+                }
+            }
+        }
+    }
+    // A rectangle's softness is its own quadrature; for the
+    // other kinds `radius` is the source's size.
+    let source_radius = select(light.radius, 0.0, light.kind == LIGHT_KIND_RECTANGLE);
+    var outside = light.penumbra > 0.5;
+    @if(wxsl_inside_penumbra)
+    outside = false;
+    let taps = clamp(i32(light.shadow_taps), 1, WXSL_SHADOW_MAX_TAP_SCALE);
+    let shadow = sample_shadow_tile(tile_index, absolute, world_normal, n_dot_l,
+        light.shadow_normal_bias, source_radius, outside, taps);
+    if blend > 0.0 {
+        let next = sample_shadow_tile(tile_index + 1u, absolute, world_normal, n_dot_l,
+            light.shadow_normal_bias, source_radius, outside, taps);
+        return mix(shadow, next, blend);
+    }
+    return mix(shadow, 1.0, fade);
+}
+
+fn sample_shadow_tile(
+    tile_index: u32,
+    absolute: vec3f,
+    world_normal: vec3f,
+    n_dot_l: f32,
+    normal_bias: f32,
+    source_radius: f32,
+    outside: bool,
+    taps: i32,
+) -> f32 {
+    let tile = scene.shadow_tiles[tile_index];
+    let rect = tile.rect;
+
+    let offset = shadow_normal_offset(world_normal, normal_bias, n_dot_l);
+    let clip = tile.view_proj * vec4f(absolute + offset, 1.0);
+    let ndc = clip.xyz / clip.w;
+    // Past the far plane of the light's view: nothing was rendered there to
+    // cast a shadow, so it is lit rather than black.
+    if ndc.z <= 0.0 || ndc.z >= 1.0 {
+        return 1.0;
+    }
+    // Inside the tile itself: the atlas is shared, and a projection
+    // that leaves the frustum must not read the neighbour's texels.
+    let local = vec2f(ndc.x, -ndc.y) * 0.5 + vec2f(0.5);
+    if local.x < 0.0 || local.x > 1.0 || local.y < 0.0 || local.y > 1.0 {
+        return 1.0;
+    }
+    let uv = rect.xy + local * rect.zw;
+
+    // Atlas UVs advance by one atlas texel, regardless of tile size.
+    let texel = 1.0 / vec2f(textureDimensions(shadow_maps));
+    // The receiver plane gives the reference depth at each texel centre:
+    // one shared reference self-shadows a slanted surface, the far
+    // cascades and a wall a lamp grazes.
+    var depth_gradient = vec2f(0.0);
+    // Differentiate the projected receiver plane analytically; this
+    // works for both orthographic cascades and perspective area faces.
+    let axis = select(vec3f(0.0, 1.0, 0.0), vec3f(1.0, 0.0, 0.0), abs(world_normal.y) > 0.9);
+    let tangent = normalize(cross(world_normal, axis));
+    let bitangent = cross(world_normal, tangent);
+    let a_clip = tile.view_proj * vec4f(tangent, 0.0);
+    let b_clip = tile.view_proj * vec4f(bitangent, 0.0);
+    let a = (a_clip.xyz - ndc * a_clip.w) / clip.w;
+    let b = (b_clip.xyz - ndc * b_clip.w) / clip.w;
+    let det = a.x * b.y - a.y * b.x;
+    if abs(det) > 1e-12 {
+        depth_gradient = vec2f(a.z * b.y - a.y * b.z, a.x * b.z - a.z * b.x)
+            / det * vec2f(2.0, -2.0) / rect.zw;
+    }
+    if source_radius > 0.0 {
+        // Turn the taps per screen pixel, about a 1080p grid of them, by
+        // blue noise: per shadow texel, a texel spans many pixels near
+        // the eye and a grazing surface stretches it; a gradient noise
+        // shows its own stripes without a temporal filter to average it.
+        let screen = camera.view_proj * vec4f(absolute, 1.0);
+        let cell = vec2i(floor(screen.xy / screen.w * vec2f(960.0, 540.0)) + vec2f(4096.0));
+        let phase = 6.2831853 * blue_noise(bitcast<vec2u>(cell));
+        return soft_shadow(tile_index, uv, clip, ndc, depth_gradient, texel, source_radius, outside, phase, taps);
+    }
+    // The PCF kernel's bilinear taps, one texel apart, cover a block of
+    // texels one wider than the kernel; summed, each texel weighs 1 but
+    // the block's edges, which weigh the bilinear fraction. So each texel
+    // is compared once, with the receiver's depth at its own centre.
+    let pixel = uv / texel - vec2f(0.5);
+    let base = vec2i(floor(pixel));
+    let fraction = fract(pixel);
+    let low = vec2i(round(rect.xy / texel));
+    let high = vec2i(round((rect.xy + rect.zw) / texel)) - vec2i(1);
+    let last = WXSL_SHADOW_PCF_RADIUS + 1;
+    var sum = 0.0;
+    for (var y = -WXSL_SHADOW_PCF_RADIUS; y <= last; y = y + 1) {
+        let weight_y = select(select(1.0, fraction.y, y == last), 1.0 - fraction.y, y == -WXSL_SHADOW_PCF_RADIUS);
+        for (var x = -WXSL_SHADOW_PCF_RADIUS; x <= last; x = x + 1) {
+            let weight_x = select(select(1.0, fraction.x, x == last), 1.0 - fraction.x, x == -WXSL_SHADOW_PCF_RADIUS);
+            let coord = clamp(base + vec2i(x, y), low, high);
+            let centre = (vec2f(coord) + vec2f(0.5)) * texel;
+            let reference = min(ndc.z + dot(depth_gradient, centre - uv), 1.0);
+            // One texel's comparison: the filtering comparison sampler at
+            // the texel's exact centre weighs only that texel. A second,
+            // non-comparison sampler on the atlas has no GLSL spelling —
+            // a GL texture unit holds one sampler. `...Level`
+            // rather than `textureSampleCompare`, which needs uniform
+            // control flow: this is called from inside a light loop after
+            // an early return, and a shadow map has no mip chain anyway.
+            sum = sum + weight_x * weight_y
+                * textureSampleCompareLevel(shadow_maps, shadow_sampler, centre, reference);
+        }
+    }
+    let width = f32(2 * WXSL_SHADOW_PCF_RADIUS + 1);
+    return sum / (width * width);
+}
+
+// A 16x16 blue-noise tile, a void-and-cluster rank map (Ulichney 1993)
+// generated for this file, four 8-bit ranks a word, row by row: each
+// pixel's turn differs most from its neighbours', so the grain is fine
+// and even rather than clumped.
+const WXSL_BLUE_NOISE: array<u32, 64> = array<u32, 64>(
+    0x13bc32eau, 0x2f79ab3au, 0x68f702a3u, 0x410e8416u,
+    0x617608d1u, 0xe417cdf0u, 0xaa7b408au, 0x9563e048u,
+    0xa5e58b55u, 0x546f924eu, 0xe71ed8b0u, 0xb42ac999u,
+    0x1dc33e19u, 0xf907b92bu, 0x30bf6429u, 0xf3800557u,
+    0xfd6598ddu, 0xc83bdc82u, 0x70880c9cu, 0x6d45aeffu,
+    0x4903bd2eu, 0x748e5aacu, 0x3dd2ed50u, 0xa0ce2193u,
+    0x71d97c51u, 0x1bf10fd0u, 0x14b22da8u, 0x12e160c1u,
+    0x233ca4f2u, 0x44b5359du, 0x537d69dfu, 0x8d3783ecu,
+    0x86e30ac5u, 0xc67e5ff6u, 0xa1f40094u, 0x6ab60947u,
+    0x4bb35d28u, 0x24da06c0u, 0x22ca395bu, 0x4ae99bd7u,
+    0x189678fcu, 0x77a63f6eu, 0x6785b7e8u, 0xa71f7531u,
+    0xee33d410u, 0x15fe89cfu, 0xfa0d974cu, 0x87cb58beu,
+    0xa952b866u, 0x34bb5926u, 0x43ad62ccu, 0x38de0481u,
+    0x7f0190e6u, 0x729a0be2u, 0x1cdb27efu, 0x4daf91ebu,
+    0x46f825c4u, 0xb142c76bu, 0x9f738f11u, 0x1a6c2c56u,
+    0xd69e5c7au, 0x5ef5208cu, 0x36c24fd5u, 0xa2fbbad3u,
+);
+
+// The tile's value in [0, 1) at `cell`, repeated over the screen.
+fn blue_noise(cell: vec2u) -> f32 {
+    let index = (cell.y % 16u) * 16u + cell.x % 16u;
+    let rank = (WXSL_BLUE_NOISE[index / 4u] >> ((index % 4u) * 8u)) & 0xffu;
+    return (f32(rank) + 0.5) / 256.0;
+}
+
+// One of `count` points of a Vogel disk of radius one, turned by `phase`:
+// evenly spread for any count, and a different turn per pixel trades
+// banding for grain.
+fn vogel_disk(index: i32, count: i32, phase: f32) -> vec2f {
+    let radius = sqrt((f32(index) + 0.5) / f32(count));
+    let angle = f32(index) * 2.3999632 + phase;
+    return radius * vec2f(cos(angle), sin(angle));
+}
+
+// Percentage-closer soft shadows (Fernando 2005) over the comparison
+// sampler alone: the atlas has no raw-depth read on GL,
+// so each search tap that finds a blocker places it by
+// bisection. The penumbra is the source's radius scaled by how far the
+// receiver is behind the average blocker, so a contact shadow stays sharp
+// and a far one blurs.
+//
+// The penumbra straddles the hard edge, or, `outside`, lies wholly
+// outside the shadow: the centred filter reads half the light
+// at the edge and all of it a penumbra out, and is stretched to read none
+// at the edge, so the shadow's inside stays dark; the filter is twice as
+// wide, for the penumbra to keep its width. Outside, blockers of two
+// kinds, a contact shadow inside a far caster's penumbra, are filtered
+// each at its own width and the darker wins: one average would blur the
+// contact shadow away inside the far penumbra.
+//
+// By similar triangles a blocker at reach b casts a penumbra of
+// R (r - b) / b at a receiver at reach r from a point-like source (the
+// distance from the eye of a perspective tile: a spot, a point face,
+// where depth is A + B / reach), and R (r - b) from a parallel one (the
+// distance past the near plane of an orthographic cascade, where depth
+// is linear, R being the tangent of the angular radius). The bisection
+// runs over that penumbra in atlas texels rather than over depth: two
+// texels a step whatever the view's depth range, and a blocker whose
+// penumbra would pass the widest is clamped to it anyway.
+fn soft_shadow(
+    tile_index: u32, uv: vec2f, clip: vec4f, ndc: vec3f, gradient: vec2f, texel: vec2f,
+    source_radius: f32, outside: bool, phase: f32, taps: i32,
+) -> f32 {
+    let tile = scene.shadow_tiles[tile_index];
+    let rect = tile.rect;
+    let m = tile.view_proj;
+    let row0 = vec3f(m[0].x, m[1].x, m[2].x);
+    let row2 = vec3f(m[0].z, m[1].z, m[2].z);
+    let row3 = vec3f(m[0].w, m[1].w, m[2].w);
+    let perspective = dot(row3, row3) > 0.5;
+    // A perspective tile's rows 2 and 3 are parallel, which gives A and B.
+    let a = dot(row2, row3) / max(dot(row3, row3), 1e-12);
+    let b = clip.z - a * clip.w;
+    let depth_scale = length(row2);
+    let receiver = select(ndc.z / depth_scale, clip.w, perspective);
+    // Penumbra texels per unit of (r - b) / b, or of r - b: the source's
+    // radius in atlas texels at the receiver.
+    let spread = source_radius * length(row0) / clip.w * 0.5 * rect.z / texel.x;
+
+    let low = rect.xy + texel * 0.5;
+    let high = rect.xy + rect.zw - texel * 0.5;
+
+    // Search where a blocker could shadow this point: the penumbra a
+    // blocker halfway to a point-like source casts, and the widest for a
+    // parallel one. Nearer blockers' penumbrae are underestimated; a wider
+    // search would spread the taps too thin to find an edge.
+    let search = clamp(spread * select(receiver, 1.0, perspective), 1.0, WXSL_SHADOW_SOFT_MAX_TEXELS);
+    // Each tap's blocker as its penumbra in texels: -1 for none, 0 for
+    // contact.
+    let search_taps = WXSL_SHADOW_SEARCH_TAPS * taps;
+    let soft_taps = WXSL_SHADOW_SOFT_TAPS * taps;
+    var penumbra_of: array<f32, WXSL_SHADOW_SEARCH_TAPS * WXSL_SHADOW_MAX_TAP_SCALE>;
+    var penumbrae = 0.0;
+    var counted = 0.0;
+    var found = false;
+    var narrowest = WXSL_SHADOW_SOFT_MAX_TEXELS;
+    var widest = 0.0;
+    for (var i = 0; i < search_taps; i = i + 1) {
+        penumbra_of[i] = -1.0;
+        let tap = clamp(uv + vogel_disk(i, search_taps, phase) * search * texel, low, high);
+        let reference = min(ndc.z + dot(gradient, tap - uv), 1.0);
+        if textureSampleCompareLevel(shadow_maps, shadow_sampler, tap, reference) < 0.5 {
+            var narrower = 0.0;
+            var wider = WXSL_SHADOW_SOFT_MAX_TEXELS;
+            for (var k = 0; k < WXSL_SHADOW_BISECTIONS; k = k + 1) {
+                let middle = 0.5 * (narrower + wider);
+                let depth = blocker_depth(middle, receiver, spread, perspective, depth_scale, a, b);
+                // The comparison is `Less`: shadowed means the stored
+                // depth is in front, so the blocker is nearer the light
+                // and its penumbra wider.
+                if textureSampleCompareLevel(shadow_maps, shadow_sampler, tap, depth) < 0.5 {
+                    narrower = middle;
+                } else {
+                    wider = middle;
+                }
+            }
+            found = true;
+            // A blocker in the narrowest interval is in contact, or is the
+            // receiver itself seen past its bias: either way the edge is
+            // sharp there, and averaging it in would narrow the penumbra
+            // of the real blockers around it.
+            var penumbra = 0.0;
+            if narrower > 0.0 {
+                penumbra = 0.5 * (narrower + wider);
+                penumbrae = penumbrae + penumbra;
+                counted = counted + 1.0;
+            }
+            penumbra_of[i] = penumbra;
+            narrowest = min(narrowest, max(penumbra, 1.0));
+            widest = max(widest, penumbra);
+        }
+    }
+    if !found {
+        return 1.0;
+    }
+    let scale = select(1.0, WXSL_SHADOW_OUTSIDE_SCALE, outside);
+    if !outside || widest <= narrowest * WXSL_SHADOW_MIXED {
+        let width = max(penumbrae / max(counted, 1.0), 1.0) * scale;
+        var lit = 0.0;
+        for (var i = 0; i < soft_taps; i = i + 1) {
+            let tap = clamp(uv + vogel_disk(i, soft_taps, phase) * width * texel, low, high);
+            let reference = min(ndc.z + dot(gradient, tap - uv), 1.0);
+            lit = lit + textureSampleCompareLevel(shadow_maps, shadow_sampler, tap, reference);
+        }
+        let centred = lit / f32(soft_taps);
+        return select(centred, outward(centred), outside);
+    }
+
+    // Two kinds of blockers, told apart at the geometric mean of the
+    // narrowest and widest penumbrae: the depth a blocker casting that
+    // penumbra has. A stored depth in front of it is a far blocker's.
+    let split = sqrt(narrowest * widest);
+    let split_depth = blocker_depth(split, receiver, spread, perspective, depth_scale, a, b);
+    var near_sum = 0.0;
+    var near_count = 0.0;
+    var far_sum = 0.0;
+    var far_count = 0.0;
+    for (var i = 0; i < search_taps; i = i + 1) {
+        let penumbra = penumbra_of[i];
+        if penumbra >= split {
+            far_sum = far_sum + penumbra;
+            far_count = far_count + 1.0;
+        } else if penumbra > 0.0 {
+            near_sum = near_sum + penumbra;
+            near_count = near_count + 1.0;
+        }
+    }
+    let near_width = max(near_sum / max(near_count, 1.0), 1.0) * scale;
+    let far_width = far_sum / max(far_count, 1.0) * scale;
+    // The far blockers over their own width; the near ones over theirs,
+    // as what is shadowed at the receiver but not by a far blocker.
+    var far_lit = 0.0;
+    var near_shadowed = 0.0;
+    for (var i = 0; i < soft_taps; i = i + 1) {
+        let disk = vogel_disk(i, soft_taps, phase);
+        let far_tap = clamp(uv + disk * far_width * texel, low, high);
+        far_lit = far_lit + textureSampleCompareLevel(shadow_maps, shadow_sampler, far_tap,
+            min(split_depth + dot(gradient, far_tap - uv), 1.0));
+        let near_tap = clamp(uv + disk * near_width * texel, low, high);
+        let past_far = textureSampleCompareLevel(shadow_maps, shadow_sampler, near_tap,
+            min(split_depth + dot(gradient, near_tap - uv), 1.0));
+        let at_receiver = textureSampleCompareLevel(shadow_maps, shadow_sampler, near_tap,
+            min(ndc.z + dot(gradient, near_tap - uv), 1.0));
+        near_shadowed = near_shadowed + max(past_far - at_receiver, 0.0);
+    }
+    let count = f32(soft_taps);
+    return min(outward(far_lit / count), outward(1.0 - near_shadowed / count));
+}
+
+// A centred filter's light, `lit`, as a penumbra outside the edge: none at
+// the edge, where the filter reads half, all of it where it reads all.
+fn outward(lit: f32) -> f32 {
+    return saturate(2.0 * lit - 1.0);
+}
+
+// The depth in the tile of a blocker whose penumbra at `receiver` is
+// `penumbra` atlas texels: by similar triangles (see `soft_shadow`).
+fn blocker_depth(
+    penumbra: f32, receiver: f32, spread: f32, perspective: bool, depth_scale: f32, a: f32, b: f32,
+) -> f32 {
+    let reach = select(receiver - penumbra / spread, receiver * spread / (spread + penumbra), perspective);
+    return select(reach * depth_scale, a + b / reach, perspective);
+}
+
+fn shadow_normal_offset(normal: vec3f, bias: f32, n_dot_l: f32) -> vec3f {
+    return normal * bias * (1.0 + slope(n_dot_l));
+}
+
+// tan(acos(n_dot_l)), clamped: how far along the surface one texel of
+// depth error reaches at this angle.
+fn slope(n_dot_l: f32) -> f32 {
+    return clamp(sqrt(1.0 - n_dot_l * n_dot_l) / max(n_dot_l, 1e-3), 0.0, 4.0);
+}

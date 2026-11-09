@@ -1,0 +1,2658 @@
+//! The lighting-model registry, and the two shaders generated from it.
+//!
+//! A *lighting model* is one WXSL function of one fixed signature plus a
+//! small integer id. A material declares which one shades it; a deferred
+//! pipeline enables a *set* of them, packs each fragment's choice into a
+//! G-buffer channel, and its lighting pass dispatches on that id. The
+//! forward path needs no dispatch at all — it shades where the surface is
+//! evaluated, so each material simply calls its own model.
+//!
+//! The registry entry is the seam. Nothing downstream — the generated
+//! dispatch, the G-buffer layout, the lighting pass — can tell a
+//! hand-written model from one generated out of a graph, so adding
+//! graph-authored models later is a new *producer* of entries, not a
+//! redesign of any of this.
+//!
+//! # The model contract
+//!
+//! Every model function has the signature, in WXSL spelling:
+//!
+//! ```text
+//! fn <function>(surface: Surface, ctx: SurfaceContext, light: LightSample, extra: vec4f) -> vec3f
+//! ```
+//!
+//! `surface` is what the material produced, `ctx` the per-fragment inputs,
+//! `light` the one light being contributed, and `extra` the texel of the
+//! model's requested G-buffer target — or zero for a model that requested
+//! none. One `vec4f` is enough because the G-buffer's own convention is
+//! packing two quantities per target; a model that outgrows it is a schema
+//! change recorded here, not a per-model special case.
+//!
+//! A model that requests a target also names a *pack* function in its
+//! module, `fn <pack>(surface: Surface) -> vec4f`, which the material's
+//! G-buffer stage calls to fill it. The lighting side reads the texel back
+//! and hands it to the model as `extra`.
+//!
+//! # What is generated
+//!
+//! Three things, all data-driven and all in this module so there is one
+//! place that knows the shape:
+//!
+//! * the per-light dispatch plus the whole [`abi::SHADE_SURFACE_FN`] — the
+//!   light loop, ambient, exposure and tonemap — which replaced the
+//!   hand-written `shading.wxsl`, because the call inside the loop is the
+//!   one thing that varies with the enabled set;
+//! * the [`abi::GBUFFER_STRUCT`] struct and [`abi::PACK_GBUFFER_FN`] — its
+//!   fields are the set's layout, so they cannot be fixed shipped text;
+//! * the whole deferred lighting pass, including
+//!   [`abi::UNPACK_GBUFFER_FN`] and a `switch` over the id.
+//!
+//! A model nobody enabled is not even imported, so it costs nothing — and
+//! dead-code elimination removes what conditional translation
+//! leaves behind.
+
+use core::fmt;
+use std::fmt::Write as _;
+
+use crate::abi::{self, GBufferPrecision, GBufferTarget};
+use crate::identity;
+use crate::wxsl::stable_hash;
+
+/// The field name of the G-buffer target every model's data shares.
+pub const MODEL_DATA_FIELD: &str = "model";
+
+/// The one G-buffer target that carries model data.
+///
+/// A pixel is shaded by one model, so the models share it: each pixel's
+/// material writes its own model's pack (or the feature its model
+/// consumes), and the lighting pass hands the texel to that model's arm.
+/// A plan carries it when anything requests a channel; one HDR `vec4`,
+/// which brings the G-buffer to the 32-byte floor whatever the set. The
+/// dispatch id rides in the normal target's fourth channel.
+pub const MODEL_DATA_TARGET: GBufferTarget = GBufferTarget {
+    field: MODEL_DATA_FIELD,
+    doc: "the pixel's model's data, read by its id (see ModelExtra)",
+    precision: GBufferPrecision::HighDynamicRange,
+};
+
+/// The name of the passthrough model a forward-shaded material's pixels
+/// route by.
+///
+/// A material marked forward-shaded keeps its own model — that is what
+/// shades it, in the geometry pass, under either pipeline. `wxsl.preshaded`
+/// is only the *route*: the material's G-buffer pixels carry its id, and
+/// the generated lighting pass returns the radiance they stored before the
+/// light loop can run. Resolution requires the set to enable it whenever a
+/// material is marked forward-shaded, by name, so the route always exists.
+pub const PRESHADED_MODEL: &str = "wxsl.preshaded";
+
+/// The G-buffer channels a model may ask for, and how they are filled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ModelExtra {
+    /// What the model stores in the shared [`MODEL_DATA_TARGET`]: the
+    /// field names the meaning (for debug views and diagnostics), the
+    /// precision how many of its channels the model reads.
+    pub target: GBufferTarget,
+    /// Name of the function in the model's module that fills the target
+    /// from the surface: `fn <pack>(surface: Surface) -> vec4f`.
+    pub pack: &'static str,
+}
+
+/// Where a G-buffer channel request came from.
+///
+/// The tags are what make the channel list *semantic*: an error can say
+/// which two authors collided, and a reader can see that a channel exists
+/// because a model asked for it — or because a material feature did,
+/// without any model in between.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ChannelSource {
+    /// The ABI's base targets and the shared model target — the fixed
+    /// part of every plan, which every request is measured against.
+    BaseLayout,
+    /// A lighting model's own request — its `extra`.
+    Model {
+        /// The model's name.
+        name: &'static str,
+    },
+    /// A material feature asking directly, the second source P12 adds:
+    /// data a *model* consumes, requested by the *feature* that owns it.
+    Feature {
+        /// The feature's name.
+        name: &'static str,
+    },
+}
+
+impl ChannelSource {
+    /// The source, as an error message names it.
+    pub fn describe(self) -> String {
+        match self {
+            ChannelSource::BaseLayout => "the G-buffer's base layout".to_string(),
+            ChannelSource::Model { name } => format!("the lighting model `{name}`"),
+            ChannelSource::Feature { name } => format!("the material feature `{name}`"),
+        }
+    }
+
+    /// The name the source goes by, whatever kind it is.
+    pub fn name(self) -> &'static str {
+        match self {
+            ChannelSource::BaseLayout => "base",
+            ChannelSource::Model { name } | ChannelSource::Feature { name } => name,
+        }
+    }
+}
+
+impl fmt::Display for ChannelSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.describe())
+    }
+}
+
+/// One request for a G-buffer channel, with who asked for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ChannelRequest {
+    /// Who asked, for errors and for readers that care.
+    pub source: ChannelSource,
+    /// The channel: its field name, its docs and its precision.
+    pub target: GBufferTarget,
+}
+
+/// A material feature: the second source of channel requests.
+///
+/// Where a lighting model both requests a channel and consumes it, a
+/// feature *owns* a channel on the models' behalf — subsurface inputs are
+/// the shape: the feature declares the channel, the material turns it on
+/// with its macro and fills it through the feature's pack, and any model
+/// that supports the feature reads it from the extras struct its dispatch
+/// hands it. Nothing downstream can tell a feature's channel from a
+/// model's own, which is the point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MaterialFeature {
+    /// The feature's name, as `Renderer::set_features` and this registry's
+    /// lookups spell it.
+    pub name: &'static str,
+    /// The macro whose `true` value turns the feature on for a material —
+    /// and demands its channel of the surrounding pipeline. Declared by
+    /// the feature's module, so a material pinning it is a normal macro
+    /// pin, and part of the variant cache key like any macro.
+    pub macro_name: &'static str,
+    /// WXSL module path holding `pack`, shipped by the same library that
+    /// ships the model modules.
+    pub module: &'static str,
+    /// Name of the function in the module that produces the channel's
+    /// value: `fn <pack>() -> vec2f` — surface-independent for now,
+    /// reading the feature's own macro constants. A surface-driven
+    /// feature needs a `Surface` field, which is a schema change recorded
+    /// when the first such feature lands.
+    pub pack: &'static str,
+    /// The channel the feature asks for.
+    pub target: GBufferTarget,
+    /// What the feature is, for editors and diagnostics.
+    pub doc: &'static str,
+}
+
+/// Subsurface: the first material feature, and the proof that channels
+/// have a second source. Its channel carries `(strength, radius)` per
+/// fragment; the shipped models do not read it yet — a feature-consuming
+/// model is the first real subsurface model's work, and the seam this
+/// entry provides is what that model builds on.
+pub const SUBSURFACE: MaterialFeature = MaterialFeature {
+    name: "subsurface",
+    macro_name: "wxsl_subsurface",
+    module: "package::wxsl::features::subsurface",
+    pack: "pack_subsurface",
+    target: GBufferTarget {
+        field: "subsurface",
+        doc: "xy = (subsurface strength, radius), for feature-aware models",
+        precision: GBufferPrecision::HighDynamicRangePair,
+    },
+    doc: "Subsurface inputs packed per fragment, for feature-aware models.",
+};
+
+/// The shipped material features.
+pub const FEATURES: &[MaterialFeature] = &[SUBSURFACE];
+
+/// The feature named `name`.
+pub fn feature_by_name(name: &str) -> Option<&'static MaterialFeature> {
+    FEATURES.iter().find(|feature| feature.name == name)
+}
+
+/// The feature turned on by a material's pin of `macro_name`.
+pub fn feature_for_macro(macro_name: &str) -> Option<&'static MaterialFeature> {
+    FEATURES
+        .iter()
+        .find(|feature| feature.macro_name == macro_name)
+}
+
+/// The channel requests for the named features. An unknown name is an
+/// error here rather than a silent drop — a pipeline that quietly skips a
+/// feature its documents name would reshade, not fail.
+pub fn feature_requests(names: &[&str]) -> Result<Vec<ChannelRequest>, LightingError> {
+    names
+        .iter()
+        .map(|name| {
+            let feature = feature_by_name(name).ok_or_else(|| LightingError::UnknownFeature {
+                name: name.to_string(),
+            })?;
+            Ok(ChannelRequest {
+                source: ChannelSource::Feature { name: feature.name },
+                target: feature.target,
+            })
+        })
+        .collect()
+}
+
+/// The collected G-buffer channel plan: the base targets, the shared model
+/// target if anything requests a channel, and every request — model and
+/// feature — with collisions named.
+///
+/// This is the single answer to "what does the deferred path attach,
+/// bind and read" that [`LightingSet::gbuffer_layout`] has always been,
+/// extended to the second source. The generated struct, the pack, the
+/// lighting pass and `wxsl-render`'s resource declaration all read it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GBufferPlan {
+    id_channel: bool,
+    requests: Vec<ChannelRequest>,
+    layout: Vec<GBufferTarget>,
+}
+
+impl GBufferPlan {
+    /// Validate and build a plan: model requests first, in id order —
+    /// the order the set packs them in — then feature requests, each
+    /// claiming a field name the others have not taken.
+    pub fn new(
+        id_channel: bool,
+        requests: impl IntoIterator<Item = ChannelRequest>,
+    ) -> Result<Self, LightingError> {
+        // The requests name meanings that share one target, so
+        // the layout grows by that target alone; the names must still be
+        // distinct, since a debug view and a diagnostic go by them.
+        let mut requests: Vec<ChannelRequest> = requests.into_iter().collect();
+        requests.sort_by_key(|request| match request.source {
+            ChannelSource::Model { .. } => (0, request.source.name()),
+            ChannelSource::Feature { .. } => (1, request.source.name()),
+            ChannelSource::BaseLayout => (2, ""),
+        });
+        let mut layout: Vec<GBufferTarget> = abi::GBUFFER_BASE_TARGETS.to_vec();
+        let mut claimed: Vec<(&'static str, ChannelSource)> = layout
+            .iter()
+            .chain([&MODEL_DATA_TARGET])
+            .map(|target| (target.field, ChannelSource::BaseLayout))
+            .collect();
+        for request in &requests {
+            if let Some((_, first)) = claimed
+                .iter()
+                .find(|(field, _)| *field == request.target.field)
+            {
+                return Err(LightingError::DuplicateChannel {
+                    field: request.target.field.to_string(),
+                    first: *first,
+                    second: request.source,
+                });
+            }
+            claimed.push((request.target.field, request.source));
+        }
+        if !requests.is_empty() {
+            layout.push(MODEL_DATA_TARGET);
+        }
+        Ok(GBufferPlan {
+            id_channel,
+            requests,
+            layout,
+        })
+    }
+
+    /// The layout this plan asks for, in `@location` order.
+    pub fn layout(&self) -> &[GBufferTarget] {
+        &self.layout
+    }
+
+    /// The collected requests, sources included.
+    pub fn requests(&self) -> &[ChannelRequest] {
+        &self.requests
+    }
+
+    /// Whether the lighting pass reads the normal target's fourth channel
+    /// as a model id: the set dispatches.
+    pub fn id_channel(&self) -> bool {
+        self.id_channel
+    }
+
+    /// Whether the plan carries the shared [`MODEL_DATA_TARGET`].
+    pub fn model_data(&self) -> bool {
+        !self.requests.is_empty()
+    }
+
+    /// The features part of the plan's identity, for cache keys.
+    pub fn signature(&self) -> String {
+        let names = self
+            .requests
+            .iter()
+            .filter(|request| matches!(request.source, ChannelSource::Feature { .. }))
+            .map(|request| request.source.name())
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("features={names}")
+    }
+}
+
+/// One lighting model: a registry entry, and the whole contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LightingModel {
+    /// The id written into the G-buffer and switched over. Unique within a
+    /// set, and stable across sessions — a saved scene names models, so
+    /// renumbering one silently reshades everything that used it.
+    pub id: u32,
+    /// Short name, as a scene document and a command line spell it.
+    pub name: &'static str,
+    /// WXSL module path holding `function` (and `extra`'s pack).
+    pub module: &'static str,
+    /// The model function, per the contract in this module's docs.
+    pub function: &'static str,
+    /// Optional model-owned analytic ambient, of signature
+    /// `fn(surface: Surface, ctx: SurfaceContext, extra: vec4f) -> vec3f`.
+    /// `None` retains the shared GGX ambient.
+    pub ambient: Option<&'static str>,
+    /// Optional model-owned response to an unshadowed rectangle or tube,
+    /// integrated analytically, of signature
+    /// `fn(surface: Surface, ctx: SurfaceContext, area: AreaLight, extra: vec4f) -> vec3f`.
+    /// `None` keeps the light loop's samples for this model.
+    pub area: Option<&'static str>,
+    /// The G-buffer target this model asks for, if any.
+    pub extra: Option<ModelExtra>,
+    /// The material feature whose channel this model consumes, if any —
+    /// the name of a [`FEATURES`] entry that owns the channel.
+    /// When the surrounding plan carries it, the dispatch hands it to the
+    /// model as `extra` under the feature's own macro; when it does not,
+    /// the arm reads zeros and the model shades without it. A model may
+    /// not own its feature's channel as `extra` — the feature owns it.
+    pub feature: Option<&'static str>,
+    /// What the model is, for editors and diagnostics.
+    pub doc: &'static str,
+}
+
+impl LightingModel {
+    /// The registry entry as a cache-key and label string.
+    fn signature(&self) -> String {
+        let mut signature = format!("{}:{}", self.name, self.id);
+        if let Some(ambient) = self.ambient {
+            let _ = write!(signature, ":ambient={ambient}");
+        }
+        if let Some(area) = self.area {
+            let _ = write!(signature, ":area={area}");
+        }
+        signature
+    }
+}
+
+/// Something is wrong with a set of lighting models.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LightingError {
+    /// Two entries claim the same id, so one would silently win the
+    /// dispatch.
+    DuplicateId {
+        /// The contested id.
+        id: u32,
+    },
+    /// Two entries share a name, so a scene naming one is ambiguous.
+    DuplicateName {
+        /// The contested name.
+        name: String,
+    },
+    /// An entry's name carries no package segment. Names are
+    /// `package.name` (`wxsl.pbr`); a set assembled from more than one
+    /// library's models cannot tell two bare `toon`s apart, so a
+    /// registration says who owns the name
+    /// ([`crate::identity`]).
+    UnnamespacedModel {
+        /// The name that was refused.
+        name: String,
+    },
+    /// The set is empty, which no pipeline can draw with.
+    Empty,
+    /// A model has its own `extra` and consumes a feature: both would be
+    /// stored in the one model target.
+    TwoDataSources {
+        /// The model's name.
+        name: String,
+    },
+    /// A material names a model the set does not enable.
+    UnknownModel {
+        /// The name that was asked for.
+        name: String,
+    },
+    /// A feature list names a feature this registry does not ship.
+    UnknownFeature {
+        /// The name that was asked for.
+        name: String,
+    },
+    /// A material pins a feature's macro while the plan it is resolved
+    /// against carries no channel for it — the check happens at resolution.
+    FeatureNotCarried {
+        /// The macro the material pinned.
+        macro_name: &'static str,
+        /// The feature that macro asks for.
+        feature: &'static str,
+    },
+    /// Two requests claim the same G-buffer field — the collision the
+    /// source tags exist to name.
+    DuplicateChannel {
+        /// The contested field name.
+        field: String,
+        /// Who claimed it first.
+        first: ChannelSource,
+        /// Who claimed it second.
+        second: ChannelSource,
+    },
+    /// A material is marked forward-shaded while the pipeline's lighting
+    /// set does not enable [`PRESHADED_MODEL`] — its pixels would carry an
+    /// id the lighting pass has no route for.
+    PreshadedNotEnabled,
+    /// A material is marked forward-shaded and still receives shadows —
+    /// a combination that cannot be honoured, because the surface's
+    /// radiance is computed in the geometry pass, before any shadow map
+    /// exists to attenuate it.
+    ForwardShadedWithShadows,
+    /// A material is marked forward-shaded and names [`PRESHADED_MODEL`]
+    /// as its own model — the route, not a shading function; there would
+    /// be nothing left to shade it with.
+    ForwardShadedModel,
+}
+
+impl fmt::Display for LightingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LightingError::DuplicateId { id } => {
+                write!(f, "two lighting models claim id {id}")
+            }
+            LightingError::DuplicateName { name } => {
+                write!(f, "two lighting models are named `{name}`")
+            }
+            LightingError::UnnamespacedModel { name } => write!(
+                f,
+                "lighting model `{name}` has no package segment — names are \
+                 `package.name` (the shipped models live under `wxsl.`); put it \
+                 in a package of its own"
+            ),
+            LightingError::Empty => write!(f, "a lighting model set cannot be empty"),
+            LightingError::TwoDataSources { name } => write!(
+                f,
+                "lighting model `{name}` has its own G-buffer data and consumes a feature; \
+                 the one model target holds one of them"
+            ),
+            LightingError::UnknownModel { name } => {
+                write!(f, "no lighting model named `{name}` is enabled")
+            }
+            LightingError::UnknownFeature { name } => {
+                write!(f, "no material feature named `{name}` is shipped")
+            }
+            LightingError::FeatureNotCarried {
+                macro_name,
+                feature,
+            } => write!(
+                f,
+                "pins `{macro_name}`, which asks for the `{feature}` channel, but this \
+                 pipeline does not enable the `{feature}` feature — enable it with \
+                 `Renderer::set_features` and resolve the material against the same plan"
+            ),
+            LightingError::DuplicateChannel {
+                field,
+                first,
+                second,
+            } => write!(
+                f,
+                "the G-buffer field `{field}` is claimed twice: by {first} and by {second} — \
+                 rename one of the requested channels"
+            ),
+            LightingError::PreshadedNotEnabled => write!(
+                f,
+                "the material is marked forward-shaded, but this pipeline's lighting set \
+                 does not enable `{PRESHADED_MODEL}` — add it to the set so the lighting \
+                 pass has a route for the material's pixels"
+            ),
+            LightingError::ForwardShadedWithShadows => write!(
+                f,
+                "the material is marked forward-shaded and receives shadows — a preshaded \
+                 surface's radiance is computed before any shadow map exists to attenuate \
+                 it, so set `receive_shadow` to false"
+            ),
+            LightingError::ForwardShadedModel => write!(
+                f,
+                "the material is marked forward-shaded and names `{PRESHADED_MODEL}` as its \
+                 model — that model is the route a forward-shaded pixel travels, not a \
+                 shading function; name a real model, or none for the set's default"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LightingError {}
+
+/// The lighting models a pipeline enables.
+///
+/// A *set*, never a global: two renderers in one process may run different
+/// sets, and the set decides the G-buffer's shape, so it is part of building
+/// a pipeline rather than of the ABI. Kept sorted by id, which is the order
+/// the G-buffer's requested targets are packed in and the order the
+/// generated switch lists its arms.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LightingSet {
+    models: Vec<LightingModel>,
+}
+
+impl Default for LightingSet {
+    /// The default: the library's default model in a set of one.
+    fn default() -> Self {
+        default_single_set()
+    }
+}
+
+impl LightingSet {
+    /// Validate and build a set from `models`.
+    ///
+    /// Sorted by id here rather than trusted: the G-buffer layout and the
+    /// generated dispatch both read in this order, and a set built twice
+    /// from the same entries in a different order should be the same set.
+    pub fn new(models: impl IntoIterator<Item = LightingModel>) -> Result<Self, LightingError> {
+        let mut models: Vec<_> = models.into_iter().collect();
+        if models.is_empty() {
+            return Err(LightingError::Empty);
+        }
+        models.sort_by_key(|model| model.id);
+        for model in &models {
+            if !identity::is_namespaced(model.name) {
+                return Err(LightingError::UnnamespacedModel {
+                    name: model.name.to_string(),
+                });
+            }
+        }
+        for (index, model) in models.iter().enumerate() {
+            if models
+                .iter()
+                .skip(index + 1)
+                .any(|other| other.id == model.id)
+            {
+                return Err(LightingError::DuplicateId { id: model.id });
+            }
+        }
+        if let Some(model) = models
+            .iter()
+            .find(|model| model.extra.is_some() && model.feature.is_some())
+        {
+            return Err(LightingError::TwoDataSources {
+                name: model.name.to_string(),
+            });
+        }
+        let mut names: Vec<&str> = models.iter().map(|model| model.name).collect();
+        names.sort_unstable();
+        names.dedup();
+        if names.len() != models.len() {
+            let duplicated = models
+                .iter()
+                .find(|model| {
+                    models
+                        .iter()
+                        .filter(|other| other.name == model.name)
+                        .count()
+                        > 1
+                })
+                .map(|model| model.name)
+                .unwrap_or_default();
+            return Err(LightingError::DuplicateName {
+                name: duplicated.to_string(),
+            });
+        }
+        Ok(LightingSet { models })
+    }
+
+    /// A set of exactly one model: no dispatch.
+    ///
+    /// The shape every deferred pipeline had before models existed, and
+    /// still the default — it keeps the G-buffer at the base three targets
+    /// until someone asks for more.
+    pub fn single(model: LightingModel) -> Self {
+        LightingSet {
+            models: vec![model],
+        }
+    }
+
+    /// The enabled models, in id order.
+    pub fn models(&self) -> &[LightingModel] {
+        &self.models
+    }
+
+    /// How many models are enabled.
+    pub fn len(&self) -> usize {
+        self.models.len()
+    }
+
+    /// Whether no model is enabled, which [`LightingSet::new`] prevents.
+    pub fn is_empty(&self) -> bool {
+        self.models.is_empty()
+    }
+
+    /// The model with `id`, if the set enables one.
+    pub fn get(&self, id: u32) -> Option<&LightingModel> {
+        self.models.iter().find(|model| model.id == id)
+    }
+
+    /// The model named `name`, as a scene document spells it: a name with
+    /// a package is taken as written, a bare one resolves against the
+    /// shipped package — `pbr` means `wxsl.pbr`, which is what every
+    /// scene written before namespacing meant.
+    pub fn by_name(&self, name: &str) -> Option<&LightingModel> {
+        let resolved = identity::resolve(name);
+        self.models
+            .iter()
+            .find(|model| model.name == resolved.as_ref())
+    }
+
+    /// The set's passthrough model, if it enables one: the id a
+    /// forward-shaded material's pixels carry so the lighting pass can
+    /// return the radiance they stored instead of re-shading it. A set without it cannot honour a forward-shaded material,
+    /// which is why resolution asks for it by name.
+    pub fn preshaded(&self) -> Option<&LightingModel> {
+        self.by_name(PRESHADED_MODEL)
+    }
+
+    /// The model a material gets when it does not name one: the lowest id.
+    ///
+    /// An order, not a flag — a `default` bit would be a second thing to
+    /// keep consistent with the ids, and the ids already order the set.
+    pub fn default_model(&self) -> &LightingModel {
+        // `new` rejects the empty set; `single` cannot build one.
+        &self.models[0]
+    }
+
+    /// Whether fragments must carry an id for the lighting pass to
+    /// dispatch on: more than one model is enabled.
+    pub fn dispatches(&self) -> bool {
+        self.models.len() > 1
+    }
+
+    /// The models that ask for a G-buffer target, in id order.
+    pub fn extras(&self) -> Vec<ModelExtra> {
+        self.models.iter().filter_map(|model| model.extra).collect()
+    }
+
+    /// The G-buffer layout this set needs, in `@location` order: the base
+    /// targets, then the shared model target if any model asks for data.
+    ///
+    /// This is the single answer to "what does the deferred path attach,
+    /// bind and read" — `wxsl-render` declares its resources from it, the
+    /// generated struct is written from it, and the lighting pass binds in
+    /// the same order, so the three cannot drift apart short of a change
+    /// here. Its cost against the attachment budget is
+    /// `wxsl-render`'s `gbuffer_bytes_per_sample`, which is what tells a
+    /// set that asked for more than fits.
+    pub fn gbuffer_layout(&self) -> Vec<GBufferTarget> {
+        self.plan(&[])
+            .expect("a set's own requests cannot collide: `LightingSet::new` checks them")
+            .layout()
+            .to_vec()
+    }
+
+    /// The collected channel plan for this set plus `features` — the
+    /// second source of requests joining the first. Feature
+    /// channels follow the models' own; any field claimed twice is an
+    /// error naming both claimants.
+    pub fn plan(&self, features: &[ChannelRequest]) -> Result<GBufferPlan, LightingError> {
+        let requests = self
+            .models()
+            .iter()
+            .filter_map(|model| {
+                model.extra.map(|extra| ChannelRequest {
+                    source: ChannelSource::Model { name: model.name },
+                    target: extra.target,
+                })
+            })
+            .chain(features.iter().copied())
+            .collect::<Vec<_>>();
+        GBufferPlan::new(self.dispatches(), requests)
+    }
+
+    /// A stable identity for caches and labels.
+    pub fn signature(&self) -> String {
+        let models = self
+            .models
+            .iter()
+            .map(LightingModel::signature)
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("models={models}")
+    }
+
+    /// A hash of [`LightingSet::signature`], for cache keys.
+    pub fn stable_id(&self) -> u64 {
+        stable_hash(self.signature().as_bytes())
+    }
+}
+
+/// The shipped models, by id.
+///
+/// The paths are ABI — the same kind of core-to-library contract as
+/// [`abi::SURFACE_MODULE`] — and `wxsl-stdlib` ships a module at each of
+/// them, which its tests check by compiling. An application substitutes its
+/// own set freely; these are what the default pipelines mean by "a
+/// lighting model".
+pub const DEFAULT_MODELS: &[LightingModel] = &[
+    LightingModel {
+        id: 0,
+        name: "wxsl.lambert",
+        module: "package::lighting::models::lambert",
+        function: "lighting_lambert",
+        ambient: None,
+        area: Some("lighting_lambert_area"),
+        extra: None,
+        feature: None,
+        doc: "Diffuse-only Lambertian: radiance * albedo * max(dot(n, l), 0).",
+    },
+    LightingModel {
+        id: 1,
+        name: "wxsl.phong",
+        module: "package::lighting::models::phong",
+        function: "lighting_phong",
+        ambient: None,
+        area: None,
+        extra: None,
+        feature: None,
+        doc: "Lambertian diffuse plus a Phong specular lobe from the roughness.",
+    },
+    LightingModel {
+        id: 2,
+        name: "wxsl.pbr",
+        module: "package::lighting::models::pbr",
+        function: "lighting_pbr",
+        ambient: None,
+        area: Some("lighting_pbr_area"),
+        extra: None,
+        feature: None,
+        doc: "The Cook-Torrance GGX model the library has always shaded with.",
+    },
+    LightingModel {
+        id: 3,
+        name: "wxsl.clearcoat",
+        module: "package::lighting::models::clearcoat",
+        function: "lighting_clearcoat",
+        ambient: None,
+        area: None,
+        extra: Some(ModelExtra {
+            target: GBufferTarget {
+                field: "clearcoat",
+                doc: "x = coat strength, y = coat roughness",
+                precision: GBufferPrecision::HighDynamicRangePair,
+            },
+            pack: "pack_clearcoat",
+        }),
+        feature: None,
+        doc: "PBR plus a second clear-coat lobe, asking for a G-buffer target.",
+    },
+    LightingModel {
+        id: 4,
+        name: "wxsl.cloth",
+        module: "package::lighting::models::cloth",
+        function: "lighting_cloth",
+        ambient: None,
+        area: None,
+        extra: None,
+        feature: None,
+        doc: "Fabric: a roughness-wrapped diffuse with a Charlie sheen layer.",
+    },
+    LightingModel {
+        id: 5,
+        name: PRESHADED_MODEL,
+        module: "package::lighting::models::preshaded",
+        function: "lighting_preshaded",
+        ambient: None,
+        area: None,
+        extra: None,
+        feature: None,
+        doc: "Passthrough: returns the radiance a forward-shaded material \
+              computed in the geometry pass, stored where the G-buffer keeps \
+              emissive radiance.",
+    },
+    LightingModel {
+        id: 6,
+        name: "wxsl.iridescent",
+        module: "package::lighting::models::iridescent",
+        function: "lighting_iridescent",
+        ambient: Some("ambient_iridescent"),
+        area: None,
+        extra: Some(ModelExtra {
+            target: GBufferTarget {
+                field: "iridescence",
+                doc: "xyz = film strength, thickness in nm, IOR",
+                precision: GBufferPrecision::HighDynamicRange,
+            },
+            pack: "pack_iridescence",
+        }),
+        feature: None,
+        doc: "GGX with a graph-authored spectral thin film, on direct and ambient light.",
+    },
+    LightingModel {
+        id: 7,
+        name: "wxsl.sheen",
+        module: "package::lighting::models::sheen",
+        function: "lighting_sheen",
+        ambient: Some("ambient_sheen"),
+        area: None,
+        extra: Some(ModelExtra {
+            target: GBufferTarget {
+                field: "sheen",
+                doc: "rgb = linear sheen colour, a = perceptual sheen roughness",
+                precision: GBufferPrecision::HighDynamicRange,
+            },
+            pack: "pack_sheen",
+        }),
+        feature: None,
+        doc: "PBR under a graph-authored Charlie sheen layer with fitted analytic ambient.",
+    },
+    LightingModel {
+        id: 8,
+        name: "wxsl.subsurface",
+        module: "package::lighting::models::subsurface",
+        function: "lighting_subsurface",
+        ambient: None,
+        area: None,
+        extra: None,
+        feature: Some("subsurface"),
+        doc: "PBR plus wrapped diffuse and transmission, fed by the subsurface \
+              feature's channel — the model a plan without the feature shades \
+              as plain PBR.",
+    },
+    LightingModel {
+        id: 9,
+        name: "wxsl.gltf_clearcoat",
+        module: "package::lighting::models::gltf_clearcoat",
+        function: "lighting_gltf_clearcoat",
+        ambient: Some("ambient_gltf_clearcoat"),
+        area: None,
+        extra: Some(ModelExtra {
+            target: GBufferTarget {
+                field: "gltf_clearcoat",
+                doc: "x = coat strength, y = coat roughness, zw = octahedral coat normal",
+                precision: GBufferPrecision::HighDynamicRange,
+            },
+            pack: "pack_gltf_clearcoat",
+        }),
+        feature: None,
+        doc: "PBR under a graph-authored clear coat with the glTF \
+              KHR_materials_clearcoat parameters: strength, roughness and a \
+              normal of its own.",
+    },
+];
+
+/// The id of the model [`default_set`] shades with, and the
+/// model a material that names none gets: the same Cook-Torrance model the
+/// ABI shaded with before models existed.
+pub const DEFAULT_MODEL_ID: u32 = 2;
+
+/// A set of exactly [`DEFAULT_MODEL_ID`]: the default.
+pub fn default_single_set() -> LightingSet {
+    let model = DEFAULT_MODELS[DEFAULT_MODEL_ID as usize];
+    debug_assert_eq!(model.id, DEFAULT_MODEL_ID);
+    LightingSet::single(model)
+}
+
+/// Every shipped model: the models share one data target, so the set
+/// costs 32 bytes per sample however many of them ask for data.
+pub fn default_set() -> Result<LightingSet, LightingError> {
+    LightingSet::new(DEFAULT_MODELS.iter().copied())
+}
+
+/// What one material is shaded with: its model, and the set around it.
+///
+/// Both together, because the two answer different questions and both are
+/// needed at generation time — the model picks the function the forward
+/// stage calls, the set picks whether the G-buffer carries an id and which
+/// targets its struct has. An *unresolved* choice (a model by name, against
+/// a set) resolves through [`MaterialLighting::resolve`], which is where a
+/// name the set does not enable is reported.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MaterialLighting {
+    /// The set the surrounding pipeline enables.
+    pub set: LightingSet,
+    /// The id of this material's model, which must be in `set`.
+    pub model: u32,
+    /// The feature channels the surrounding pipeline carries, which the
+    /// material's G-buffer struct must match — resolved together with the
+    /// set, because a material compiled for one plan cannot be drawn under
+    /// another.
+    pub features: Vec<ChannelRequest>,
+}
+
+impl MaterialLighting {
+    /// Resolve an *authored* choice — a model name, optional — against a
+    /// pipeline's set. `None` means "the default model", which is the
+    /// library's default when the set enables it and otherwise the set's
+    /// lowest id — so widening a set never quietly reshades a material
+    /// that named nothing.
+    pub fn resolve(set: &LightingSet, name: Option<&str>) -> Result<Self, LightingError> {
+        let model = match name {
+            Some(name) => {
+                set.by_name(name)
+                    .ok_or_else(|| LightingError::UnknownModel {
+                        name: name.to_string(),
+                    })?
+                    .id
+            }
+            None => match set.get(DEFAULT_MODEL_ID) {
+                Some(default) => default.id,
+                None => set.default_model().id,
+            },
+        };
+        Ok(MaterialLighting {
+            set: set.clone(),
+            model,
+            features: Vec::new(),
+        })
+    }
+
+    /// The same lighting, resolved for a pipeline carrying `features`'
+    /// channels: the material's G-buffer struct is generated from the same
+    /// plan the pipeline's resources are declared from.
+    pub fn with_features(mut self, features: Vec<ChannelRequest>) -> Self {
+        self.features = features;
+        self
+    }
+
+    /// The material's model entry.
+    pub fn model(&self) -> &LightingModel {
+        self.set
+            .get(self.model)
+            .expect("resolved against the set, so the id is in it")
+    }
+
+    /// The enabled set.
+    pub fn set(&self) -> &LightingSet {
+        &self.set
+    }
+
+    /// The feature channels this material's G-buffer carries.
+    pub fn features(&self) -> &[ChannelRequest] {
+        &self.features
+    }
+}
+
+impl Default for MaterialLighting {
+    /// The library's default model in a set of one — the shape every
+    /// pipeline had before models existed, which dispatches on no id and
+    /// adds no G-buffer target.
+    fn default() -> Self {
+        MaterialLighting {
+            set: default_single_set(),
+            model: DEFAULT_MODEL_ID,
+            features: Vec::new(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Generated shaders
+// ---------------------------------------------------------------------------
+
+/// One generated piece of WXSL: the source, and what it imports.
+///
+/// The imports are separate because a generated *material* module has one
+/// import list shared with the graph's own, and merging text that carries
+/// `import` lines into it would mean parsing them back out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GeneratedLighting {
+    /// The WXSL source, without any `import` lines.
+    pub source: String,
+    /// `(module, item)` pairs the source names, for the host module to
+    /// import.
+    pub imports: Vec<(&'static str, &'static str)>,
+}
+
+/// How the generated shading function picks its model.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Dispatch {
+    /// Call one model directly: the forward stage of a material, compiled
+    /// per material, which knows its model at generation time. No id, no
+    /// switch, and no other model in the module.
+    Direct(LightingModel),
+    /// Switch over an id the caller read from the G-buffer: the deferred
+    /// lighting pass, which shades every enabled model's pixels in one
+    /// draw.
+    Switch(LightingSet),
+}
+
+/// Generate the per-light dispatch and the whole [`abi::SHADE_SURFACE_FN`].
+///
+/// The light loop is shared text — sample, shadow, accumulate — and is the
+/// same for every set; the call inside it is the one thing that varies, so
+/// it goes through [`abi::LIGHTING_DISPATCH_FN`], whose body is the only
+/// part the dispatch shape changes.
+///
+/// The macro knobs the loop honours (`wxsl_debug_normals`,
+/// `wxsl_receive_shadows`) are declared here with the
+/// ABI's defaults, exactly as `shading.wxsl` used to declare them: a WXSL
+/// module declares the knobs it uses, and the host binds values over the
+/// top.
+pub fn shade_surface(dispatch: &Dispatch) -> GeneratedLighting {
+    shade_surface_with(dispatch, &[], true)
+}
+
+/// The `${NAME}`-holed templates the generators fill, embedded at compile
+/// time and kept under `templates/lighting/` for the same reason: the
+/// light loop, the ambient and the pass's plumbing are shader text a
+/// shader author may want to read, diff and edit as shader, and none of it
+/// can be a shipped module because it names things no fixed module can.
+/// The generator owns the logic — which models, which targets, which ids —
+/// and one table of hole → text per template
+/// ([`crate::template`]).
+const MACROS_TEMPLATE: &str = include_str!("../templates/lighting/macros.wxsl");
+const DISPATCH_DIRECT_TEMPLATE: &str = include_str!("../templates/lighting/dispatch_direct.wxsl");
+const DISPATCH_SWITCH_TEMPLATE: &str = include_str!("../templates/lighting/dispatch_switch.wxsl");
+const SHADE_SURFACE_TEMPLATE: &str = include_str!("../templates/lighting/shade_surface.wxsl");
+const AMBIENT_DEFAULT_TEMPLATE: &str = include_str!("../templates/lighting/ambient_default.wxsl");
+const AMBIENT_SWITCH_TEMPLATE: &str = include_str!("../templates/lighting/ambient_switch.wxsl");
+const AREA_DIRECT_TEMPLATE: &str = include_str!("../templates/lighting/area_direct.wxsl");
+const AREA_SWITCH_TEMPLATE: &str = include_str!("../templates/lighting/area_switch.wxsl");
+const LIGHTING_PASS_TEMPLATE: &str = include_str!("../templates/lighting/lighting_pass.wxsl");
+const DEBUG_SURFACE_TEMPLATE: &str = include_str!("../templates/lighting/debug_surface.wxsl");
+
+/// [`shade_surface`], with the macro declarations omitted and `features`'
+/// channels joined to the models' own extras.
+///
+/// A generated *material* module declares every macro in effect itself, so
+/// shading text pasted into one must not declare them again — twice in the
+/// same module is a redefinition. The lighting pass, compiled as a root of
+/// its own, has nobody else to declare them and needs them. The `features`
+/// are the pipeline's second source of channels: a model whose
+/// registry entry names the feature reads the shared model target as
+/// `extra` under the feature's own macro — zeros when the plan does not
+/// carry it.
+pub fn shade_surface_with(
+    dispatch: &Dispatch,
+    features: &[ChannelRequest],
+    declare_macros: bool,
+) -> GeneratedLighting {
+    shade_surface_from(dispatch, features, declare_macros, false)
+}
+
+/// Deferred direct dispatch consumes a stored model extra, rather than
+/// packing the reconstructed base surface.
+fn shade_surface_from(
+    dispatch: &Dispatch,
+    features: &[ChannelRequest],
+    declare_macros: bool,
+    stored_extra: bool,
+) -> GeneratedLighting {
+    let mut imports = vec![
+        (abi::SURFACE_MODULE, abi::SURFACE_STRUCT),
+        (abi::SURFACE_MODULE, abi::CONTEXT_STRUCT),
+        ("package::wxsl::bindings", "AreaLight"),
+        ("package::wxsl::bindings", "area_light"),
+        ("package::wxsl::bindings", "light_setup"),
+        ("package::wxsl::bindings", "sample_light_setup"),
+        ("package::wxsl::bindings", "specular_lobe"),
+        ("package::wxsl::bindings", "sample_light_value"),
+        ("package::wxsl::bindings", "local_light"),
+        ("package::wxsl::bindings", "local_light_span"),
+        ("package::wxsl::bindings", "light_grid_word"),
+        ("package::wxsl::bindings", "scene"),
+        ("package::wxsl::bindings", "WXSL_MAX_LIGHTS"),
+        ("package::wxsl::bindings", "LightSample"),
+        ("package::wxsl::bindings", "environment_brdf"),
+        ("package::wxsl::bindings", "environment_diffuse_radiance"),
+        ("package::wxsl::bindings", "environment_specular_radiance"),
+        (abi::SHADOW_MODULE, "shadow_factor_at"),
+        (
+            "package::lighting::ambient_environment",
+            "ambient_environment",
+        ),
+    ];
+
+    let mut out = String::with_capacity(3072);
+    out.push_str(
+        "// ---------------------------------------------------------------------------\n",
+    );
+    out.push_str("// Lighting: generated by `wxsl_core::lighting` from the enabled models.\n");
+    out.push_str("// Do not edit: change the registry or the model modules instead.\n");
+    out.push_str(
+        "// ---------------------------------------------------------------------------\n\n",
+    );
+    if declare_macros {
+        out.push_str(&crate::template::fill(MACROS_TEMPLATE, &[]));
+    }
+
+    out.push_str(AMBIENT_DEFAULT_TEMPLATE);
+    // A model consuming a feature's channel reads it under the feature's
+    // own macro, so the feature module joins the imports wherever the
+    // guarded read does — the same rule the pack generates by. And a root
+    // module has nobody else to declare its knobs: the feature's macro
+    // joins the declared set at the default, exactly as codegen puts a
+    // plan's feature macros into a material module's set.
+    // Conditional translation and the zero default keep both arms honest.
+    let consumed: Vec<(&'static MaterialFeature, ChannelRequest)> = match &dispatch {
+        Dispatch::Direct(model) => consumed_feature(model, features).into_iter().collect(),
+        Dispatch::Switch(set) => set
+            .models()
+            .iter()
+            .filter_map(|model| consumed_feature(model, features))
+            .collect(),
+    };
+    for (feature, _) in &consumed {
+        imports.push((feature.module, feature.pack));
+        if declare_macros {
+            let _ = writeln!(out, "@macro const {}: bool = false;", feature.macro_name);
+        }
+    }
+    let direct_consumed = match (&dispatch, consumed.first()) {
+        (Dispatch::Direct(_), Some((feature, request))) => Some((*feature, *request)),
+        _ => None,
+    };
+    let (shading_params, dispatch_args, extra_decl, ambient_call) = match dispatch {
+        Dispatch::Direct(model) => {
+            imports.push((model.module, model.function));
+            let ambient_call = if let Some(ambient) = model.ambient {
+                imports.push((model.module, ambient));
+                format!("{ambient}(surface, ctx, model_extra)")
+            } else {
+                "default_ambient(surface, ctx)".to_string()
+            };
+            let extra = match model.extra {
+                // Computed once, before the loop: the pack reads the same
+                // surface every light would hand it.
+                Some(_) if stored_extra => "model_extra".to_string(),
+                Some(extra) => {
+                    imports.push((model.module, extra.pack));
+                    format!("{}(surface)", extra.pack)
+                }
+                None if direct_consumed.is_some() => String::new(),
+                None => "vec4f(0.0)".to_string(),
+            };
+            out.push_str(&crate::template::fill(
+                DISPATCH_DIRECT_TEMPLATE,
+                &[
+                    ("DISPATCH_FN", abi::LIGHTING_DISPATCH_FN),
+                    ("SURFACE", abi::SURFACE_STRUCT),
+                    ("CONTEXT", abi::CONTEXT_STRUCT),
+                    ("FUNCTION", model.function),
+                ],
+            ));
+            let area_body = match model.area {
+                Some(area) => {
+                    imports.push((model.module, area));
+                    format!("    return vec4f({area}(surface, ctx, area, extra), 1.0);")
+                }
+                None => "    return vec4f(0.0);".to_string(),
+            };
+            out.push_str(&crate::template::fill(
+                AREA_DIRECT_TEMPLATE,
+                &[
+                    ("SURFACE", abi::SURFACE_STRUCT),
+                    ("CONTEXT", abi::CONTEXT_STRUCT),
+                    ("BODY", &area_body),
+                ],
+            ));
+            let passes_extra = model.extra.is_some() || direct_consumed.is_some();
+            (
+                if stored_extra && passes_extra {
+                    ", model_extra: vec4f".to_string()
+                } else {
+                    String::new()
+                },
+                ", model_extra".to_string(),
+                if stored_extra && passes_extra {
+                    String::new()
+                } else if let Some((feature, request)) = direct_consumed {
+                    // The feature's channel, read under its own macro: the
+                    // pack when the material turns the feature on, zeros
+                    // when it does not. Conditional translation keeps the
+                    // taken arm, so a plan without the channel never names
+                    // it (the same shape the pack generates by).
+                    format!(
+                        "    var model_extra = vec4f(0.0);\n    @if({macro})\n    model_extra = {};\n",
+                        widen(
+                            format!("{}()", feature.pack),
+                            request.target.precision.channels(),
+                        ),
+                        macro = feature.macro_name,
+                    )
+                } else {
+                    format!("    let model_extra = {extra};\n")
+                },
+                ambient_call,
+            )
+        }
+        Dispatch::Switch(set) => {
+            for model in set.models() {
+                imports.push((model.module, model.function));
+            }
+            // The models' view of the G-buffer: the shared model target,
+            // when the plan carries it, and no parameter when
+            // nobody asked for data.
+            let has_data = !set.extras().is_empty() || !features.is_empty();
+            let (extras_param, model_extras) = if has_data {
+                (", model_data: vec4f".to_string(), "model_data".to_string())
+            } else {
+                (String::new(), String::new())
+            };
+            // A narrower target is widened back to the vec4f the model
+            // contract hands over.
+            let mut arms = String::new();
+            let mut ambient_arms = String::new();
+            let mut area_arms = String::new();
+            let custom_ambient = set.models().iter().any(|model| model.ambient.is_some());
+            for model in set.models() {
+                let extra = match model.extra {
+                    Some(extra) => stored(extra.target.precision.channels()),
+                    None => "vec4f(0.0)".to_string(),
+                };
+                // A feature-consuming model reads the channel under the
+                // feature's own macro, widened from the local the arm
+                // starts from — so a plan without the channel never names
+                // it, and a material that has not pinned it reads zeros.
+                if let Some((feature, request)) = consumed_feature(model, features) {
+                    imports.push((feature.module, feature.pack));
+                    if let Some(area) = model.area {
+                        imports.push((model.module, area));
+                        let _ = writeln!(
+                            area_arms,
+                            "        case {id}u: {{\n            var model_extra = vec4f(0.0);\n            @if({macro})\n            model_extra = {value};\n            return vec4f({area}(surface, ctx, area, model_extra), 1.0);\n        }}",
+                            id = model.id,
+                            macro = feature.macro_name,
+                            value = stored(request.target.precision.channels()),
+                        );
+                    }
+                    let _ = writeln!(
+                        arms,
+                        "        case {id}u: {{\n            var model_extra = vec4f(0.0);\n            @if({macro})\n            model_extra = {value};\n            return {function}(surface, ctx, light, model_extra);\n        }}",
+                        id = model.id,
+                        function = model.function,
+                        macro = feature.macro_name,
+                        value = stored(request.target.precision.channels()),
+                    );
+                    continue;
+                }
+                let _ = writeln!(
+                    arms,
+                    "        case {id}u: {{ return {function}(surface, ctx, light, {extra}); }}",
+                    id = model.id,
+                    function = model.function,
+                );
+                if let Some(area) = model.area {
+                    imports.push((model.module, area));
+                    let _ = writeln!(
+                        area_arms,
+                        "        case {id}u: {{ return vec4f({area}(surface, ctx, area, {extra}), 1.0); }}",
+                        id = model.id,
+                    );
+                }
+                if custom_ambient {
+                    let call = if let Some(ambient) = model.ambient {
+                        imports.push((model.module, ambient));
+                        format!("{ambient}(surface, ctx, {extra})")
+                    } else {
+                        "default_ambient(surface, ctx)".to_string()
+                    };
+                    let _ = writeln!(
+                        ambient_arms,
+                        "        case {}u: {{ return {call}; }}",
+                        model.id
+                    );
+                }
+            }
+            out.push_str(&crate::template::fill(
+                DISPATCH_SWITCH_TEMPLATE,
+                &[
+                    ("EXTRAS_PARAM", &extras_param),
+                    ("DISPATCH_FN", abi::LIGHTING_DISPATCH_FN),
+                    ("SURFACE", abi::SURFACE_STRUCT),
+                    ("CONTEXT", abi::CONTEXT_STRUCT),
+                    ("SWITCH_ARMS", &arms),
+                ],
+            ));
+            out.push_str(&crate::template::fill(
+                AREA_SWITCH_TEMPLATE,
+                &[
+                    ("EXTRAS_PARAM", &extras_param),
+                    ("SURFACE", abi::SURFACE_STRUCT),
+                    ("CONTEXT", abi::CONTEXT_STRUCT),
+                    ("SWITCH_ARMS", &area_arms),
+                ],
+            ));
+            let ambient_call = if custom_ambient {
+                out.push_str(&crate::template::fill(
+                    AMBIENT_SWITCH_TEMPLATE,
+                    &[
+                        ("EXTRAS_PARAM", &extras_param),
+                        ("SWITCH_ARMS", &ambient_arms),
+                    ],
+                ));
+                if model_extras.is_empty() {
+                    "ambient_dispatch(surface, ctx, model_id)".to_string()
+                } else {
+                    "ambient_dispatch(surface, ctx, model_data, model_id)".to_string()
+                }
+            } else {
+                "default_ambient(surface, ctx)".to_string()
+            };
+            (
+                // The shading function receives the extras as they came
+                // off the G-buffer; there is nothing to compute.
+                if model_extras.is_empty() {
+                    ", model_id: u32".to_string()
+                } else {
+                    ", model_data: vec4f, model_id: u32".to_string()
+                },
+                if model_extras.is_empty() {
+                    ", model_id".to_string()
+                } else {
+                    ", model_data, model_id".to_string()
+                },
+                String::new(),
+                ambient_call,
+            )
+        }
+    };
+
+    out.push_str(&crate::template::fill(
+        SHADE_SURFACE_TEMPLATE,
+        &[
+            ("SHADE_FN", abi::SHADE_SURFACE_FN),
+            ("SURFACE", abi::SURFACE_STRUCT),
+            ("CONTEXT", abi::CONTEXT_STRUCT),
+            ("SHADING_PARAMS", &shading_params),
+            ("EXTRA_DECL", &extra_decl),
+            ("SHADOW_FN", "shadow_factor_at"),
+            ("DISPATCH_FN", abi::LIGHTING_DISPATCH_FN),
+            ("DISPATCH_ARGS", &dispatch_args),
+            ("AMBIENT_CALL", &ambient_call),
+        ],
+    ));
+
+    GeneratedLighting {
+        source: out,
+        imports: dedup(imports),
+    }
+}
+
+/// Generate the [`abi::GBUFFER_STRUCT`] struct for a layout.
+///
+/// One field per target, at its `@location`, which is the index in the
+/// layout — the same list `wxsl-render` declares its resources from.
+pub fn gbuffer_struct(layout: &[GBufferTarget]) -> String {
+    let mut out = String::with_capacity(256);
+    let _ = writeln!(
+        out,
+        "struct {struct_name} {{",
+        struct_name = abi::GBUFFER_STRUCT
+    );
+    for (location, target) in layout.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "    // {doc}\n    @location({location}) {field}: {ty},",
+            doc = target.doc,
+            field = target.field,
+            ty = target.precision.field_type(),
+        );
+    }
+    out.push_str("}\n");
+    out
+}
+
+/// Generate [`abi::PACK_GBUFFER_FN`] for a material shading with `model`
+/// under `set`, with `features`' channels in the layout.
+///
+/// The base targets are packed as they always were, except the normal,
+/// which is octahedral beside the roughness and the model id.
+/// The shared model target gets the material's own model's pack, or the
+/// pack of the feature its model consumes when the material's macro turns
+/// it on, or zeros.
+///
+/// A forward-shaded material (`forward_shaded`) packs
+/// differently in one place: the radiance its fragment has already
+/// computed — passed in as `wxsl_preshaded`, rather than read off the
+/// surface — is what the emissive target stores, because that target is
+/// where the lighting pass looks for a preshaded pixel's answer. The
+/// occlusion it displaces only ever attenuated ambient, which a preshaded
+/// pixel's lighting pass never runs.
+pub fn pack_gbuffer(
+    model: &LightingModel,
+    set: &LightingSet,
+    features: &[ChannelRequest],
+    forward_shaded: bool,
+) -> GeneratedLighting {
+    let plan = set
+        .plan(features)
+        .expect("the material's plan was validated when its lighting was resolved");
+    let layout = plan.layout();
+    let mut imports = Vec::new();
+    let mut source = gbuffer_struct(layout);
+    let _ = write!(
+        source,
+        "\nfn {pack}(surface: {surface}{radiance_param}{id_param}) -> {struct_name} {{\n    \
+             var out: {struct_name};\n",
+        pack = abi::PACK_GBUFFER_FN,
+        surface = abi::SURFACE_STRUCT,
+        radiance_param = if forward_shaded {
+            ", wxsl_preshaded: vec4f"
+        } else {
+            ""
+        },
+        id_param = if set.dispatches() {
+            ", model_id: u32"
+        } else {
+            ""
+        },
+        struct_name = abi::GBUFFER_STRUCT,
+    );
+    imports.push((abi::GBUFFER_MODULE, abi::ENCODE_NORMAL_FN));
+    let model_id = if set.dispatches() {
+        "f32(model_id)"
+    } else {
+        "0.0"
+    };
+    for target in layout {
+        let expr = match (target.field, forward_shaded) {
+            // The base packing, except the emissive target of a
+            // forward-shaded material, which stores the fragment's own
+            // radiance, and the normal target, which also
+            // carries the model id.
+            ("base_color", _) => {
+                "vec4f(surface.base_color, saturate(surface.metallic))".to_string()
+            }
+            ("normal", _) => format!(
+                "vec4f({encode}(normalize(surface.normal)), saturate(surface.roughness), {model_id})",
+                encode = abi::ENCODE_NORMAL_FN,
+            ),
+            ("emissive", false) => {
+                "vec4f(surface.emissive, saturate(surface.occlusion))".to_string()
+            }
+            ("emissive", true) => "vec4f(wxsl_preshaded.rgb, 0.0)".to_string(),
+            (MODEL_DATA_FIELD, _) => {
+                if let Some(extra) = model.extra {
+                    // The pack contract hands a vec4f over; a model reading
+                    // fewer channels ignores the rest.
+                    imports.push((model.module, extra.pack));
+                    format!("{}(surface)", extra.pack)
+                } else if let Some((feature, request)) = stored_feature(model, features) {
+                    // The feature this model consumes, or else the first
+                    // the plan carries (a debug view reads it), under the
+                    // feature's own macro: zeros when the material leaves
+                    // it off.
+                    // Conditional translation keeps only the taken arm, and
+                    // an unused import dies with it.
+                    imports.push((feature.module, feature.pack));
+                    let _ = writeln!(
+                        source,
+                        "    @if({macro})\n    out.{field} = {value};\n    @if(!{macro})\n    out.{field} = vec4f(0.0);",
+                        macro = feature.macro_name,
+                        field = MODEL_DATA_FIELD,
+                        value = widen(
+                            format!("{}()", feature.pack),
+                            request.target.precision.channels()
+                        ),
+                    );
+                    continue;
+                } else {
+                    // Zeroed rather than skipped: the field exists, and an
+                    // undefined channel reads back whatever the clear left.
+                    "vec4f(0.0)".to_string()
+                }
+            }
+            other => unreachable!("G-buffer target `{other:?}` has no pack expression"),
+        };
+        let _ = writeln!(source, "    out.{field} = {expr};", field = target.field);
+    }
+    source.push_str("    return out;\n}\n");
+    GeneratedLighting {
+        source,
+        imports: dedup(imports),
+    }
+}
+
+/// The macro that turns the deferred lighting pass into a G-buffer view:
+/// `0` shades, any other value is a [`DebugView::id`] and the
+/// pass returns that channel instead. An `i32` macro rather than a uniform
+/// because a debug view is a different shader, not a different value, and
+/// the lighting pass already compiles under the materials' macro set.
+pub const DEBUG_VIEW_MACRO: &str = "wxsl_debug_view";
+
+/// The material index the `material id` view colours by: an
+/// `i32` macro a host sets per material, `0` when absent.
+pub const DEBUG_MATERIAL_MACRO: &str = "wxsl_debug_material";
+
+/// One isolation view a shading pass can return instead of shading:
+/// the deferred lighting pass from the G-buffer, a forward
+/// pass from the surface it evaluates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DebugView {
+    /// The [`DEBUG_VIEW_MACRO`] value that selects this view. Stable for a
+    /// build: the base views first, then every channel a shipped feature
+    /// or model can request, in registry order.
+    pub id: i32,
+    /// What a menu shows.
+    pub label: &'static str,
+    /// The requested channel this view isolates, or `None` for a base
+    /// view, which every plan carries.
+    pub channel: Option<&'static str>,
+    /// Which passes can show it.
+    pub stage: DebugStage,
+}
+
+/// Which shading passes can return a [`DebugView`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DebugStage {
+    /// Both: the lighting pass reads it from the G-buffer, a forward pass
+    /// from the surface.
+    Both,
+    /// Only a forward pass: what it reads (the mesh's uv, its screen
+    /// derivatives) is not in the G-buffer.
+    Forward,
+    /// Only the deferred lighting pass: a G-buffer channel.
+    Deferred,
+}
+
+impl DebugView {
+    /// Whether `plan` carries what this view reads; a menu greys out the
+    /// rest rather than hiding them.
+    pub fn available(&self, plan: &GBufferPlan) -> bool {
+        match self.channel {
+            None => true,
+            Some(field) => plan
+                .requests()
+                .iter()
+                .any(|request| request.target.field == field),
+        }
+    }
+}
+
+/// The base views: what every surface has, and where it can be shown.
+const BASE_DEBUG_VIEWS: &[(&str, DebugStage)] = &[
+    ("albedo", DebugStage::Both),
+    ("normal", DebugStage::Both),
+    ("depth", DebugStage::Both),
+    ("metallic-roughness", DebugStage::Both),
+    ("emissive", DebugStage::Both),
+    ("occlusion", DebugStage::Both),
+    ("uv", DebugStage::Forward),
+    ("mip level", DebugStage::Forward),
+    // The draw's instance row, which the vertex entry carries in the uv
+    // varying under this view: the fragment stage has no instance index.
+    (INSTANCE_ID_VIEW, DebugStage::Forward),
+    ("material id", DebugStage::Forward),
+    // A constant per fragment; a host makes it a count by blending the
+    // camera's passes additively without a depth test.
+    (OVERDRAW_VIEW, DebugStage::Forward),
+];
+
+/// The view whose vertex entry writes the instance row into the uv
+/// varying.
+const INSTANCE_ID_VIEW: &str = "instance id";
+
+/// The label of the overdraw view, which a host shows by also rewriting
+/// the passes' blend and depth state.
+pub const OVERDRAW_VIEW: &str = "overdraw";
+
+/// Whether the debug view `id` makes the vertex entry carry the instance
+/// row in the uv varying.
+pub(crate) fn debug_view_reads_instance(id: i32) -> bool {
+    debug_views()
+        .into_iter()
+        .any(|view| view.id == id && view.label == INSTANCE_ID_VIEW)
+}
+
+/// A distinct, saturated colour for an index, the same in Rust and in the
+/// `instance id` view's shader.
+fn index_hue(index: u32) -> [f32; 3] {
+    let h = (index.wrapping_mul(2_654_435_761) >> 8) as f32 / 16_777_216.0;
+    [0.0, 2.0 / 3.0, 1.0 / 3.0]
+        .map(|offset: f32| ((((h + offset).fract()) * 6.0 - 3.0).abs() - 1.0).clamp(0.0, 1.0))
+}
+
+/// Every view the shading passes know: the base ones, then one per channel
+/// a shipped feature or model can request — whether or not the current
+/// plan carries it, so the ids do not move as features are toggled.
+pub fn debug_views() -> Vec<DebugView> {
+    let mut views: Vec<DebugView> = BASE_DEBUG_VIEWS
+        .iter()
+        .map(|&(label, stage)| DebugView {
+            id: 0,
+            label,
+            channel: None,
+            stage,
+        })
+        .collect();
+    let requested = FEATURES.iter().map(|feature| feature.target).chain(
+        DEFAULT_MODELS
+            .iter()
+            .filter_map(|model| model.extra.map(|extra| extra.target)),
+    );
+    for target in requested {
+        if !views.iter().any(|view| view.channel == Some(target.field)) {
+            views.push(DebugView {
+                id: 0,
+                label: target.field,
+                channel: Some(target.field),
+                stage: DebugStage::Deferred,
+            });
+        }
+    }
+    for (index, view) in views.iter_mut().enumerate() {
+        view.id = index as i32 + 1;
+    }
+    views
+}
+
+/// The shading function a forward stage gets under the debug view `id`:
+/// `shade_surface`'s signature, returning the view instead of
+/// lighting. `None` for 0 and for a view only the lighting pass can show.
+/// Same encoding as the lighting pass's arm, so the two pipelines agree.
+/// `material` is the [`DEBUG_MATERIAL_MACRO`] value.
+pub fn debug_surface(id: i32, material: i32) -> Option<GeneratedLighting> {
+    let view = debug_views()
+        .into_iter()
+        .find(|view| view.id == id && view.stage != DebugStage::Deferred)?;
+    let [r, g, b] = index_hue(material as u32);
+    let material = format!("vec3f({r:?}, {g:?}, {b:?})");
+    let (prelude, shown) = match view.label {
+        "albedo" => ("", "surface.base_color"),
+        "normal" => ("", "srgb_to_linear(normalize(surface.normal) * 0.5 + vec3f(0.5))"),
+        "depth" => (
+            "",
+            "srgb_to_linear(vec3f(exp(-0.15 * distance(eye_position(), ctx.world_position))))",
+        ),
+        "metallic-roughness" => (
+            "",
+            "srgb_to_linear(vec3f(surface.metallic, surface.roughness, 0.0))",
+        ),
+        "emissive" => ("", "surface.emissive"),
+        "occlusion" => ("", "srgb_to_linear(vec3f(surface.occlusion))"),
+        "uv" => ("", "srgb_to_linear(vec3f(fract(ctx.uv), 0.0))"),
+        // The level a 1024-texel texture would be sampled at: blue where
+        // it is magnified, yellow at level 5, red at 10.
+        "mip level" => (
+            "    let texels = ctx.uv * 1024.0;\n    \
+             let footprint = max(dot(dpdx(texels), dpdx(texels)), dot(dpdy(texels), dpdy(texels)));\n    \
+             let level = clamp(0.5 * log2(max(footprint, 1e-8)), 0.0, 10.0);\n",
+            "srgb_to_linear(vec3f(saturate(level / 5.0), saturate(1.0 - abs(level - 5.0) / 5.0), \
+             saturate(1.0 - level / 5.0)))",
+        ),
+        // `index_hue`, at run time: the row is not a constant.
+        INSTANCE_ID_VIEW => (
+            "    let row = u32(round(ctx.uv.x));\n    \
+             let h = f32((row * 2654435761u) >> 8u) / 16777216.0;\n",
+            "saturate(abs(fract(vec3f(h) + vec3f(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) \
+             - vec3f(1.0))",
+        ),
+        "material id" => ("", material.as_str()),
+        OVERDRAW_VIEW => ("", "vec3f(0.1, 0.05, 0.02)"),
+        label => unreachable!("base view `{label}` has no forward expression"),
+    };
+    Some(GeneratedLighting {
+        source: crate::template::fill(
+            DEBUG_SURFACE_TEMPLATE,
+            &[
+                ("LABEL", view.label),
+                ("SHADE_FN", abi::SHADE_SURFACE_FN),
+                ("SURFACE", abi::SURFACE_STRUCT),
+                ("CONTEXT", abi::CONTEXT_STRUCT),
+                ("PRELUDE", prelude),
+                ("SHOWN", shown),
+            ],
+        ),
+        imports: vec![
+            (abi::SURFACE_MODULE, abi::SURFACE_STRUCT),
+            (abi::SURFACE_MODULE, abi::CONTEXT_STRUCT),
+            ("package::wxsl::bindings", "eye_position"),
+            ("package::color::srgb_to_linear", "srgb_to_linear"),
+        ],
+    })
+}
+
+/// The lighting pass's debug arm: one branch per view `plan` carries, each
+/// writing what a plain sRGB encode should display. Colours stay linear;
+/// data is lifted with `srgb_to_linear` so the encode shows the raw
+/// numbers — so a debug view wants a curve-free encode in place of the
+/// tonemap at the end of the chain; that pass is not built yet.
+fn debug_view_arm(set: &LightingSet, plan: &GBufferPlan) -> String {
+    let mut arm = format!("if ({DEBUG_VIEW_MACRO} != 0) {{\n        var shown = vec3f(0.0);\n");
+    for view in debug_views() {
+        if !view.available(plan) || view.stage == DebugStage::Forward {
+            continue;
+        }
+        let expr = match (view.label, view.channel) {
+            ("albedo", None) => "unpacked.surface.base_color".to_string(),
+            ("emissive", None) => "unpacked.surface.emissive".to_string(),
+            ("normal", None) => {
+                "srgb_to_linear(unpacked.surface.normal * 0.5 + vec3f(0.5))".to_string()
+            }
+            ("depth", None) => {
+                "srgb_to_linear(vec3f(exp(-0.15 * distance(camera.position, world_position))))"
+                    .to_string()
+            }
+            ("metallic-roughness", None) => "srgb_to_linear(vec3f(unpacked.surface.metallic, \
+                 unpacked.surface.roughness, 0.0))"
+                .to_string(),
+            ("occlusion", None) => "srgb_to_linear(vec3f(unpacked.surface.occlusion))".to_string(),
+            (_, Some(field)) => {
+                // The shared target holds this meaning only where a model
+                // reading it shaded the pixel; black elsewhere.
+                let channels = plan
+                    .requests()
+                    .iter()
+                    .find(|request| request.target.field == field)
+                    .map_or(4, |request| request.target.precision.channels());
+                let data = format!("unpacked.{MODEL_DATA_FIELD}");
+                let value = match channels {
+                    1 => format!("vec3f({data}.x, 0.0, 0.0)"),
+                    2 => format!("vec3f({data}.xy, 0.0)"),
+                    _ => format!("{data}.rgb"),
+                };
+                // A model's data is where that model shaded; a feature's
+                // where the pixel's model stores no data of its own.
+                let feature = FEATURES.iter().any(|feature| feature.target.field == field);
+                let owners: Vec<u32> = set
+                    .models()
+                    .iter()
+                    .filter(|model| match model.extra {
+                        Some(extra) => extra.target.field == field,
+                        None => feature,
+                    })
+                    .map(|model| model.id)
+                    .collect();
+                let shown = format!("srgb_to_linear(saturate({value}))");
+                if owners.is_empty() {
+                    "vec3f(0.0)".to_string()
+                } else if !set.dispatches() {
+                    shown
+                } else {
+                    let test = owners
+                        .iter()
+                        .map(|id| format!("unpacked.model_id == {id}u"))
+                        .collect::<Vec<_>>()
+                        .join(" || ");
+                    format!("select(vec3f(0.0), {shown}, {test})")
+                }
+            }
+            (label, None) => unreachable!("base view `{label}` has no expression"),
+        };
+        arm.push_str(&format!(
+            "        if ({DEBUG_VIEW_MACRO} == {id}) {{ shown = {expr}; }}\n",
+            id = view.id
+        ));
+    }
+    arm.push_str("        return vec4f(shown, 1.0);\n    }\n    ");
+    arm
+}
+
+/// Generate the whole deferred lighting pass for `set`, with `features`'
+/// channels in the layout, as one root module.
+///
+/// The fullscreen triangle and the depth-based background test are the
+/// plumbing they always were; the unpack, the struct it returns and the
+/// shading function are the set's, because they name its targets and
+/// models. Feature channels ride along: unpacked, and handed to the
+/// shading function's extras struct for the models that read them.
+/// Mounted under [`abi::LIGHTING_PASS_MODULE`], which is why that path
+/// still exists for labels and diagnostics.
+pub fn lighting_pass_source(set: &LightingSet, features: &[ChannelRequest]) -> String {
+    let plan = set
+        .plan(features)
+        .expect("the pipeline's plan was validated when the features were set");
+    let layout = plan.layout();
+    // One model needs no dispatch at all: the pass shades with it
+    // directly, and the module contains only that model — which is the
+    // bar a single-model pipeline is held to. Only a real set switches.
+    let dispatch = match set.len() {
+        1 => Dispatch::Direct(*set.models().first().expect("non-empty")),
+        _ => Dispatch::Switch(set.clone()),
+    };
+    let switch_shape = matches!(dispatch, Dispatch::Switch(_));
+    // The preshaded route: a pixel whose id names
+    // `wxsl.preshaded` has already been shaded in the geometry pass, so
+    // the pass returns the radiance it stored — where the G-buffer keeps
+    // emissive — and never runs the light loop or the ambient over it. A
+    // set of *only* that model makes every pixel preshaded: the pass is
+    // pure passthrough, and no shading function is generated at all.
+    let preshaded = set.preshaded().copied();
+    let passthrough = preshaded.is_some() && set.len() == 1;
+    let shading = if passthrough {
+        None
+    } else {
+        Some(shade_surface_from(&dispatch, features, true, true))
+    };
+
+    let mut out = String::with_capacity(4096);
+    out.push_str(
+        "// The deferred lighting pass, generated by `wxsl_core::lighting`
+",
+    );
+    out.push_str("// from the enabled models (");
+    let names = set
+        .models()
+        .iter()
+        .map(|model| model.name)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let _ = writeln!(out, "{names}).");
+    out.push_str(
+        "// Do not edit: change the set or a model module instead.
+
+",
+    );
+
+    out.push_str(
+        "import package::wxsl::bindings::{camera, eye_position, point_sampler, scene, world_origin};
+",
+    );
+    out.push_str(
+        "import package::space::tangent_basis::tangent_basis;
+",
+    );
+    out.push_str(
+        "import package::color::srgb_to_linear::srgb_to_linear;
+",
+    );
+    let _ = writeln!(
+        out,
+        "import {}::{};",
+        abi::GBUFFER_MODULE,
+        abi::DECODE_NORMAL_FN
+    );
+    if let Some(shading) = &shading {
+        for (module, item) in &shading.imports {
+            let _ = writeln!(out, "import {module}::{item};");
+        }
+    }
+
+    // One binding per target, in layout order, then depth — the same order
+    // `wxsl-render` declared the pass's reads in.
+    let mut bindings = String::new();
+    for (binding, target) in layout.iter().enumerate() {
+        let _ = writeln!(
+            bindings,
+            "@group(3) @binding({binding}) var gbuffer_{field}: texture_2d<f32>;",
+            binding = binding,
+            field = target.field,
+        );
+    }
+
+    // What the texels come back as: the surface, plus whatever the models
+    // and features asked for. One struct rather than out-params, because
+    // the dispatch's arms read different subsets of it.
+    let mut unpacked = String::from(
+        "struct UnpackedGBuffer {
+    surface: Surface,
+",
+    );
+    if set.dispatches() {
+        unpacked.push_str(
+            "    model_id: u32,
+",
+        );
+    }
+    if plan.model_data() {
+        let _ = writeln!(unpacked, "    {MODEL_DATA_FIELD}: vec4f,");
+    }
+    unpacked.push_str(
+        "}
+
+",
+    );
+
+    let params = layout
+        .iter()
+        .map(|target| format!("{}: {}", target.field, target.precision.field_type()))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // The id line exists only when the set dispatches. Half floats hold
+    // small integers exactly, so the id needs no scale.
+    let model_id_line = if set.dispatches() {
+        "    out.model_id = u32(round(normal.w));\n".to_string()
+    } else {
+        String::new()
+    };
+    let extras_unpack = if plan.model_data() {
+        format!("    out.{MODEL_DATA_FIELD} = {MODEL_DATA_FIELD};\n")
+    } else {
+        String::new()
+    };
+
+    // `textureLoad` always answers with a vec4; the unpack's parameter
+    // takes the channels the target actually has.
+    let loads = layout
+        .iter()
+        .map(|target| {
+            let load = format!("textureLoad(gbuffer_{}, coord, 0)", target.field);
+            match target.precision.channels() {
+                1 => format!("{load}.x"),
+                2 => format!("{load}.xy"),
+                _ => load,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    // A stored dispatch with a feature-consuming model reads the channel
+    // under the feature's own macro; the guarded local is what the call
+    // passes. Statements before the return, indented for the template.
+    let mut extra_preamble = String::new();
+    let shade_args = if switch_shape {
+        // A set whose models asked for no channels passes no data: the
+        // generated dispatch takes the id and nothing else.
+        if plan.model_data() {
+            format!("unpacked.surface, ctx, unpacked.{MODEL_DATA_FIELD}, unpacked.model_id")
+        } else {
+            "unpacked.surface, ctx, unpacked.model_id".to_string()
+        }
+    } else if let Some(extra) = set.models()[0].extra {
+        extra_preamble = format!("let model_data = unpacked.{MODEL_DATA_FIELD};\n    ");
+        format!(
+            "unpacked.surface, ctx, {}",
+            stored(extra.target.precision.channels())
+        )
+    } else if let Some((feature, request)) = consumed_feature(&set.models()[0], features) {
+        extra_preamble = format!(
+            "let model_data = unpacked.{MODEL_DATA_FIELD};\n    var model_extra = vec4f(0.0);\n    @if({macro})\n    model_extra = {value};\n    ",
+            macro = feature.macro_name,
+            value = stored(request.target.precision.channels()),
+        );
+        "unpacked.surface, ctx, model_extra".to_string()
+    } else {
+        "unpacked.surface, ctx".to_string()
+    };
+
+    let depth_binding = layout.len().to_string();
+    let final_return = if passthrough {
+        "return vec4f(unpacked.surface.emissive, 1.0);".to_string()
+    } else {
+        let shaded = format!(
+            "{extra_preamble}return {}({});",
+            abi::SHADE_SURFACE_FN,
+            shade_args
+        );
+        match preshaded {
+            // Route first, shade the rest: a preshaded pixel's radiance is
+            // already in the G-buffer, and the loop would add it once per
+            // light on top of the ambient it never asked for.
+            Some(model) => format!(
+                "if (unpacked.model_id == {}u) {{ return vec4f(unpacked.surface.emissive, 1.0); }}\n    {}",
+                model.id, shaded
+            ),
+            None => shaded,
+        }
+    };
+    out.push_str(&crate::template::fill(
+        LIGHTING_PASS_TEMPLATE,
+        &[
+            ("GBUFFER_BINDINGS", bindings.as_str()),
+            ("DEPTH_BINDING", depth_binding.as_str()),
+            ("VERTEX_ENTRY", abi::LIGHTING_PASS_VERTEX_ENTRY),
+            ("UNPACKED_STRUCT", unpacked.as_str()),
+            ("UNPACK_FN", abi::UNPACK_GBUFFER_FN),
+            ("UNPACK_PARAMS", params.as_str()),
+            ("MODEL_ID_LINE", model_id_line.as_str()),
+            ("EXTRAS_UNPACK", extras_unpack.as_str()),
+            (
+                "SHADING",
+                shading.map(|s| s.source).unwrap_or_default().as_str(),
+            ),
+            ("FRAGMENT_ENTRY", abi::LIGHTING_PASS_FRAGMENT_ENTRY),
+            ("FIRST_TARGET", layout[0].field),
+            ("UNPACK_CALL", loads.as_str()),
+            ("DEBUG_VIEW", &debug_view_arm(set, &plan)),
+            ("DEBUG_VIEW_MACRO", DEBUG_VIEW_MACRO),
+            ("FINAL_RETURN", &final_return),
+        ],
+    ));
+    out
+}
+
+/// Drop repeated `(module, item)` pairs, keeping first order.
+fn dedup(imports: Vec<(&'static str, &'static str)>) -> Vec<(&'static str, &'static str)> {
+    let mut seen = Vec::new();
+    for pair in imports {
+        if !seen.contains(&pair) {
+            seen.push(pair);
+        }
+    }
+    seen
+}
+
+/// The feature channel `model` consumes, when the plan carries it: the
+/// shipped feature and the request, for the guarded read the dispatch
+/// generates. A model naming an unknown feature, or a plan without the
+/// channel, is `None` — the model shades without it, which is the
+/// feature-off contract.
+fn consumed_feature(
+    model: &LightingModel,
+    features: &[ChannelRequest],
+) -> Option<(&'static MaterialFeature, ChannelRequest)> {
+    let name = model.feature?;
+    let request = features.iter().copied().find(|request| {
+        matches!(request.source, ChannelSource::Feature { .. }) && request.source.name() == name
+    })?;
+    let feature = FEATURES.iter().find(|feature| feature.name == name)?;
+    Some((feature, request))
+}
+
+/// The shared model target's texel, `model_data`, as a model reading
+/// `channels` of it sees it: the rest zeroed, as a narrower target of its
+/// own used to read back.
+fn stored(channels: usize) -> String {
+    match channels {
+        1 => "vec4f(model_data.x, 0.0, 0.0, 0.0)".to_string(),
+        2 => "vec4f(model_data.xy, 0.0, 0.0)".to_string(),
+        _ => "model_data".to_string(),
+    }
+}
+
+/// The feature a material shading with `model` stores in the shared model
+/// target: the one the model consumes, or else the first the plan carries.
+/// None when the model stores data of its own.
+fn stored_feature(
+    model: &LightingModel,
+    features: &[ChannelRequest],
+) -> Option<(&'static MaterialFeature, ChannelRequest)> {
+    if model.extra.is_some() {
+        return None;
+    }
+    consumed_feature(model, features).or_else(|| {
+        features.iter().find_map(|request| {
+            let feature = FEATURES
+                .iter()
+                .find(|feature| feature.name == request.source.name())?;
+            Some((feature, *request))
+        })
+    })
+}
+
+/// Widen a channel expression back to the `vec4f` the model contract
+/// hands over.
+fn widen(expr: String, channels: usize) -> String {
+    match channels {
+        1 => format!("vec4f({expr}, 0.0, 0.0, 0.0)"),
+        2 => format!("vec4f({expr}, 0.0, 0.0)"),
+        _ => expr,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn model(id: u32, name: &str) -> LightingModel {
+        LightingModel {
+            id,
+            name: Box::leak(name.to_string().into_boxed_str()),
+            module: "package::test",
+            function: "test_model",
+            ambient: None,
+            area: None,
+            extra: None,
+            feature: None,
+            doc: "",
+        }
+    }
+
+    #[test]
+    fn a_set_is_sorted_by_id_and_rejects_collisions() {
+        let set = LightingSet::new([model(2, "lib.b"), model(0, "lib.a")]).unwrap();
+        assert_eq!(
+            set.models().iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+        assert_eq!(
+            set.default_model().name,
+            "lib.a",
+            "lowest id is the default"
+        );
+
+        assert_eq!(
+            LightingSet::new([model(1, "lib.a"), model(1, "lib.b")]).unwrap_err(),
+            LightingError::DuplicateId { id: 1 }
+        );
+        assert_eq!(
+            LightingSet::new([model(0, "lib.same"), model(1, "lib.same")]).unwrap_err(),
+            LightingError::DuplicateName {
+                name: "lib.same".to_string()
+            }
+        );
+        // A name with no package is refused at registration: a set
+        // assembled from more than one library cannot tell two bare
+        // `toon`s apart.
+        assert_eq!(
+            LightingSet::new([model(0, "toon")]).unwrap_err(),
+            LightingError::UnnamespacedModel {
+                name: "toon".to_string()
+            }
+        );
+        assert_eq!(LightingSet::new([]).unwrap_err(), LightingError::Empty);
+    }
+
+    #[test]
+    fn a_single_model_needs_no_id_channel() {
+        let set = LightingSet::single(DEFAULT_MODELS[DEFAULT_MODEL_ID as usize]);
+        assert!(!set.dispatches());
+        assert_eq!(set.gbuffer_layout(), abi::GBUFFER_BASE_TARGETS.to_vec());
+    }
+
+    #[test]
+    fn every_model_shares_one_data_target() {
+        let set = default_set().unwrap();
+        assert!(set.dispatches());
+        assert!(set.extras().len() >= 3, "clearcoat, iridescent and sheen");
+        let layout = set.gbuffer_layout();
+        let fields: Vec<&str> = layout.iter().map(|t| t.field).collect();
+        assert_eq!(
+            fields,
+            vec!["base_color", "normal", "emissive", MODEL_DATA_FIELD],
+            "base targets, then the one shared model target"
+        );
+        assert_eq!(layout[3], MODEL_DATA_TARGET);
+    }
+
+    #[test]
+    fn a_model_with_data_and_a_feature_is_refused() {
+        let mut both = DEFAULT_MODELS[3];
+        assert!(both.extra.is_some());
+        both.feature = Some("subsurface");
+        assert_eq!(
+            LightingSet::new([both]).unwrap_err(),
+            LightingError::TwoDataSources {
+                name: both.name.to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn a_direct_dispatch_names_one_model_and_no_other() {
+        let pbr = DEFAULT_MODELS[DEFAULT_MODEL_ID as usize];
+        let generated = shade_surface(&Dispatch::Direct(pbr));
+        assert!(generated.source.contains("fn lighting_dispatch"));
+        assert!(generated
+            .source
+            .contains("return lighting_pbr(surface, ctx, light, extra);"));
+        assert!(!generated.source.contains("lighting_lambert"));
+        assert!(!generated.source.contains("switch"));
+        assert!(generated
+            .imports
+            .iter()
+            .any(|(module, item)| *module == pbr.module && *item == pbr.function));
+        // One import per pair, even when two pieces asked for the same.
+        let mut unique = generated.imports.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), generated.imports.len());
+    }
+
+    #[test]
+    fn a_switch_dispatch_has_one_arm_per_enabled_model() {
+        let set = default_set().unwrap();
+        let generated = shade_surface(&Dispatch::Switch(set.clone()));
+        for model in set.models() {
+            assert!(
+                generated.source.contains(&format!(
+                    "case {}u: {{ return {}(",
+                    model.id, model.function
+                )),
+                "no arm for {}",
+                model.name
+            );
+        }
+        // Every enabled model is imported: a model nobody enabled costs
+        // nothing, which is the whole point of generating the dispatch.
+        assert!(generated.source.contains("lighting_lambert"));
+        assert!(generated.source.contains("default: { return vec3f(0.0); }"));
+        // The arm for the model with an extra reads the shared texel in
+        // its own precision; the others are handed zero.
+        assert!(generated.source.contains(
+            "case 3u: { return lighting_clearcoat(surface, ctx, light, vec4f(model_data.xy, 0.0, 0.0)); }"
+        ));
+        assert!(generated
+            .source
+            .contains("case 2u: { return lighting_pbr(surface, ctx, light, vec4f(0.0)); }"));
+        // The switch flavour's shading function takes the texel and the id.
+        assert!(generated.source.contains(
+            "fn shade_surface(surface: Surface, ctx: SurfaceContext, model_data: vec4f, model_id: u32)"
+        ));
+    }
+
+    #[test]
+    fn the_pack_writes_the_id_beside_the_normal_only_when_dispatching() {
+        let single = LightingSet::single(DEFAULT_MODELS[DEFAULT_MODEL_ID as usize]);
+        let plain = pack_gbuffer(
+            &DEFAULT_MODELS[DEFAULT_MODEL_ID as usize],
+            &single,
+            &[],
+            false,
+        );
+        assert!(plain
+            .source
+            .contains("fn pack_gbuffer(surface: Surface) -> GBuffer"));
+        assert!(!plain.source.contains("model_id"));
+        assert!(plain.source.contains(
+            "out.normal = vec4f(gbuffer_encode_normal(normalize(surface.normal)), saturate(surface.roughness), 0.0);"
+        ));
+        assert!(!plain.source.contains("out.model"));
+
+        let set = default_set().unwrap();
+        let dispatched = pack_gbuffer(&DEFAULT_MODELS[DEFAULT_MODEL_ID as usize], &set, &[], false);
+        assert!(dispatched
+            .source
+            .contains("fn pack_gbuffer(surface: Surface, model_id: u32) -> GBuffer"));
+        assert!(dispatched
+            .source
+            .contains("saturate(surface.roughness), f32(model_id));"));
+
+        // The clearcoat model fills the shared target through its pack,
+        // and a model with no data zeroes it.
+        let coat = DEFAULT_MODELS
+            .iter()
+            .find(|m| m.name == "wxsl.clearcoat")
+            .unwrap();
+        let coated = pack_gbuffer(coat, &set, &[], false);
+        assert!(coated
+            .source
+            .contains("out.model = pack_clearcoat(surface);"));
+        let plain_under_set =
+            pack_gbuffer(&DEFAULT_MODELS[DEFAULT_MODEL_ID as usize], &set, &[], false);
+        assert!(plain_under_set.source.contains("out.model = vec4f(0.0);"));
+    }
+
+    #[test]
+    fn the_lighting_pass_binds_one_target_per_layout_entry_plus_depth() {
+        let set = default_set().unwrap();
+        let source = lighting_pass_source(&set, &[]);
+        let layout = set.gbuffer_layout();
+        for (binding, target) in layout.iter().enumerate() {
+            assert!(
+                source.contains(&format!(
+                    "@group(3) @binding({binding}) var gbuffer_{}:",
+                    target.field
+                )),
+                "no binding for {}",
+                target.field
+            );
+        }
+        assert!(source.contains(&format!(
+            "@group(3) @binding({}) var gbuffer_depth:",
+            layout.len()
+        )));
+        // The dispatch and the unpack are both present, and the fragment
+        // entry hands the shared texel and the id to the shading function.
+        assert!(source.contains("switch model_id"));
+        assert!(source.contains("out.model_id = u32(round(normal.w));"));
+        assert!(source.contains("gbuffer_decode_normal(normal.xy)"));
+        assert!(source.contains(
+            "return shade_surface(unpacked.surface, ctx, unpacked.model, unpacked.model_id)"
+        ));
+    }
+
+    #[test]
+    fn a_single_model_pass_has_no_dispatch_at_all() {
+        let set = LightingSet::single(DEFAULT_MODELS[DEFAULT_MODEL_ID as usize]);
+        let source = lighting_pass_source(&set, &[]);
+        assert!(!source.contains("switch"));
+        assert!(!source.contains("model_id"));
+        // One model shades directly: no dispatch, no extras argument, and
+        // nothing in the module but that model.
+        assert!(source.contains("return shade_surface(unpacked.surface, ctx)"));
+        assert!(source.contains("return lighting_pbr(surface, ctx, light, extra);"));
+    }
+
+    #[test]
+    fn a_single_model_reads_its_stored_extra_instead_of_repacking_the_surface() {
+        for name in ["wxsl.clearcoat", "wxsl.iridescent", "wxsl.sheen"] {
+            let model = *DEFAULT_MODELS
+                .iter()
+                .find(|model| model.name == name)
+                .unwrap();
+            let extra = model.extra.unwrap();
+            let source = lighting_pass_source(&LightingSet::single(model), &[]);
+            assert!(source.contains("ctx: SurfaceContext, model_extra: vec4f"));
+            assert!(source.contains("let model_data = unpacked.model;"));
+            assert!(!source.contains(extra.pack));
+            let forward = shade_surface(&Dispatch::Direct(model));
+            assert!(forward.source.contains(&format!("{}(surface)", extra.pack)));
+        }
+    }
+
+    #[test]
+    fn custom_ambient_uses_the_same_model_and_extra_as_direct_lighting() {
+        let sheen = *DEFAULT_MODELS
+            .iter()
+            .find(|model| model.name == "wxsl.sheen")
+            .unwrap();
+        let pbr = DEFAULT_MODELS[DEFAULT_MODEL_ID as usize];
+        let single = lighting_pass_source(&LightingSet::single(sheen), &[]);
+        assert!(single.contains("var lit = ambient_sheen(surface, ctx, model_extra)"));
+        let switch = lighting_pass_source(&LightingSet::new([pbr, sheen]).unwrap(), &[]);
+        assert!(switch.contains("case 7u: { return ambient_sheen(surface, ctx, model_data); }"));
+        assert!(switch.contains("case 2u: { return default_ambient(surface, ctx); }"));
+        let mut changed = sheen;
+        changed.ambient = None;
+        assert_ne!(
+            LightingSet::single(sheen).stable_id(),
+            LightingSet::single(changed).stable_id()
+        );
+    }
+
+    #[test]
+    fn a_switch_without_requested_channels_names_no_extras() {
+        // Two models, no targets, no features: an empty `ModelExtras`
+        // struct is invalid WGSL, so neither the struct nor the parameter
+        // is generated — found by the first two-model set to reach a real
+        // lighting pass on a device (pbr + preshaded).
+        let set = LightingSet::new([
+            DEFAULT_MODELS[DEFAULT_MODEL_ID as usize],
+            *DEFAULT_MODELS
+                .iter()
+                .find(|model| model.name == PRESHADED_MODEL)
+                .expect("the route ships"),
+        ])
+        .unwrap();
+        assert!(!set.dispatches() || set.extras().is_empty());
+        let generated = shade_surface(&Dispatch::Switch(set.clone()));
+        assert!(
+            !generated.source.contains("ModelExtras"),
+            "{}",
+            generated.source
+        );
+        assert!(generated
+            .source
+            .contains("fn shade_surface(surface: Surface, ctx: SurfaceContext, model_id: u32)"));
+
+        let source = lighting_pass_source(&set, &[]);
+        assert!(
+            source.contains("return shade_surface(unpacked.surface, ctx, unpacked.model_id)"),
+            "{}",
+            source
+        );
+    }
+
+    #[test]
+    fn a_set_signature_distinguishes_sets() {
+        let single = LightingSet::single(DEFAULT_MODELS[DEFAULT_MODEL_ID as usize]);
+        let all = default_set().unwrap();
+        assert_ne!(single.signature(), all.signature());
+        assert_ne!(single.stable_id(), all.stable_id());
+        // Order of construction does not change the identity.
+        let reordered = LightingSet::new(all.models().iter().rev().copied()).unwrap();
+        assert_eq!(all.signature(), reordered.signature());
+    }
+
+    #[test]
+    fn a_feature_channel_joins_the_plan_after_the_models_requests() {
+        // The second source: a feature asks directly, and the
+        // plan collects it after every model's own request.
+        let set = default_set().unwrap();
+        let plan = set
+            .plan(&feature_requests(&["subsurface"]).unwrap())
+            .unwrap();
+        let fields: Vec<&str> = plan.layout().iter().map(|t| t.field).collect();
+        assert_eq!(
+            fields,
+            vec!["base_color", "normal", "emissive", MODEL_DATA_FIELD],
+            "every request shares the one model target"
+        );
+        // The request is tagged, which is what an error — or a reader —
+        // needs to say where the channel came from.
+        let last = plan.requests().last().expect("the feature's request");
+        assert_eq!(last.source, ChannelSource::Feature { name: "subsurface" });
+    }
+
+    #[test]
+    fn colliding_channel_requests_are_named_by_both_sources() {
+        // A hypothetical feature claiming a model's field is the
+        // collision the source tags exist to name.
+        let set = default_set().unwrap();
+        let clashing = ChannelRequest {
+            source: ChannelSource::Feature { name: "subsurface" },
+            target: GBufferTarget {
+                field: "clearcoat",
+                doc: "",
+                precision: GBufferPrecision::NormalizedScalar,
+            },
+        };
+        match set.plan(&[clashing]) {
+            Err(LightingError::DuplicateChannel {
+                field,
+                first,
+                second,
+            }) => {
+                assert_eq!(field, "clearcoat");
+                assert_eq!(
+                    first,
+                    ChannelSource::Model {
+                        name: "wxsl.clearcoat"
+                    }
+                );
+                assert_eq!(second, ChannelSource::Feature { name: "subsurface" });
+            }
+            other => panic!("expected a channel collision, got {other:?}"),
+        }
+
+        // And even the base layout is a named claimant, not a silent one.
+        let clashing = ChannelRequest {
+            source: ChannelSource::Feature { name: "subsurface" },
+            target: GBufferTarget {
+                field: "normal",
+                doc: "",
+                precision: GBufferPrecision::NormalizedScalar,
+            },
+        };
+        match set.plan(&[clashing]) {
+            Err(LightingError::DuplicateChannel { first, .. }) => {
+                assert_eq!(first, ChannelSource::BaseLayout);
+            }
+            other => panic!("expected a base-layout collision, got {other:?}"),
+        }
+
+        // An unknown feature name is an error, not a quiet skip.
+        assert!(feature_requests(&["melting"]).is_err());
+    }
+
+    #[test]
+    fn the_pack_fills_a_feature_channel_when_the_material_pins_it() {
+        let model = shipped_model("wxsl.subsurface");
+        let single = LightingSet::single(model);
+        let features = feature_requests(&["subsurface"]).unwrap();
+
+        // Under the feature: the consuming model's material fills the
+        // shared target through the feature's pack when its macro turns
+        // it on, zeros when it does not.
+        let packed = pack_gbuffer(&model, &single, &features, false);
+        assert!(packed.source.contains("model: vec4f,"), "{}", packed.source);
+        assert!(packed.source.contains("@if(wxsl_subsurface)"));
+        assert!(packed
+            .source
+            .contains("out.model = vec4f(pack_subsurface(), 0.0, 0.0);"));
+        assert!(packed.source.contains("@if(!wxsl_subsurface)"));
+        assert!(packed.source.contains("out.model = vec4f(0.0);"));
+        assert!(packed
+            .imports
+            .iter()
+            .any(|(module, item)| *module == SUBSURFACE.module && *item == SUBSURFACE.pack));
+
+        // Without the feature there is no field at all — a narrower plan,
+        // and nothing emitted for it.
+        let plain = pack_gbuffer(&model, &single, &[], false);
+        assert!(!plain.source.contains("subsurface"));
+        assert!(!plain.source.contains("out.model"));
+
+        // A model with no data of its own stores the feature too, for a
+        // debug view to read; one with its own data stores that instead.
+        let pbr = DEFAULT_MODELS[DEFAULT_MODEL_ID as usize];
+        let other = pack_gbuffer(&pbr, &LightingSet::single(pbr), &features, false);
+        assert!(other
+            .source
+            .contains("out.model = vec4f(pack_subsurface(), 0.0, 0.0);"));
+        let coat = shipped_model("wxsl.clearcoat");
+        let coated = pack_gbuffer(&coat, &LightingSet::single(coat), &features, false);
+        assert!(coated
+            .source
+            .contains("out.model = pack_clearcoat(surface);"));
+    }
+
+    /// The preshaded route: findable by name in any set that
+    /// enables it, absent from one that does not.
+    #[test]
+    fn the_preshaded_route_is_findable_by_name() {
+        let full = default_set().unwrap();
+        let route = full.preshaded().expect("the shipped set enables it");
+        assert_eq!(route.name, PRESHADED_MODEL);
+
+        let bare = LightingSet::single(DEFAULT_MODELS[DEFAULT_MODEL_ID as usize]);
+        assert!(bare.preshaded().is_none());
+    }
+
+    /// A forward-shaded material's pack takes the fragment's radiance and
+    /// stores it where the lighting pass looks — the emissive target —
+    /// while every other target packs as it always did.
+    #[test]
+    fn the_forward_shaded_pack_stores_the_radiance_in_emissive() {
+        let set = default_set().unwrap();
+        let model = DEFAULT_MODELS[DEFAULT_MODEL_ID as usize];
+        let packed = pack_gbuffer(&model, &set, &[], true);
+        assert!(
+            packed
+                .source
+                .contains("fn pack_gbuffer(surface: Surface, wxsl_preshaded: vec4f, model_id: u32) -> GBuffer"),
+            "{}",
+            packed.source
+        );
+        assert!(
+            packed
+                .source
+                .contains("out.emissive = vec4f(wxsl_preshaded.rgb, 0.0);"),
+            "{}",
+            packed.source
+        );
+        // The untouched targets, for contrast.
+        assert!(packed
+            .source
+            .contains("out.base_color = vec4f(surface.base_color, saturate(surface.metallic));"));
+
+        // The plain pack of the same material is unchanged: one bool, not
+        // a second code path.
+        let plain = pack_gbuffer(&model, &set, &[], false);
+        assert!(plain
+            .source
+            .contains("fn pack_gbuffer(surface: Surface, model_id: u32) -> GBuffer"));
+        assert!(plain
+            .source
+            .contains("out.emissive = vec4f(surface.emissive, saturate(surface.occlusion));"));
+    }
+
+    /// A dispatching lighting pass answers a preshaded pixel before its
+    /// light loop can run; a set of only the route is pure passthrough,
+    /// with no shading function generated at all.
+    #[test]
+    fn the_lighting_pass_returns_a_preshaded_pixel_before_the_loop() {
+        let set = default_set().unwrap();
+        let source = lighting_pass_source(&set, &[]);
+        let route = set.preshaded().expect("the shipped set enables it");
+        assert!(
+            source.contains(&format!(
+                "if (unpacked.model_id == {}u) {{ return vec4f(unpacked.surface.emissive, 1.0); }}",
+                route.id
+            )),
+            "{}",
+            source
+        );
+        // Everyone else still shades.
+        assert!(source.contains("return shade_surface(unpacked.surface, ctx"));
+
+        let only = LightingSet::single(*set.preshaded().expect("ships"));
+        let passthrough = lighting_pass_source(&only, &[]);
+        assert!(
+            passthrough.contains("return vec4f(unpacked.surface.emissive, 1.0);"),
+            "{}",
+            passthrough
+        );
+        assert!(!passthrough.contains("shade_surface"));
+        assert!(
+            !passthrough.contains("lighting_preshaded"),
+            "the passthrough generates no shading function at all: {}",
+            passthrough
+        );
+    }
+
+    #[test]
+    fn the_lighting_pass_unpacks_feature_channels_for_the_models() {
+        let set = default_set().unwrap();
+        let features = feature_requests(&["subsurface"]).unwrap();
+        let source = lighting_pass_source(&set, &features);
+        // One binding per layout entry, depth included: the feature's
+        // channel is the shared model target.
+        let layout = set.plan(&features).unwrap();
+        let depth_binding = layout.layout().len();
+        assert!(source.contains(&format!(
+            "@group(3) @binding({}) var gbuffer_model:",
+            depth_binding - 1
+        )));
+        assert!(source.contains(&format!(
+            "@group(3) @binding({}) var gbuffer_depth:",
+            depth_binding
+        )));
+        // Unpacked and handed to the shading function, where a
+        // feature-aware model reads it.
+        assert!(source.contains("    model: vec4f,"));
+        assert!(source.contains("unpacked.surface, ctx, unpacked.model, unpacked.model_id"));
+    }
+
+    fn shipped_model(name: &str) -> LightingModel {
+        *DEFAULT_MODELS
+            .iter()
+            .find(|model| model.name == name)
+            .unwrap_or_else(|| panic!("{name} ships"))
+    }
+
+    /// The feature-consuming model reads the channel under the feature's
+    /// own macro, widened, with the feature module imported and its macro
+    /// declared for the root module.
+    #[test]
+    fn a_feature_consuming_model_reads_its_channel_under_the_feature_macro() {
+        let set = LightingSet::new([shipped_model("wxsl.pbr"), shipped_model("wxsl.subsurface")])
+            .unwrap();
+        let features = feature_requests(&["subsurface"]).unwrap();
+        let source = lighting_pass_source(&set, &features);
+        assert!(
+            source.contains(
+                "case 8u: {\n            var model_extra = vec4f(0.0);\n            \
+                 @if(wxsl_subsurface)\n            model_extra = vec4f(model_data.xy, 0.0, 0.0);\n            \
+                 return lighting_subsurface(surface, ctx, light, model_extra);\n        }"
+            ),
+            "{source}"
+        );
+        assert!(source.contains("import package::wxsl::features::subsurface::pack_subsurface;"));
+        assert!(source.contains("@macro const wxsl_subsurface: bool = false;"));
+    }
+
+    /// Without the feature in the plan, the same arm never names the
+    /// channel: it shades zeros, which is the feature-off contract.
+    #[test]
+    fn without_the_feature_a_consuming_model_reads_zeros() {
+        let set = LightingSet::new([shipped_model("wxsl.pbr"), shipped_model("wxsl.subsurface")])
+            .unwrap();
+        let source = lighting_pass_source(&set, &[]);
+        assert!(!source.contains("model_data: vec4f"), "{source}");
+        assert!(source.contains("return lighting_subsurface(surface, ctx, light, vec4f(0.0));"));
+        assert!(!source.contains("@macro const wxsl_subsurface"));
+    }
+
+    /// A set of one feature-consuming model has no dispatch; the stored
+    /// read is the guarded local the pass passes straight through.
+    #[test]
+    fn a_direct_feature_model_reads_the_stored_channel() {
+        let set = LightingSet::single(shipped_model("wxsl.subsurface"));
+        let features = feature_requests(&["subsurface"]).unwrap();
+        let source = lighting_pass_source(&set, &features);
+        assert!(
+            source.contains(
+                "var model_extra = vec4f(0.0);\n    @if(wxsl_subsurface)\n    \
+                 model_extra = vec4f(model_data.xy, 0.0, 0.0);\n    "
+            ),
+            "{source}"
+        );
+        assert!(source.contains("return shade_surface(unpacked.surface, ctx, model_extra);"));
+    }
+}
